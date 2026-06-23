@@ -405,7 +405,7 @@ safehttpx==0.1.6
 safetensors==0.5.2
 sam2==1.1.0
 scikit-image==0.25.1
-scikit-learn==1.6.1
+scikit-learn==1.9.0
 scipy==1.15.1
 seaborn==0.13.2
 semantic-version==2.10.0
