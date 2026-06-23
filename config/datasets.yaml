@@ -1,0 +1,121 @@
+datasets:
+  - name: mcity_fisheye_2000
+    loader_fct: load_mcity_fisheye_2000
+    hf_dataset_name: mcity-data-engine/mcity_fisheye_v51
+    local_path: datasets/midadvrb_2000/
+    v51_type: YOLOv5Dataset
+    v51_splits: ["train", "val"]
+  - name: mcity_fisheye_2100
+    loader_fct: load_dataset_from_hf_hub
+    hf_dataset_name: mcity-data-engine/mcity-fisheye-vru-2844
+  - name: mcity_fisheye_2000_vru_only
+    loader_fct: load_dataset_from_hf_hub
+    hf_dataset_name: danielbogdoll/mcity_fisheye_2000_vru_only
+  - name: mcity_fisheye_2100_vru_only
+    loader_fct: load_dataset_from_hf_hub
+    hf_dataset_name: danielbogdoll/mcity_fisheye_2100_vru_only
+  - name: mcity_fisheye_3_months
+    loader_fct: load_mcity_fisheye_3_months
+    local_path: datasets/midadvrb_3_months/
+    v51_type: YOLOv5Dataset
+    v51_splits: ["train", "val"]
+  - name: fisheye8k
+    loader_fct: load_fisheye_8k
+    hf_dataset_name: Voxel51/fisheye8k
+  - name: fisheye8k_mini
+    loader_fct: load_fisheye_8k_mini
+    hf_dataset_name: Abeyankar/fisheye8k-mini
+  - name: mcity_fisheye_ano_ped
+    loader_fct: load_mcity_fisheye_2000
+    local_path: datasets/midadvrb_ano_ped/
+    v51_type: YOLOv5Dataset
+    v51_splits: ["train", "val"]
+    anomalib_masks_path: datasets/midadvrb_ano_ped_masks/
+  - name: mars_multitraversal
+    loader_fct: load_mars_multitraversal
+    local_path: datasets/MARS/Multitraversal_2023_10_04-2024_03_08/
+    hf_dataset_name: ai4ce/MARS
+    hf_path: Multitraversal_2023_10_04-2024_03_08
+  - name: mars_multiagent
+    loader_fct: load_mars_multiagent
+    local_path: Multiagent_53scene
+    hf_dataset_name: ai4ce/MARS
+    hf_path: datasets/MARS/Multiagent_53scene/
+    v51_config: mars_multiagent.yaml
+  - name: annarbor_rolling
+    loader_fct: load_annarbor_rolling
+    local_path: datasets/dataengine_rolling/1/decoded
+    v51_type: FiftyOneDataset
+  - name: SUNRGBD
+    loader_fct: load_sunrgbd
+    local_path: /home/wizard/mcity_data_engine/SUNRGBD
+    v51_type: FiftyOneDataset
+  - name: mcity_31k
+    loader_fct: load_mcity_31k
+    hf_dataset_name: mcity-ai/mcity_31k_clean_ds
+  - name: gamedayds
+    loader_fct: load_gameday_ds
+    hf_dataset_name: Abeyankar/gameday_ds
+  - name: gameday_ds_annotated
+    loader_fct: load_fisheye_8k
+    hf_dataset_name: mcity-engineering/gameday_ds_annotated
+  - name: mcity_35k
+    loader_fct: load_mcity_31k
+    hf_dataset_name: mcity-engineering/mcity_abey_daniel_35k
+  - name: ashley-huron-jan-2026
+    loader_fct: load_mcity_31k
+    hf_dataset_name: mcity-engineering/ashley-huron-jan-2026
+  - name: gs_catherine_glen1-sample-1
+    loader_fct: load_mcity_31k
+    hf_dataset_name: mcity-engineering/gs_catherine_glen1-sample-1
+  - name: barton-plymouth-sample-1
+    loader_fct: load_mcity_31k
+    hf_dataset_name: mcity-engineering/barton-plymouth-sample-1
+  - name: gs_catherine_glen1-sample-2
+    loader_fct: load_mcity_31k
+    hf_dataset_name: mcity-engineering/gs_catherine_glen1-sample-2
+  - name: mcity-person-kp_bb
+    loader_fct: load_mcity_31k
+    hf_dataset_name: mcity-engineering/mcity-person-keypoints
+  - name: gs_fuller_maiden2
+    loader_fct: load_mcity_31k
+    hf_dataset_name: mcity-engineering/gs_fuller_maiden2
+  - name: gs_catherine_zina1
+    loader_fct: load_mcity_31k
+    hf_dataset_name: mcity-engineering/gs_catherine_zina11
+  - name: "gs_gen_zina_msight1"
+    loader_fct: "load_custom_dataset"
+    v51_type: "FiftyOneDataset"
+  - name: coco-2017-train
+    loader_fct: load_mcity_31k
+    hf_dataset_name: coco-2017-train
+  - name: coco-2017-keypoints
+    loader_fct: load_mcity_31k
+    hf_dataset_name: coco-2017-keypoints
+  - name: "custom_dataset1"
+    loader_fct: "load_custom_dataset"
+    v51_type: "FiftyOneDataset"
+  - name: "custom_dataset2"
+    loader_fct: "load_custom_dataset"
+    v51_type: "FiftyOneDataset"
+  - name: "custom_dataset3"
+    loader_fct: "load_custom_dataset"
+    v51_type: "FiftyOneDataset"
+  - name: "custom_dataset4"
+    loader_fct: "load_custom_dataset"
+    v51_type: "FiftyOneDataset"
+  - name: "custom_dataset5"
+    loader_fct: "load_custom_dataset"
+    v51_type: "FiftyOneDataset"
+  - name: "custom_dataset6"
+    loader_fct: "load_custom_dataset"
+    v51_type: "FiftyOneDataset"
+  - name: "custom_dataset7"
+    loader_fct: "load_custom_dataset"
+    v51_type: "FiftyOneDataset"
+  - name: "custom_dataset8"
+    loader_fct: "load_custom_dataset"
+    v51_type: "FiftyOneDataset"
+  - name: "custom_dataset9"
+    loader_fct: "load_custom_dataset"
+    v51_type: "FiftyOneDataset"
