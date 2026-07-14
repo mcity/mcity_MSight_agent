@@ -11,7 +11,7 @@ albumentations==2.0.5
 alembic==1.13.3
 annotated-doc==0.0.4
 annotated-types==0.7.0
-anomalib==1.2.0
+anomalib==2.5.0
 anthropic==0.102.0
 antlr4-python3-runtime==4.9.3
 anyio==4.9.0
