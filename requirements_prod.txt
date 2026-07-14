@@ -39,7 +39,7 @@ numpy==2.1.1
 opencv-python==4.10.0.84
 onnx==1.17.0
 onnxruntime==1.21.0
-openai==1.72.0
+openai==2.45.0
 pandas==2.2.3
 pillow==10.4.0
 plotly==5.24.1
