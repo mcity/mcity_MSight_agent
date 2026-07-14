@@ -290,7 +290,7 @@ onnxruntime==1.21.0
 onnxslim==0.1.50
 open3d==0.19.0
 open_clip_torch==2.30.0
-openai==1.72.0
+openai==2.45.0
 openapi-pydantic==0.5.1
 opencv-python==4.10.0.84
 opencv-python-headless==4.10.0.84
