@@ -74,7 +74,7 @@ On February 24, 2025, Daniel Bogdoll, a research scholar at Mcity, gave a presen
 
 ## Key Features of the Agentic Implementation:
 The Agentic Mcity Data Engine extends the Mcity Data Engine with an LLM-agnostic orchestration layer powered by the Model Context Protocol (MCP).
-This layer transforms each workflow—such as auto-labeling, class mapping, or embedding selection—into structured, callable tools that can be accessed either through natural-language interaction or programmatic APIs.
+This layer transforms the Auto Labeling workflow into structured, callable tools that can be accessed either through natural-language interaction or programmatic APIs.
 
 <div align="center"> <picture> <source srcset="https://github.com/user-attachments/assets/3a5c751d-a386-4170-bd44-a29783fc92d6" width="80%"> <img alt="Agentic Mcity Data Engine Detailed Architecture" src=""> </picture> <p><em>Figure 2. Agentic Mcity Data Engine architecture – detailed interaction between user, LLM, chat server, MCP tool server.</em></p> </div>
 
@@ -87,10 +87,10 @@ Natural Language Configuration: Configure complex workflows through conversation
 **- Chat Server:**  A FastAPI service (port 8001) acting as the bridge between the user, LLM, and backend MCP services.
 It maintains multi-turn chat history, handles tool invocations, streams Server-Sent Event (SSE) logs, and supports both web-UI and programmatic clients.
 
-**- LLM Layer (Model-Agnostic):** Connects to OpenAI GPT-4o, Google Gemini, or Groq Llama models.
+**- LLM Layer (Model-Agnostic):** Connects to OpenAI, Anthropic Claude, Google Gemini, or Groq models.
 The LLM interprets user instructions, determines the appropriate workflow tool call, and sends structured requests back to the chat server for execution.
 
-**- MCP Server:** A FastAPI-based backend (port 8000) exposing 40 + tools that represent the core Mcity Data Engine workflows.
+**- MCP Server:** A FastAPI-based backend (port 8000) exposing the tools that represent the Auto Labeling workflow and its shared infrastructure (dataset selection, ingestion, CVAT/Label Studio export, Voxel51 visualization).
 
 **- Data Ingestion Server:** A dedicated service (port 8002) for uploading and preprocessing datasets.
 It supports drag-and-drop ingestion of images, videos, and annotations in COCO, YOLO, or CVAT-XML formats, automatically converting them into FiftyOne-compatible datasets.
@@ -115,30 +115,41 @@ Online demo on Google Colab: [Mcity Data Engine Web Demo](https://colab.research
 
 At least one GPU is required for many of the Mcity Data Engine workflows. Check the hardware setups we have tested in the [**Wiki**](https://github.com/mcity/mcity_data_engine/wiki/Environments). To download the repository and install the requirements run:
 ```
-git clone --recurse-submodules git@github.com:mcity/mcity_data_engine.git
-cd mcity_data_engine
-python3 -m venv .venv
+git clone git@github.com:mcity/mcity_data_agent.git
+cd mcity_data_agent
+
+# Use python3.12 explicitly -- plain `python3` may resolve to a newer default
+# (3.13/3.14) on your system, which several pinned packages (e.g. numba==0.61.0)
+# do not yet support.
+python3.12 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 pip install -r agent_requirements.txt
+
+# fiftyone requires sse-starlette<1, but mcp (via fastmcp) requires >=1.6.1 --
+# no version satisfies both, so fiftyone is installed separately with --no-deps
+# rather than forcing the wrong one onto the rest of the stack.
+pip install "fiftyone==1.4.1" --no-deps
 ```
 
 Login with your [Weights and Biases](https://wandb.ai/) and [Hugging Face](https://huggingface.co/) accounts:
 ```
 wandb login
-huggingface-cli login
+hf auth login
 ```
 
 ### Agentic Implementation Guide:
 
 **Configuration**: Create a .env file with your LLM API key.
 ```
-# Choose your LLM provider (openai, gemini, or groq)
+# Choose your LLM provider (openai, claude, gemini, or groq)
 LLM_PROVIDER=openai
 
 # Add your API key
 OPENAI_API_KEY=sk-...
+# OR
+ANTHROPIC_API_KEY=sk-ant-...
 # OR
 GEMINI_API_KEY=...
 # OR
@@ -163,59 +174,64 @@ python mcp_layer/client_chat.py --ui
 
 The web interface will open automatically at http://localhost:5225.
 
+**Docker / AWS Deployment:**
+`agent_deployment/` does **not** contain a Dockerfile for running the agent itself in a
+local container. Instead:
+- `agent_deployment/Docker/` is a small Flask app (`App.py` + `cloudFormationManager.py` +
+  `redisManager.py`) that provides a web form for launching a *remote* AWS EC2 sandbox
+  running this repo via CloudFormation. `docker-compose.yml` there runs that launcher
+  app itself (plus a Redis instance it depends on) — it does not run the data engine.
+  Copy `agent_deployment/Docker/env_sample` to `agent_deployment/Docker/.env` and fill in
+  your AWS credentials before running `docker compose up` in that directory.
+- `agent_deployment/Full-install/` and `agent_deployment/Using-AMI/` contain the
+  CloudFormation templates (`deploy-agent.yml`, `deploy-agent-AWS-AMI.yml`) that the
+  Flask app submits — these boot a plain EC2 instance (or one from a pre-baked AMI) and
+  run the same "Launch the Agentic Interface" steps above via cloud-init.
+
+If you're looking to containerize the agent itself for local testing, that setup doesn't
+exist yet in this repo.
+
 **Talk to Task: Example Run**
 ```
 User: Hi, I would like to explore the data engine for processing my data.
 
-Agent: Great! We have several workflows you can choose from to process your data:
-        1. Auto Labeling
-        2. Class Mapping
-        3. Anomaly Detection
-        4. Embedding Selection
-        5. Zero-Shot Auto Labeling
-        6. Ensemble Selection
+Agent: Great! I can help you with Auto Labeling — training or running an object
+       detection model on your dataset. Which dataset would you like to use?
 
-        Which workflow would you like to start with?
+User: fisheye8k
 
-User: I would like to generate labels for my dataset. It’s completely unlabeled right now.
+Agent: Dataset 'fisheye8k' confirmed. Do you have credentials configured for
+       CVAT or Label Studio? I detected Label Studio credentials — using
+       Label Studio for annotation. How would you like to annotate your
+       dataset?
+          - Manual Labeling: export your dataset for manual annotation.
+          - Auto Generated Labeling: run a detection model to generate
+            predictions automatically, then review/correct them.
 
-Agent: Since your dataset has no labels, the best fit is the Zero-Shot Auto Labeling workflow.
-       This workflow lets you generate labels automatically without any prior annotations.
-       You can choose from the following state-of-the-art zero-shot models:
-          1. omlab/omdet-turbo-swin-tiny-hf
-          2. IDEA-Research/grounding-dino-tiny
-          3. google/owlvit-large-patch14
-          4. google/owlv2-base-patch16-finetuned
-          5. google/owlv2-large-patch14-ensemble
+User: Auto Generated Labeling.
 
-User: I would like to use the first 3 models.
+Agent: Here are the available model sources and models: [...]
+       Which model would you like to use?
 
-Agent: The models have been successfully updated.
-       Would you like to modify the detection threshold value (default is 0.2) for the zero-shot models?
+User: rfdetr_2xlarge
 
-User: Can you explain what the detection threshold means?
+Agent: rfdetr_2xlarge (roboflow) has been configured.
+       Here are the current hyperparameters: [...]
+       Would you like to modify any of these hyperparameters, or are you
+       ready to start?
 
-Agent: The detection threshold is a confidence score that decides whether a detected object is valid.
-       If the model’s confidence is above this value, the detection is accepted; if below, it’s rejected.
-       Lower thresholds yield more detections but may include false positives, while higher thresholds are more selective.
-       The default is 0.2, meaning detections above 20% confidence are accepted.
+User: Let's go with the defaults.
 
-User: Set threshold to 0.3.
+Agent: Here's a summary of what will be run: [...] Shall I proceed with
+       auto-labeling?
 
-Agent: Threshold set. Next, provide the object classes to detect from the data.
+User: Yes, proceed.
 
-User: Car, bike, pedestrian, and truck.
+[Data Engine Server]: Running auto-labeling — live logs are streamed here and to Weights and Biases.
 
-Agent: Classes set to car, bike, pedestrian, truck. The workflow is ready to run.
-       Let me know when to start.
-
-User: We can begin execution of the workflow.
-
-[Data Engine Server]: Executing Zero-Shot Auto Labeling… live logs are streamed to Weights and Biases.
-
-Agent: Zero-Shot Auto Labeling completed successfully.
-       You can now use Ensemble Selection to find detections where models agree.
-       I can also assist you with visualizing detections using Voxel51.
+Agent: Auto-labeling completed. Predictions have been exported to Label Studio
+       for review. Let me know when you're done and I'll import your labels
+       back, or I can launch Voxel51 so you can explore the results now.
 ```
 
 ### Notebooks and Submodules
@@ -224,7 +240,7 @@ To exclude the output of jupyter notebooks from git tracking, add the following 
 
 ```
 [filter "strip-notebook-output-engine"]
-    clean = <your_path>/mcity_data_engine/.venv/bin/jupyter nbconvert --ClearOutputPreprocessor.enabled=True --ClearMetadataPreprocessor.enabled=True --to=notebook --stdin --stdout
+    clean = <your_path>/mcity_data_agent/.venv/bin/jupyter nbconvert --ClearOutputPreprocessor.enabled=True --ClearMetadataPreprocessor.enabled=True --to=notebook --stdin --stdout
     smudge = cat
     required = true
 ```
@@ -233,7 +249,7 @@ and those to ```.git/modules/mcity_data_engine_scripts/config```
 
 ```
 [filter "strip-notebook-output-scripts"]
-    clean = <your_path>/mcity_data_engine/.venv/bin/jupyter nbconvert --ClearOutputPreprocessor.enabled=True --ClearMetadataPreprocessor.enabled=True --to=notebook --stdin --stdout
+    clean = <your_path>/mcity_data_agent/.venv/bin/jupyter nbconvert --ClearOutputPreprocessor.enabled=True --ClearMetadataPreprocessor.enabled=True --to=notebook --stdin --stdout
     smudge = cat
     required = true
 ```
@@ -257,27 +273,29 @@ git add .gitmodules $(git submodule foreach --quiet 'echo $name')
 ├── docs/                       # Documentation generated with `pdoc`
 ├── tests/                      # Tests using Pytest
 ├── custom_models/              # External models with containerized environments
-├── mcp_layer/  # Experiment scripts and one-time operations (Mcity internal)
-│  ├── mcp_server.py           # MCP tool registry (port 8000)
-│  ├── chat_server.py          # FastAPI chat endpoint (port 8001)
-│  ├── ingest_server.py        # File upload & processing (port 8002)
-│  ├── client_chat.py          # Web/terminal client (port 5225)
-│  ├── mcptools/               # Tool implementations
+├── mcp_layer/                   # Agentic (MCP) layer
+│  ├── mcp_server.py            # MCP tool registry (port 8000)
+│  ├── chat_server.py           # FastAPI chat endpoint (port 8001)
+│  ├── ingest_server.py         # File upload & processing (port 8002)
+│  ├── client_chat.py           # Web/terminal client (port 5225)
+│  ├── chat_pipeline.py         # Tool dispatch, state routing, reply formatting
+│  ├── validate_workflow_state.py # Pydantic workflow state machine
+│  ├── mcptools/                # Tool implementations
 │  │   ├── __init__.py
 │  │   ├── workflow_selector.py
 │  │   ├── auto_labeling.py
-│  │   ├── class_mapping.py
-│  │   ├── anomaly_detection.py
-│  │   ├── embedding_selection.py
-│  │   ├── zsal.py             # Zero-shot auto-labeling
-│  │   ├── ensemble_selection.py
 │  │   ├── data_ingest.py
-│  │   └── v51.py              # Voxel51 integration
-│  ├── llm_clients.py          # Multi-LLM support
-│  ├── tool_schema.py          # OpenAI tool definitions
-│  └── ui/                     # Web interface assets
+│  │   ├── cvat_export.py
+│  │   ├── label_studio_export.py
+│  │   └── v51.py               # Voxel51 integration
+│  ├── llm_clients.py           # Multi-LLM support (OpenAI, Claude, Gemini, Groq)
+│  ├── tool_schema.py           # Tool definitions exposed to the LLM
+│  ├── prompts/                 # System + per-workflow prompt text
+│  │   └── workflows/
+│  └── ui/                      # Web interface assets
 │      └── index.html
-├── mcity_data_engine_scripts/  # Experiment scripts and one-time operations (Mcity internal)
+├── agent_deployment/            # AWS CloudFormation / Docker launcher for the agent
+├── mcity_data_engine_scripts/   # Experiment scripts and one-time operations (Mcity internal)
 ├── .vscode                     # Settings for VS Code IDE
 ├── .github/workflows/          # GitHub Action workflows
 ├── .gitignore                  # Files and directories to be ignored by Git
@@ -294,7 +312,7 @@ Training runs are logged with [Weights and Biases (WandB)](https://wandb.ai/mcit
 In order to change the standard WandB directory, run
 
 ```
-echo 'export WANDB_DIR="<your_path>/mcity_data_engine/logs"' >> ~/.profile
+echo 'export WANDB_DIR="<your_path>/mcity_data_agent/logs"' >> ~/.profile
 source ~/.profile
 ```
 
