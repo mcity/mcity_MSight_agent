@@ -1,15 +1,12 @@
 """
-Priority 1: valid_tool_names() and all six workflow-specific tool-filtering functions.
+Priority 1: valid_tool_names() and the auto_labeling tool-filtering function.
 
 Each function under test is pure (no I/O); instances are constructed directly from
 Pydantic models — no state is loaded from or saved to config.py.
 """
 import pytest
 from validate_workflow_state import (
-    WorkflowState, AutoLabelingState, ClassMappingState,
-    AnomalyDetectionState, EmbeddingSelectionState,
-    ZeroShotAutoLabelingState, EnsembleSelectionState,
-    LabelingBackend, AutoLabelingPhase,
+    WorkflowState, AutoLabelingState, LabelingBackend, AutoLabelingPhase,
 )
 
 ALWAYS = {"send_reply", "switch_workflow"}
@@ -40,14 +37,8 @@ def test_valid_tool_names_no_workflow_selected():
     assert result == ALWAYS | {"select_workflow"}
 
 
-def test_valid_tool_names_non_class_mapping_workflow_dataset_not_confirmed():
+def test_valid_tool_names_auto_labeling_dataset_not_confirmed():
     state = WorkflowState(workflow_name="auto_labeling")
-    result = state.valid_tool_names()
-    assert result == ALWAYS | {"set_selected_dataset", "list_datasets"}
-
-
-def test_valid_tool_names_dataset_not_confirmed_anomaly_detection():
-    state = WorkflowState(workflow_name="anomaly_detection")
     result = state.valid_tool_names()
     assert result == ALWAYS | {"set_selected_dataset", "list_datasets"}
 
@@ -278,218 +269,3 @@ def test_auto_labeling_tools_auto_path_complete_not_imported_ls():
     assert result == ALWAYS | {"import_from_label_studio"}
 
 
-# ---------------------------------------------------------------------------
-# _class_mapping_tools
-# ---------------------------------------------------------------------------
-
-def _cm_state(**kwargs) -> WorkflowState:
-    cm = ClassMappingState(**kwargs)
-    return WorkflowState(workflow_name="class_mapping", class_mapping=cm)
-
-
-def test_class_mapping_tools_no_substate():
-    """class_mapping with cm=None → show listing and configure tools."""
-    state = WorkflowState(workflow_name="class_mapping", class_mapping=None)
-    result = state.valid_tool_names()
-    assert result == ALWAYS | {"list_class_mapping_models", "configure_class_mapping_model"}
-
-
-def test_class_mapping_tools_model_not_configured():
-    state = _cm_state(model_configured=False)
-    result = state.valid_tool_names()
-    assert result == ALWAYS | {"list_class_mapping_models", "configure_class_mapping_model"}
-
-
-def test_class_mapping_tools_model_configured_awaiting_source():
-    state = _cm_state(model_configured=True, source_dataset_set=False)
-    result = state.valid_tool_names()
-    assert result == ALWAYS | {
-        "set_class_mapping_dataset_source", "set_selected_dataset", "launch_voxel51_session"
-    }
-
-
-def test_class_mapping_tools_source_set_awaiting_target():
-    state = _cm_state(model_configured=True, source_dataset_set=True, target_dataset_set=False)
-    result = state.valid_tool_names()
-    assert result == ALWAYS | {"set_class_mapping_dataset_target", "launch_voxel51_session"}
-
-
-def test_class_mapping_tools_source_and_target_set_awaiting_labels():
-    state = _cm_state(
-        model_configured=True, source_dataset_set=True,
-        target_dataset_set=True, candidate_labels_set=False,
-    )
-    result = state.valid_tool_names()
-    assert result == ALWAYS | {"set_class_mapping_candidate_labels", "launch_voxel51_session"}
-
-
-def test_class_mapping_tools_all_set_ready_to_run():
-    state = _cm_state(
-        model_configured=True, source_dataset_set=True,
-        target_dataset_set=True, candidate_labels_set=True,
-    )
-    result = state.valid_tool_names()
-    assert result == ALWAYS | {"run_class_mapping", "launch_voxel51_session"}
-
-
-# ---------------------------------------------------------------------------
-# _anomaly_detection_tools
-# ---------------------------------------------------------------------------
-
-def _ad_state(**kwargs) -> WorkflowState:
-    ad = AnomalyDetectionState(**kwargs)
-    return WorkflowState(
-        workflow_name="anomaly_detection",
-        dataset_name="test_ds", dataset_confirmed=True,
-        anomaly_detection=ad,
-    )
-
-
-def test_anomaly_detection_tools_no_substate():
-    state = WorkflowState(
-        workflow_name="anomaly_detection",
-        dataset_name="test_ds", dataset_confirmed=True,
-        anomaly_detection=None,
-    )
-    result = state.valid_tool_names()
-    assert result == ALWAYS | {
-        "list_anomaly_detection_models", "configure_anomaly_detection_model", "launch_voxel51_session"
-    }
-
-
-def test_anomaly_detection_tools_model_not_configured():
-    state = _ad_state(model_configured=False)
-    result = state.valid_tool_names()
-    assert result == ALWAYS | {
-        "list_anomaly_detection_models", "configure_anomaly_detection_model", "launch_voxel51_session"
-    }
-
-
-def test_anomaly_detection_tools_model_configured_awaiting_data_source():
-    state = _ad_state(model_configured=True, data_source_set=False)
-    result = state.valid_tool_names()
-    assert result == ALWAYS | {"set_anomaly_detection_data_source", "launch_voxel51_session"}
-
-
-def test_anomaly_detection_tools_data_source_set_ready_to_run():
-    state = _ad_state(model_configured=True, data_source_set=True)
-    result = state.valid_tool_names()
-    assert result == ALWAYS | {
-        "set_anomaly_detection_hyperparams", "run_anomaly_detection", "launch_voxel51_session"
-    }
-
-
-# ---------------------------------------------------------------------------
-# _embedding_selection_tools
-# ---------------------------------------------------------------------------
-
-def _es_state(**kwargs) -> WorkflowState:
-    es = EmbeddingSelectionState(**kwargs)
-    return WorkflowState(
-        workflow_name="embedding_selection",
-        dataset_name="test_ds", dataset_confirmed=True,
-        embedding_selection=es,
-    )
-
-
-def test_embedding_selection_tools_no_substate():
-    state = WorkflowState(
-        workflow_name="embedding_selection",
-        dataset_name="test_ds", dataset_confirmed=True,
-        embedding_selection=None,
-    )
-    result = state.valid_tool_names()
-    assert result == ALWAYS | {"list_embedding_selection_models", "configure_embedding_selection_model"}
-
-
-def test_embedding_selection_tools_model_not_configured():
-    state = _es_state(model_configured=False)
-    result = state.valid_tool_names()
-    assert result == ALWAYS | {"list_embedding_selection_models", "configure_embedding_selection_model"}
-
-
-def test_embedding_selection_tools_model_configured_ready_to_run():
-    state = _es_state(model_configured=True)
-    result = state.valid_tool_names()
-    assert result == ALWAYS | {"set_embedding_selection_params", "run_embedding_selection"}
-
-
-# ---------------------------------------------------------------------------
-# _zero_shot_tools
-# ---------------------------------------------------------------------------
-
-def _zs_state(**kwargs) -> WorkflowState:
-    zs = ZeroShotAutoLabelingState(**kwargs)
-    return WorkflowState(
-        workflow_name="auto_labeling_zero_shot",
-        dataset_name="test_ds", dataset_confirmed=True,
-        auto_labeling_zero_shot=zs,
-    )
-
-
-def test_zero_shot_tools_no_substate():
-    state = WorkflowState(
-        workflow_name="auto_labeling_zero_shot",
-        dataset_name="test_ds", dataset_confirmed=True,
-        auto_labeling_zero_shot=None,
-    )
-    result = state.valid_tool_names()
-    assert result == ALWAYS | {"list_zsal", "configure_auto_labeling_zero_shot_models"}
-
-
-def test_zero_shot_tools_models_not_configured():
-    state = _zs_state(models_configured=False)
-    result = state.valid_tool_names()
-    assert result == ALWAYS | {"list_zsal", "configure_auto_labeling_zero_shot_models"}
-
-
-def test_zero_shot_tools_models_configured_classes_not_set():
-    state = _zs_state(models_configured=True, classes_set=False)
-    result = state.valid_tool_names()
-    config_tools = {"set_auto_labeling_zero_shot_threshold", "set_auto_labeling_zero_shot_classes"}
-    assert result == ALWAYS | config_tools
-
-
-def test_zero_shot_tools_models_configured_classes_set_ready_to_run():
-    state = _zs_state(models_configured=True, classes_set=True)
-    result = state.valid_tool_names()
-    config_tools = {"set_auto_labeling_zero_shot_threshold", "set_auto_labeling_zero_shot_classes"}
-    assert result == ALWAYS | config_tools | {"run_zero_shot_auto_labeling"}
-
-
-# ---------------------------------------------------------------------------
-# _ensemble_tools
-# ---------------------------------------------------------------------------
-
-def _ens_state(**kwargs) -> WorkflowState:
-    ens = EnsembleSelectionState(**kwargs)
-    return WorkflowState(
-        workflow_name="ensemble_selection",
-        dataset_name="test_ds", dataset_confirmed=True,
-        ensemble_selection=ens,
-    )
-
-
-def test_ensemble_tools_no_substate():
-    state = WorkflowState(
-        workflow_name="ensemble_selection",
-        dataset_name="test_ds", dataset_confirmed=True,
-        ensemble_selection=None,
-    )
-    result = state.valid_tool_names()
-    config_tools = {"set_ensemble_selection_parameters", "set_ensemble_selection_classes"}
-    assert result == ALWAYS | config_tools
-
-
-def test_ensemble_tools_classes_not_set():
-    state = _ens_state(classes_set=False)
-    result = state.valid_tool_names()
-    config_tools = {"set_ensemble_selection_parameters", "set_ensemble_selection_classes"}
-    assert result == ALWAYS | config_tools
-
-
-def test_ensemble_tools_classes_set_ready_to_run():
-    state = _ens_state(classes_set=True)
-    result = state.valid_tool_names()
-    config_tools = {"set_ensemble_selection_parameters", "set_ensemble_selection_classes"}
-    assert result == ALWAYS | config_tools | {"run_ensemble_selection"}

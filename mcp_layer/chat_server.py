@@ -10,9 +10,15 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastmcp import Client
 from fastmcp.client.transports import SSETransport
 
 sys.path.append(os.path.dirname(__file__))
+
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 
 from chat_pipeline import ChatPipeline
 from host_utils import resolve_host
@@ -29,6 +35,12 @@ _LLM_PROVIDERS = {
     "claude": ClaudeClient,
     "anthropic": ClaudeClient,  # alias
 }
+_PROVIDER_ENV_VAR = {
+    "openai": "OPENAI_API_KEY",
+    "claude": "ANTHROPIC_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "groq": "GROQ_API_KEY",
+}
 
 llm_provider = os.getenv("LLM_PROVIDER", "openai").lower()
 if llm_provider not in _LLM_PROVIDERS:
@@ -37,6 +49,29 @@ if llm_provider not in _LLM_PROVIDERS:
         f"Valid values: {list(_LLM_PROVIDERS)}. Falling back to 'openai'."
     )
     llm_provider = "openai"
+
+
+def _canonical_provider(key: str) -> str:
+    key = (key or "").lower()
+    return "claude" if key == "anthropic" else key
+
+
+def available_providers() -> list[str]:
+    """Providers whose API key env var is actually set on this server."""
+    return [p for p, env in _PROVIDER_ENV_VAR.items() if os.getenv(env, "").strip()]
+
+
+def get_llm_client(app: FastAPI, requested: str):
+    """Resolve + lazily construct + cache a client, never for a provider whose key is missing."""
+    avail = available_providers()
+    key = _canonical_provider(requested)
+    if key not in avail:
+        default_key = _canonical_provider(llm_provider)
+        key = default_key if default_key in avail else (avail[0] if avail else "openai")
+    cache = app.state.llm_clients
+    if key not in cache:
+        cache[key] = _LLM_PROVIDERS[key]()
+    return cache[key]
 
 def _reset_state_on_startup() -> None:
     """Reset persisted state on startup so each server launch begins clean."""
@@ -52,10 +87,36 @@ def _reset_state_on_startup() -> None:
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     _reset_state_on_startup()
-    app.state.llm = _LLM_PROVIDERS[llm_provider]()
+    app.state.llm_clients = {}
     host = resolve_host()
-    app.state.mcp_transport = SSETransport(url=f"http://{host}:8000/sse")
-    yield
+    mcp_transport = SSETransport(url=f"http://{host}:8000/sse")
+    # One persistent MCP connection for the app's lifetime, instead of opening
+    # a fresh SSE connection per chat turn (was adding several seconds of
+    # connect + initialize overhead to every request that called a tool).
+    #
+    # deploy-agent.yml launches mcp_server.py and chat_server.py back-to-back
+    # with no ordering guarantee, so mcp_server may not be listening yet on
+    # the first attempt -- retry with backoff instead of failing startup.
+    mcp_client_cm = Client(mcp_transport)
+    last_exc: Exception | None = None
+    for attempt in range(15):
+        try:
+            mcp_client = await mcp_client_cm.__aenter__()
+            break
+        except Exception as e:
+            last_exc = e
+            logging.warning(
+                f"[STARTUP] MCP connect attempt {attempt + 1}/15 failed: {e}; retrying in 2s"
+            )
+            await asyncio.sleep(2)
+    else:
+        raise RuntimeError("Could not connect to MCP server after 15 attempts") from last_exc
+
+    app.state.mcp_client = mcp_client
+    try:
+        yield
+    finally:
+        await mcp_client_cm.__aexit__(None, None, None)
 
 
 app = FastAPI(lifespan=_lifespan)
@@ -66,9 +127,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SYSTEM_PROMPT = (
-    Path(__file__).resolve().parent / "prompts" / "system_prompt.txt"
-).read_text()
+# Maps workflow_name -> (display label for the greeting list, prompt filename).
+# Add an entry here + drop the file in prompts/workflows/ to register a new workflow.
+WORKFLOW_META = {
+    "auto_labeling": {"label": "Auto Labeling", "file": "auto_labeling.txt"},
+}
+
+_PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+
+WORKFLOW_PROMPT_TEXT = {
+    name: (_PROMPTS_DIR / "workflows" / meta["file"]).read_text()
+    for name, meta in WORKFLOW_META.items()
+}
+
+_WORKFLOW_LIST = "\n".join(
+    f"{i + 1}. {meta['label']} (internal name: {name})"
+    for i, (name, meta) in enumerate(WORKFLOW_META.items())
+)
+
+BASE_PROMPT = (
+    (_PROMPTS_DIR / "base_prompt.txt").read_text().replace("{WORKFLOW_LIST}", _WORKFLOW_LIST)
+)
+
+
+def _build_system_prompt(state) -> str:
+    """Base rules + the active workflow's prompt, if one is selected and registered."""
+    if state and state.workflow_name in WORKFLOW_PROMPT_TEXT:
+        return BASE_PROMPT + "\n\n" + WORKFLOW_PROMPT_TEXT[state.workflow_name]
+    return BASE_PROMPT
 
 
 def _attach_source(message: str, source: str | None) -> str:
@@ -169,7 +255,9 @@ def _build_state_hint(state=None) -> str:
                     f"Parameters are LOCKED — do not reconfigure. "
                     f"If the user asks to change a parameter: tell them the workflow is locked. "
                     f"If they want to discard all progress and restart from dataset selection: "
-                    f"call switch_workflow(workflow_name='{state.workflow_name}') to reset all state."
+                    f"confirm with them first (e.g. 'This will discard the current run — are you sure?'), "
+                    f"then call switch_workflow(workflow_name='{state.workflow_name}', confirm_restart=true) "
+                    f"to force the reset."
                 )
             if al.models_listed and not al.model_configured:
                 parts.append(
@@ -209,10 +297,9 @@ def _build_state_hint(state=None) -> str:
             if al.labels_imported:
                 parts.append(
                     "workflow_complete — "
-                    "if user names a specific workflow: call switch_workflow with that name; "
-                    "if user does not name one: send_reply with the workflow list and ask which one. "
-                    "Generic words like 'done', 'ok', 'thanks', 'exit' do NOT name a workflow — "
-                    "respond with send_reply asking if they want to start another workflow or are finished."
+                    "if user wants to start over: call switch_workflow(workflow_name='auto_labeling'). "
+                    "Generic words like 'done', 'ok', 'thanks', 'exit' do NOT mean start over — "
+                    "respond with send_reply asking if they want to run auto-labeling again or are finished."
                 )
             if not al.phase and not al.auto_labeling_complete and (al.labeling_path or al.model_configured):
                 backend_rule = (
@@ -234,91 +321,14 @@ def _build_state_hint(state=None) -> str:
                     + backend_rule
                     + path_rule
                 )
-        cm = state.class_mapping
-        if cm:
-            if cm.model_configured and not cm.source_dataset_set:
-                parts.append(
-                    "class_mapping: model_configured | "
-                    "NEXT STEP: get source dataset, call set_class_mapping_dataset_source"
-                )
-            elif cm.source_dataset_set and not cm.target_dataset_set:
-                parts.append(
-                    "class_mapping: source_set | "
-                    "NEXT STEP: get target dataset, call set_class_mapping_dataset_target"
-                )
-            elif cm.target_dataset_set and not cm.candidate_labels_set:
-                parts.append(
-                    "class_mapping: target_set | "
-                    "NEXT STEP: get class mapping from user, call set_class_mapping_candidate_labels"
-                )
-            elif cm.candidate_labels_set:
-                parts.append(
-                    "class_mapping: fully_configured | "
-                    "call run_class_mapping when user confirms"
-                )
-
-        ad = state.anomaly_detection
-        if ad:
-            if ad.model_configured and not ad.data_source_set:
-                parts.append(
-                    "anomaly_detection: model_configured | "
-                    "NEXT STEP: get location + rare_class, call set_anomaly_detection_data_source"
-                )
-            elif ad.data_source_set:
-                parts.append(
-                    "anomaly_detection: data_source_set | "
-                    "hyperparams: call set_anomaly_detection_hyperparams if user adjusts; "
-                    "when ready: call run_anomaly_detection"
-                )
-
-        es = state.embedding_selection
-        if es:
-            if es.model_configured:
-                parts.append(
-                    "embedding_selection: model_configured | "
-                    "params: call set_embedding_selection_params if user adjusts; "
-                    "when ready: call run_embedding_selection"
-                )
-
-        zs = state.auto_labeling_zero_shot
-        if zs:
-            if zs.models_configured and not zs.threshold_set:
-                parts.append(
-                    "zero_shot: models_configured | "
-                    "NEXT STEP: get threshold, call set_auto_labeling_zero_shot_threshold"
-                )
-            elif zs.threshold_set and not zs.classes_set:
-                parts.append(
-                    "zero_shot: threshold_set | "
-                    "NEXT STEP: get object classes, call set_auto_labeling_zero_shot_classes"
-                )
-            elif zs.classes_set:
-                parts.append(
-                    "zero_shot: fully_configured | "
-                    "call run_zero_shot_auto_labeling when user confirms"
-                )
-
-        ens = state.ensemble_selection
-        if ens:
-            if ens.params_set and not ens.classes_set:
-                parts.append(
-                    "ensemble: params_set | "
-                    "NEXT STEP: get positive classes, call set_ensemble_selection_classes"
-                )
-            elif ens.classes_set:
-                parts.append(
-                    "ensemble: fully_configured | "
-                    "call run_ensemble_selection when user confirms"
-                )
-
-        parts.append(
-            "ALWAYS AVAILABLE: user wants a completely different workflow → "
-            "use send_reply to list the six workflows and ask which one — "
-            "do NOT call switch_workflow until the user names a specific workflow."
-        )
         return "SESSION_STATE: " + " | ".join(parts)
     except Exception:
         return ""
+
+
+@app.get("/chat/providers")
+async def chat_providers():
+    return {"providers": available_providers(), "default": "openai"}
 
 
 @app.post("/chat/stream")
@@ -327,20 +337,21 @@ async def chat_stream(request: Request):
     data    = await request.json()
     message = data.get("message", "")
     history = data.get("history", [])
+    llm_client = get_llm_client(request.app, data.get("provider", ""))
 
-    MAX_HISTORY_TURNS = 8
+    MAX_HISTORY_TURNS = 4
     if len(history) > MAX_HISTORY_TURNS:
         history = history[-MAX_HISTORY_TURNS:]
-
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for user_msg, assistant_msg in history:
-        messages.append({"role": "user",      "content": user_msg})
-        messages.append({"role": "assistant", "content": assistant_msg})
 
     try:
         _state = WorkflowState.load()
     except Exception:
         _state = None
+
+    messages = [{"role": "system", "content": _build_system_prompt(_state)}]
+    for user_msg, assistant_msg in history:
+        messages.append({"role": "user",      "content": user_msg})
+        messages.append({"role": "assistant", "content": assistant_msg})
 
     if _state:
         al = _state.auto_labeling
@@ -390,7 +401,7 @@ async def chat_stream(request: Request):
                 tool_choice = "required" if iteration == 0 else "auto"
 
                 try:
-                    assistant_message = await request.app.state.llm.chat(
+                    assistant_message = await llm_client.chat(
                         messages, tools=current_tools, tool_choice=tool_choice
                     )
                 except Exception as e:
@@ -438,7 +449,7 @@ async def chat_stream(request: Request):
                 })
 
                 if pipeline is None:
-                    pipeline = ChatPipeline(mcp_transport=request.app.state.mcp_transport, llm=request.app.state.llm)
+                    pipeline = ChatPipeline(mcp_client=request.app.state.mcp_client, llm=llm_client)
 
                 tool_results, early_reply = await pipeline.run(
                     tool_calls, messages, progress_cb=progress_cb

@@ -107,13 +107,17 @@ tools = [
             "function": {
                 "name": "switch_workflow",
                 "description": (
-                    "Call this in two cases: "
-                    "(1) the user names a specific different workflow to switch to "
-                    "(e.g. 'switch to class mapping', 'let me try anomaly detection') — pass that workflow name; OR "
-                    "(2) the user wants to start over or restart from scratch within the current workflow — "
-                    "pass the current workflow name to reset all state back to dataset selection. "
-                    "Do NOT call this if the user says they want 'a different workflow' without naming one — "
-                    "use send_reply to present the six workflow options and ask which one instead."
+                    "Call this when the user wants to start over or restart from scratch within the "
+                    "current workflow — pass the current workflow name ('auto_labeling') to reset all "
+                    "state back to dataset selection. "
+                    "Do NOT call this if the user is answering a pending in-workflow question — e.g. replying "
+                    "'auto labeling' or 'auto' to a Manual vs Auto Generated Labeling prompt means the annotation "
+                    "method (call set_labeling_path instead), not the 'Auto Labeling' workflow by name. "
+                    "Only treat a message as a workflow switch when no other pending question is awaiting an answer. "
+                    "If the run is mid-export/mid-training (locked), this call is blocked and returns a message "
+                    "telling you to confirm with the user that they want to discard all progress — once they "
+                    "explicitly confirm (e.g. 'yes', 'discard it', 'start over anyway'), call this again with "
+                    "confirm_restart=true to force the reset."
                 ),
                 "parameters": {
                     "type": "object",
@@ -121,6 +125,10 @@ tools = [
                         "workflow_name": {
                             "type": "string",
                             "description": "The exact workflow name the user stated. Must come from the user's message — do not infer or guess."
+                        },
+                        "confirm_restart": {
+                            "type": "boolean",
+                            "description": "Set to true ONLY after the user has explicitly confirmed they want to discard an in-progress (locked) run. Omit or leave false otherwise."
                         }
                     },
                     "required": ["workflow_name"]
@@ -188,7 +196,14 @@ tools = [
             "type": "function",
             "function": {
                 "name": "list_model_sources_and_models",
-                "description": "Lists valid model sources and models for auto_labeling.",
+                "description": (
+                    "Lists valid model sources and models for auto_labeling. "
+                    "Only call this to show the list for the first time. "
+                    "Do NOT call this again if the user is asking for a recommendation or says they're unsure "
+                    "which model to pick (e.g. 'I don't know which to use', 'what do you suggest?') — "
+                    "the list has already been shown; use send_reply to recommend a specific model with brief "
+                    "reasoning instead, then ask them to confirm."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {}
@@ -225,338 +240,6 @@ tools = [
                         "weight_decay": {"type": "number", "description": "Weight decay (L2 penalty)."},
                         "max_grad_norm": {"type": "number", "description": "Max norm for gradient clipping."}
                     }
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "list_class_mapping_models",
-                "description": "Lists zero-shot classification models available for class mapping.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {}
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "configure_class_mapping_model",
-                "description": "Enables the selected model for class_mapping by commenting out all other zero-shot models.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "selected_model": {
-                            "type": "string",
-                            "description": "The HuggingFace zero-shot classification model to use."
-                        }
-                    },
-                    "required": ["selected_model"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "set_class_mapping_dataset_source",
-                "description": "Updates the dataset_source field inside the class_mapping section of config.py.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "dataset_source": {
-                            "type": "string",
-                            "description": "The name of the dataset source to use ('fisheye8k', 'fisheye8k_mini')"
-                        }
-                    },
-                    "required": ["dataset_source"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "set_class_mapping_dataset_target",
-                "description": "Updates the dataset_target field inside the class_mapping section of config.py.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "dataset_target": {
-                            "type": "string",
-                            "description": "The name of the dataset target to use ('mcity_fisheye_2000', 'mcity_fisheye_2100')"
-                        }
-                    },
-                    "required": ["dataset_target"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "set_class_mapping_candidate_labels",
-                "description": "Updates the candidate_labels section in the class_mapping workflow. Supports one-to-many and one-to-one mappings.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "candidate_labels": {
-                            "type": "object",
-                            "description": "Mapping from source class label to list of generalized target class names.",
-                            "additionalProperties": {
-                                "type": "array",
-                                "items": { "type": "string" }
-                            }
-                        }
-                    },
-                    "required": ["candidate_labels"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "list_anomaly_detection_models",
-                "description": "Lists Anomalib image models available for anomaly detection.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {}
-                }
-            }
-        },
-
-        {
-            "type": "function",
-            "function": {
-                "name": "configure_anomaly_detection_model",
-                "description": "Enables the selected model for anomaly_detection by commenting out all other Anomalib models.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "selected_model": {
-                            "type": "string",
-                            "description": "The Anomalib image model to use (e.g., Padim, Draem, EfficientAd, Cfa)."
-                        }
-                    },
-                    "required": ["selected_model"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "set_embedding_selection_params",
-                "description": "Update embedding selection parameters like representativeness, uniqueness, similarity, and neighbour count.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "compute_representativeness": {
-                            "type": "number",
-                            "description": "Value between 0 and 1 that balances global representativeness."
-                        },
-                        "compute_unique_images_greedy": {
-                            "type": "number",
-                            "description": "Value between 0 and 1 for greedy uniqueness."
-                        },
-                        "compute_unique_images_deterministic": {
-                            "type": "number",
-                            "description": "Value between 0 and 1 for deterministic uniqueness."
-                        },
-                        "compute_similar_images": {
-                            "type": "number",
-                            "description": "Value between 0 and 1 for how many similar images to retain."
-                        },
-                        "neighbour_count": {
-                            "type": "integer",
-                            "description": "Number of neighbors to consider in embedding space."
-                        }
-                    }
-                }
-            }
-        },
-
-        {
-            "type": "function",
-            "function": {
-                "name": "list_embedding_selection_models",
-                "description": "Lists models available for embedding selection",
-                "parameters": {
-                    "type": "object",
-                    "properties": {}
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "configure_embedding_selection_model",
-                "description": "Enables the selected model for embedding_selection by commenting out all other models.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "selected_model": {
-                            "type": "string",
-                            "description": "The Embedding Selection model to use."
-                        }
-                    },
-                    "required": ["selected_model"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "set_anomaly_detection_data_source",
-                "description": "Update the location and rare_class used for anomaly detection in the data_preparation section.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "location": {
-                            "type": "string",
-                            "description": "The camera location (e.g., cam1, cam2) to set for anomaly detection."
-                        },
-                        "rare_class": {
-                            "type": "string",
-                            "description": "The class to be treated as rare or anomalous (e.g., Bus, Truck, Pedestrian)."
-                        }
-                    },
-                    "required": ["location", "rare_class"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "set_anomaly_detection_hyperparams",
-                "description": "Updates mode, epochs, and early_stop_patience in the anomaly_detection config.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "mode": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Execution mode(s), like ['train'], ['inference'], or both."
-                        },
-                        "epochs": {
-                            "type": "integer",
-                            "description": "Number of training epochs."
-                        },
-                        "early_stop_patience": {
-                            "type": "integer",
-                            "description": "Patience for early stopping (in epochs)."
-                        }
-                    }
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "list_zsal",
-                "description": "Lists models available for auto_labeling_zero_shot > hf_models_zeroshot_objectdetection.",
-                "parameters": {
-                "type": "object",
-                "properties": {}
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "configure_auto_labeling_zero_shot_models",
-                "description": "Enables the selected models for auto_labeling_zero_shot by commenting out all other models.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "selected_models": {
-                            "type": "array",
-                            "description": "List of zero-shot object detection models to use.",
-                            "items": {
-                                "type": "string"
-                            }
-                        }
-                    },
-                    "required": ["selected_models"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "set_auto_labeling_zero_shot_threshold",
-                "description": "Sets the detection threshold in the auto_labeling_zero_shot workflow.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "threshold": {
-                        "type": "number",
-                        "description": "Detection confidence threshold to use (e.g., 0.3)"
-                        }
-                    },
-                    "required": ["threshold"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "set_auto_labeling_zero_shot_classes",
-                "description": "Replaces the list of object classes to be detected in the auto_labeling_zero_shot workflow.",
-                "parameters": {
-                "type": "object",
-                "properties": {
-                        "object_classes": {
-                        "type": "array",
-                        "description": "List of object classes that the zero-shot model should detect.",
-                        "items": {
-                                "type": "string"
-                            }
-                        }
-                    },
-                "required": ["object_classes"]
-                }
-            }
-        },
-        {
-        "type": "function",
-        "function": {
-            "name": "set_ensemble_selection_parameters",
-            "description": "Update parameters for the ensemble selection workflow, including agreement threshold, IoU threshold, and maximum bounding box size.",
-            "parameters": {
-                "type": "object",
-                    "properties": {
-                        "agreement_threshold": {
-                            "type": "integer",
-                            "description": "Required. Minimum number of models that must agree on overlapping detections; must be >= 1 and <= number of zero-shot models used."
-                        },
-                        "iou_threshold": {
-                            "type": "number",
-                            "description": "Optional. Minimum Intersection-over-Union (IoU) for bounding boxes to be considered overlapping; must be between 0 and 1. Suggested default is 0.5."
-                        },
-                        "max_bbox_size": {
-                            "type": "number",
-                            "description": "Optional. Maximum relative area of bounding boxes (normalized to image size); must be between 0 and 1. Useful for filtering out overly large detections."
-                        }
-                    },
-                    "required": ["agreement_threshold"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "set_ensemble_selection_classes",
-                "description": "Updates the list of object classes to be used as positives in the ensemble_selection workflow.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "positive_classes": {
-                            "type": "array",
-                            "description": "List of object class names to retain as positive detections in ensemble selection.",
-                            "items": {
-                                "type": "string"
-                            }
-                        }
-                    },
-                    "required": ["positive_classes"]
                 }
             }
         },
@@ -664,7 +347,7 @@ tools = [
             "type": "function",
             "function": {
                 "name": "set_labeling_backend",
-                "description": "Set the active annotation backend for this session. Call this ONLY when the user directly names a backend as their choice ('CVAT', 'Label Studio', 'use CVAT', 'I prefer Label Studio'). A question ('what's the difference?', 'tell me more') is NOT a selection — answer it with send_reply and re-ask which they prefer. Do NOT call this if only one backend is configured — it is selected automatically.",
+                "description": "Set the active annotation backend for this session. Call this when the user names a backend as their choice, including softly-phrased decisions that still name a specific backend ('CVAT', 'use CVAT', 'I prefer Label Studio', 'can I use CVAT instead', 'let's switch to Label Studio', 'actually use CVAT'). Only treat it as a non-selection when the user asks for information WITHOUT naming a backend they want ('what's the difference?', 'tell me more', 'which is better?') — those get send_reply, re-asking which they prefer. Do NOT call this if only one backend is configured — it is selected automatically.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -683,11 +366,14 @@ tools = [
             "function": {
                 "name": "set_labeling_path",
                 "description": (
-                    "Call this IMMEDIATELY when the user names their labeling path at Step 3b. "
+                    "Call this IMMEDIATELY when the user names their labeling path at Step 3b, "
+                    "or explicitly asks to switch between manual and auto generated labeling later. "
                     "Use 'manual' when the user says 'Manual Labeling', 'annotate myself', etc. "
                     "Use 'auto' when the user says 'Auto Generated Labeling', 'run a model', etc. "
                     "This MUST be called before any export or model tool — it unlocks the correct "
-                    "downstream tools and persists the path so backend switches do not lose it."
+                    "downstream tools and persists the path so backend switches do not lose it. "
+                    "Do NOT call this for unrelated requests (backend changes, dataset changes, questions) — "
+                    "it only sets manual vs. auto, never re-call it with the path that is already active."
                 ),
                 "parameters": {
                     "type": "object",
@@ -745,61 +431,5 @@ tools = [
                 }
             }
         },
-        {
-            "type": "function",
-            "function": {
-                "name": "run_class_mapping",
-                "description": "Run main.py for class_mapping workflow and stream logs in real time.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {}
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "run_anomaly_detection",
-                "description": "Run main.py for anomaly_detection workflow and return the last 500 characters from combined output.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {}
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "run_embedding_selection",
-                "description": "Run main.py for embedding_selection workflow.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {}
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "run_zero_shot_auto_labeling",
-                "description": "Run main.py for zero shot autolabeling workflow.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {}
-                }
-            }
-        },
-
-        {
-            "type": "function",
-            "function": {
-                "name": "run_ensemble_selection",
-                "description": "Run main.py for ensemble_selection workflow and stream logs in real time.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {}
-                }
-            }
-        }
 
 ]

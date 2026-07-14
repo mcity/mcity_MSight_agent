@@ -3,16 +3,13 @@ import json
 import logging
 import os
 import re
+import sys
 from pathlib import Path
 
 from fastmcp import Client
-from fastmcp.client.transports import SSETransport
 
 from validate_workflow_state import (
-    WorkflowState, AutoLabelingState, ClassMappingState,
-    AnomalyDetectionState, EmbeddingSelectionState,
-    ZeroShotAutoLabelingState, EnsembleSelectionState,
-    WORKFLOW_DEPENDENCIES, validate_tool_input,
+    WorkflowState, AutoLabelingState, validate_tool_input,
     LabelingBackend, AutoLabelingPhase, LabelingPath,
 )
 
@@ -40,46 +37,10 @@ TOOL_STATUS_MESSAGES: dict[str, str] = {
     "confirm_run":                            "Recording run consent...",
     "reset_workflow_state":                   "Resetting workflow state...",
     "launch_voxel51_session":                "Launching Voxel51 visualization...",
-    "list_class_mapping_models":             "Fetching class mapping models...",
-    "configure_class_mapping_model":         "Configuring class mapping model...",
-    "run_class_mapping":                     "Running class mapping...",
-    "list_anomaly_detection_models":         "Fetching anomaly detection models...",
-    "configure_anomaly_detection_model":     "Configuring anomaly detection model...",
-    "run_anomaly_detection":                 "Running anomaly detection...",
-    "list_embedding_selection_models":       "Fetching embedding selection models...",
-    "configure_embedding_selection_model":   "Configuring embedding model...",
-    "run_embedding_selection":               "Running embedding selection...",
-    "list_zsal":                             "Fetching zero-shot models...",
-    "configure_auto_labeling_zero_shot_models": "Configuring zero-shot models...",
-    "run_zero_shot_auto_labeling":           "Running zero-shot auto-labeling...",
-    "set_ensemble_selection_parameters":     "Setting ensemble parameters...",
-    "set_ensemble_selection_classes":        "Setting ensemble classes...",
-    "run_ensemble_selection":                "Running ensemble selection...",
 }
 
 # Strip ANSI escape codes and bare CR from subprocess output.
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]|\r')
-
-# Aliases used to validate that the user actually named a workflow before switch_workflow fires.
-_WORKFLOW_ALIASES: dict[str, list[str]] = {
-    "auto_labeling":           ["auto labeling", "auto-labeling", "autolabeling"],
-    "class_mapping":           ["class mapping", "class-mapping", "classmapping"],
-    "anomaly_detection":       ["anomaly detection", "anomaly-detection", "anomaly"],
-    "embedding_selection":     ["embedding selection", "embedding-selection", "embedding"],
-    "auto_labeling_zero_shot": ["zero shot", "zero-shot", "zeroshot", "zero shot auto"],
-    "ensemble_selection":      ["ensemble selection", "ensemble-selection", "ensemble"],
-}
-
-_WORKFLOW_LIST_HARDSTOP = (
-    "I need to know which workflow you'd like to switch to. Here are your options:\n\n"
-    "1. Auto Labeling\n"
-    "2. Class Mapping\n"
-    "3. Anomaly Detection\n"
-    "4. Embedding Selection\n"
-    "5. Zero-Shot Auto Labeling\n"
-    "6. Ensemble Selection (Note: requires Zero-Shot Auto Labeling first)\n\n"
-    "Which one would you like?"
-)
 
 
 def unwrap_tool_output(raw) -> str:
@@ -161,8 +122,8 @@ class ChatPipeline:
     assistant tool_call_id without a matching tool result.
     """
 
-    def __init__(self, mcp_transport: SSETransport, llm):
-        self.transport = mcp_transport
+    def __init__(self, mcp_client: Client, llm):
+        self.mcp_client = mcp_client
         self.llm = llm
 
         self.state: WorkflowState = WorkflowState()
@@ -177,24 +138,6 @@ class ChatPipeline:
             "weight_decay": 0.0001,
             "max_grad_norm": 0.01,
         }
-        self.anomaly_detection_cache = {
-            "mode": ["train", "inference"],
-            "epochs": 12,
-            "early_stop_patience": 5,
-        }
-        self.embedding_selection_cache = {
-            "compute_representativeness": 0.99,
-            "compute_unique_images_greedy": 0.01,
-            "compute_unique_images_deterministic": 0.99,
-            "compute_similar_images": 0.03,
-            "neighbour_count": 3,
-        }
-        self.ensemble_selection_cache = {
-            "agreement_threshold": 3,
-            "iou_threshold": 0.5,
-            "max_bbox_size": 0.1,
-        }
-
         self._progress_cb = None  # async (event_type: str, data: dict) -> None
 
     def _set_flag_if_ok(
@@ -234,19 +177,6 @@ class ChatPipeline:
                       "learning_rate", "weight_decay", "max_grad_norm"):
                 if k in al_wf:
                     self.auto_labeling_cache[k] = al_wf[k]
-            ad_wf = _wf.get("anomaly_detection", {})
-            for k in ("mode", "epochs", "early_stop_patience"):
-                if k in ad_wf:
-                    self.anomaly_detection_cache[k] = ad_wf[k]
-            es_params = _wf.get("embedding_selection", {}).get("parameters", {})
-            for k in ("compute_representativeness", "compute_unique_images_greedy",
-                      "compute_unique_images_deterministic", "compute_similar_images", "neighbour_count"):
-                if k in es_params:
-                    self.embedding_selection_cache[k] = es_params[k]
-            ens_wf = _wf.get("ensemble_selection", {})
-            for k in ("agreement_threshold", "iou_threshold", "max_bbox_size"):
-                if k in ens_wf:
-                    self.ensemble_selection_cache[k] = ens_wf[k]
         except Exception:
             pass
 
@@ -257,43 +187,43 @@ class ChatPipeline:
             f"{[c.function.name for c in tool_calls]}"
         )
 
-        async with Client(self.transport) as mcp_client:
-            for call in tool_calls:
-                fn_name = call.function.name
+        mcp_client = self.mcp_client
+        for call in tool_calls:
+            fn_name = call.function.name
 
-                try:
-                    fn_args = json.loads(call.function.arguments)
-                except json.JSONDecodeError:
-                    fn_args = {}
+            try:
+                fn_args = json.loads(call.function.arguments)
+            except json.JSONDecodeError:
+                fn_args = {}
 
-                ok, err, fn_args = validate_tool_input(fn_name, fn_args)
-                if not ok:
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": call.id,
-                        "name": fn_name,
-                        "content": err,
-                    })
-                    tool_results.append({
-                        "tool_call_id": call.id,
-                        "name": fn_name,
-                        "fn_args": fn_args,
-                        "result": err,
-                    })
-                    all_routings.append([FallThrough()])
-                    logging.warning(f"[PIPELINE] Tool input validation failed for {fn_name}: {err}")
-                    continue
-
-                result, routings = await self._dispatch(
-                    fn_name, fn_args, call, mcp_client, messages, progress_cb
-                )
+            ok, err, fn_args = validate_tool_input(fn_name, fn_args)
+            if not ok:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "name": fn_name,
+                    "content": err,
+                })
                 tool_results.append({
                     "tool_call_id": call.id,
                     "name": fn_name,
                     "fn_args": fn_args,
-                    "result": result,
+                    "result": err,
                 })
-                all_routings.append(routings)
+                all_routings.append([FallThrough()])
+                logging.warning(f"[PIPELINE] Tool input validation failed for {fn_name}: {err}")
+                continue
+
+            result, routings = await self._dispatch(
+                fn_name, fn_args, call, mcp_client, messages, progress_cb
+            )
+            tool_results.append({
+                "tool_call_id": call.id,
+                "name": fn_name,
+                "fn_args": fn_args,
+                "result": result,
+            })
+            all_routings.append(routings)
 
         # Workflow reset wipes dataset_confirmed; re-apply if both fired in the same batch.
         workflow_reset_this_batch = any(
@@ -388,83 +318,6 @@ class ChatPipeline:
                     fn_args, mcp_client
                 )
 
-            elif fn_name == "configure_class_mapping_model":
-                result, routings = await self._handle_configure_class_mapping_model(
-                    fn_args, mcp_client
-                )
-
-            elif fn_name == "set_class_mapping_dataset_source":
-                result, routings = await self._handle_set_class_mapping_dataset_source(
-                    fn_args, mcp_client
-                )
-
-            elif fn_name == "set_class_mapping_dataset_target":
-                result, routings = await self._handle_set_class_mapping_dataset_target(
-                    fn_args, mcp_client
-                )
-
-            elif fn_name == "set_class_mapping_candidate_labels":
-                result, routings = await self._handle_set_class_mapping_candidate_labels(
-                    fn_args, mcp_client
-                )
-
-            elif fn_name == "run_class_mapping":
-                result, routings = await self._handle_run_class_mapping(mcp_client)
-
-            elif fn_name == "configure_anomaly_detection_model":
-                result, routings = await self._handle_configure_anomaly_detection_model(
-                    fn_args, mcp_client
-                )
-
-            elif fn_name == "set_anomaly_detection_data_source":
-                result, routings = await self._handle_set_anomaly_detection_data_source(
-                    fn_args, mcp_client
-                )
-
-            elif fn_name == "set_anomaly_detection_hyperparams":
-                result, routings = await self._handle_set_anomaly_detection_hyperparams(
-                    fn_args, mcp_client
-                )
-
-            elif fn_name == "run_anomaly_detection":
-                result, routings = await self._handle_run_anomaly_detection(mcp_client)
-
-            elif fn_name == "configure_embedding_selection_model":
-                result, routings = await self._handle_configure_embedding_selection_model(
-                    fn_args, mcp_client
-                )
-
-            elif fn_name == "set_embedding_selection_params":
-                result, routings = await self._handle_set_embedding_selection_params(
-                    fn_args, mcp_client
-                )
-
-            elif fn_name == "run_embedding_selection":
-                result, routings = await self._handle_run_embedding_selection(mcp_client)
-
-            elif fn_name == "configure_auto_labeling_zero_shot_models":
-                result, routings = await self._handle_configure_auto_labeling_zero_shot_models(fn_args, mcp_client)
-
-            elif fn_name == "set_auto_labeling_zero_shot_threshold":
-                result, routings = await self._handle_set_auto_labeling_zero_shot_threshold(fn_args, mcp_client)
-
-            elif fn_name == "set_auto_labeling_zero_shot_classes":
-                result, routings = await self._handle_set_auto_labeling_zero_shot_classes(fn_args, mcp_client)
-
-            elif fn_name == "run_zero_shot_auto_labeling":
-                result, routings = await self._handle_run_zero_shot_auto_labeling(mcp_client)
-
-            elif fn_name == "set_ensemble_selection_parameters":
-                result, routings = await self._handle_set_ensemble_selection_parameters(
-                    fn_args, mcp_client
-                )
-
-            elif fn_name == "set_ensemble_selection_classes":
-                result, routings = await self._handle_set_ensemble_classes(fn_args, mcp_client)
-
-            elif fn_name == "run_ensemble_selection":
-                result, routings = await self._handle_run_ensemble_selection(mcp_client)
-
             elif fn_name == "export_to_cvat":
                 result, routings = await self._handle_export_to_cvat(fn_args, mcp_client)
 
@@ -530,115 +383,57 @@ class ChatPipeline:
     async def _handle_select_or_switch_workflow(
         self, fn_name: str, fn_args: dict, mcp_client, messages: list | None = None
     ) -> tuple[str, list[ToolRouting]]:
-        """Reset state for the new workflow, check dependencies, then call the MCP tool."""
+        """Reset state for the (only) auto_labeling workflow, then call the MCP tool."""
         workflow_name = fn_args.get("workflow_name", "")
 
-        if fn_name == "switch_workflow":
-            if workflow_name:
-                if workflow_name == self.state.workflow_name:
-                    al = self.state.auto_labeling
+        if fn_name == "switch_workflow" and workflow_name:
+            al = self.state.auto_labeling
 
-                    # No dataset yet — guard against dataset-list loop.
-                    if not self.state.dataset_confirmed:
-                        logging.warning(
-                            f"[PIPELINE] switch_workflow: '{workflow_name}' already active "
-                            f"with no dataset confirmed — no-op to prevent loop"
-                        )
-                        result = (
-                            f"SWITCH_NOOP: Workflow '{workflow_name}' is already active "
-                            f"and awaiting dataset selection. "
-                            f"Call set_selected_dataset with the user's dataset name."
-                        )
-                        return result, [Injection(
-                            f"The workflow '{workflow_name}' is already active and no dataset "
-                            f"has been confirmed yet. If the user provided a dataset name, call "
-                            f"set_selected_dataset(dataset_name=<name>) immediately. "
-                            f"Do NOT call switch_workflow again."
-                        )]
-
-                    if al and al.phase in (AutoLabelingPhase.ANNOTATING, AutoLabelingPhase.TRAINING):
-                        action = "annotation export" if al.phase == AutoLabelingPhase.ANNOTATING else "auto-labeling run"
-                        logging.warning(
-                            f"[PIPELINE] switch_workflow blocked: phase={al.phase!r}"
-                        )
-                        result = (
-                            f"SWITCH_LOCKED: Cannot reconfigure mid-{action}. "
-                            f"Parameters are locked until the import step completes. "
-                            f"If the user explicitly wants to discard all progress and restart "
-                            f"from scratch, confirm with them first, then call switch_workflow "
-                            f"with a DIFFERENT workflow name, then switch back."
-                        )
-                        msg = result.split("SWITCH_LOCKED: ", 1)[1] if "SWITCH_LOCKED: " in result else result
-                        return result, [HardStop(msg)]
-
-                    if al and al.phase == AutoLabelingPhase.COMPLETE:
-                        logging.warning(
-                            f"[PIPELINE] switch_workflow full-reset: workflow complete, starting fresh"
-                        )
-                        self.state = self.state.reset_for_workflow(workflow_name)
-                        result = unwrap_tool_output(await mcp_client.call_tool(fn_name, fn_args))
-                        return result, [HardStop(await self._fetch_and_return_dataset_list())]
-
-                    logging.warning(
-                        f"[PIPELINE] switch_workflow full-reset (same workflow): '{workflow_name}'"
-                    )
-                    self.state = self.state.reset_for_workflow(workflow_name)
-                    result = unwrap_tool_output(await mcp_client.call_tool(fn_name, fn_args))
-                    return result, [HardStop(await self._fetch_and_return_dataset_list())]
-
-                # Different workflow — verify the user actually named it.
-                recent_text = " ".join(
-                    m["content"].lower() for m in (messages or [])[-6:]
-                    if m.get("role") == "user" and isinstance(m.get("content"), str)
+            # No dataset yet — guard against dataset-list loop.
+            if not self.state.dataset_confirmed:
+                logging.warning(
+                    f"[PIPELINE] switch_workflow: '{workflow_name}' already active "
+                    f"with no dataset confirmed — no-op to prevent loop"
                 )
-                aliases = _WORKFLOW_ALIASES.get(workflow_name, [])
-                user_named_it = (
-                    workflow_name.replace("_", " ") in recent_text
-                    or workflow_name in recent_text
-                    or any(a in recent_text for a in aliases)
+                result = (
+                    f"SWITCH_NOOP: Workflow '{workflow_name}' is already active "
+                    f"and awaiting dataset selection. "
+                    f"Call set_selected_dataset with the user's dataset name."
                 )
-                if not user_named_it:
-                    logging.warning(
-                        f"[PIPELINE] switch_workflow blocked: '{workflow_name}' not found "
-                        f"in recent user messages — returning workflow list"
-                    )
-                    return "SWITCH_NEEDS_SELECTION", [HardStop(_WORKFLOW_LIST_HARDSTOP)]
+                return result, [Injection(
+                    f"The workflow '{workflow_name}' is already active and no dataset "
+                    f"has been confirmed yet. If the user provided a dataset name, call "
+                    f"set_selected_dataset(dataset_name=<name>) immediately. "
+                    f"Do NOT call switch_workflow again."
+                )]
 
-                deps = WORKFLOW_DEPENDENCIES.get(workflow_name, [])
-                if deps:
-                    completed = [
-                        wf for wf in [
-                            "auto_labeling", "class_mapping", "anomaly_detection",
-                            "embedding_selection", "auto_labeling_zero_shot", "ensemble_selection"
-                        ]
-                        if getattr(self.state, wf, None) is not None
-                    ]
-                    ok, msg = self.state.check_workflow_dependencies(workflow_name, completed)
-                    if not ok:
-                        logging.warning(
-                            f"[PIPELINE] switch_workflow blocked: unmet deps for '{workflow_name}'"
-                        )
-                        return msg, [HardStop(msg)]
+            if al and al.phase in (AutoLabelingPhase.ANNOTATING, AutoLabelingPhase.TRAINING) and not fn_args.get("confirm_restart"):
+                action = "annotation export" if al.phase == AutoLabelingPhase.ANNOTATING else "auto-labeling run"
+                logging.warning(
+                    f"[PIPELINE] switch_workflow blocked: phase={al.phase!r}"
+                )
+                result = (
+                    f"SWITCH_LOCKED: Cannot reconfigure mid-{action}. "
+                    f"Parameters are locked until the import step completes. "
+                    f"If the user explicitly wants to discard all progress and restart "
+                    f"from scratch, confirm with them first, then call switch_workflow "
+                    f"again with confirm_restart=true."
+                )
+                msg = result.split("SWITCH_LOCKED: ", 1)[1] if "SWITCH_LOCKED: " in result else result
+                return result, [HardStop(msg)]
 
-                self.state = self.state.reset_for_workflow(workflow_name)
-            else:
-                self.state = WorkflowState()
-                self.state.save()
+            logging.warning(
+                f"[PIPELINE] switch_workflow full-reset: '{workflow_name}'"
+            )
+            self.state = self.state.reset_for_workflow(workflow_name)
             result = unwrap_tool_output(await mcp_client.call_tool(fn_name, fn_args))
             return result, [HardStop(await self._fetch_and_return_dataset_list())]
 
-        deps = WORKFLOW_DEPENDENCIES.get(workflow_name, [])
-        if deps:
-            completed = [
-                wf for wf in [
-                    "auto_labeling", "class_mapping", "anomaly_detection",
-                    "embedding_selection", "auto_labeling_zero_shot", "ensemble_selection"
-                ]
-                if getattr(self.state, wf, None) is not None
-            ]
-            ok, msg = self.state.check_workflow_dependencies(workflow_name, completed)
-            if not ok:
-                return msg, [HardStop(msg)]
+        if fn_name == "switch_workflow":
+            self.state = WorkflowState()
+            self.state.save()
+            result = unwrap_tool_output(await mcp_client.call_tool(fn_name, fn_args))
+            return result, [HardStop(await self._fetch_and_return_dataset_list())]
 
         self.state = self.state.reset_for_workflow(workflow_name)
         result = unwrap_tool_output(await mcp_client.call_tool(fn_name, fn_args))
@@ -723,9 +518,6 @@ class ChatPipeline:
         self.state.dataset_name = dataset_name
         self.state.dataset_confirmed = True
         self.state.save()
-
-        if self.state.workflow_name != "auto_labeling":
-            return tool_output, [Injection(f"DATASET_CONFIRMED: {dataset_name}")]
 
         al = self.state.auto_labeling
         effective_backend = (al.labeling_backend if al else "") or initial_backend
@@ -1086,409 +878,6 @@ class ChatPipeline:
             f"Would you like to change anything else, or are you ready to start?"
         )]
 
-    # Class mapping
-
-    async def _handle_configure_class_mapping_model(
-        self, fn_args: dict, mcp_client
-    ) -> tuple[str, list[ToolRouting]]:
-        if self.state.class_mapping is None:
-            self.state.class_mapping = ClassMappingState()
-        result = unwrap_tool_output(await mcp_client.call_tool("configure_class_mapping_model", fn_args))
-        # No error sentinel from this MCP tool — it always returns a success string.
-        # Follow-up: add a sentinel on the MCP server side (e.g. "INVALID_MODEL") so
-        # a bad model name can be detected here without setting the flag.
-        stop = self._set_flag_if_ok(result, [], lambda: setattr(self.state.class_mapping, "model_configured", True))
-        if stop:
-            return result, [stop]
-        model = fn_args.get("selected_model", "?")
-        return result, [Injection(
-            f"CLASS_MAPPING_MODEL_CONFIGURED: model={model!r}. "
-            f"Acknowledge to the user that the model is configured. "
-            f"Ask for source dataset (supported: fisheye8k, fisheye8k_mini)."
-        )]
-
-    async def _handle_set_class_mapping_dataset_source(
-        self, fn_args: dict, mcp_client
-    ) -> tuple[str, list[ToolRouting]]:
-        if self.state.class_mapping is None:
-            self.state.class_mapping = ClassMappingState()
-        result = unwrap_tool_output(
-            await mcp_client.call_tool("set_class_mapping_dataset_source", fn_args)
-        )
-        # The MCP tool writes the config name before attempting to load the dataset.
-        # If the load fails it returns "but failed to load: <err>" but the config was
-        # already updated, so the flag is still set (the name is persisted).
-        # Follow-up: add a DATASET_NOT_FOUND sentinel *before* the write so the config
-        # is not corrupted with an invalid dataset name.
-        stop = self._set_flag_if_ok(result, [], lambda: setattr(self.state.class_mapping, "source_dataset_set", True))
-        if stop:
-            return result, [stop]
-        src = fn_args.get("dataset_source", "?")
-        return result, [Injection(
-            f"CLASS_MAPPING_SOURCE_SET: source={src!r}. "
-            f"Acknowledge to the user that the source dataset is confirmed. "
-            f"Ask for target dataset (supported: mcity_fisheye_2000, mcity_fisheye_2100)."
-        )]
-
-    async def _handle_set_class_mapping_dataset_target(
-        self, fn_args: dict, mcp_client
-    ) -> tuple[str, list[ToolRouting]]:
-        if self.state.class_mapping is None:
-            self.state.class_mapping = ClassMappingState()
-        result = unwrap_tool_output(
-            await mcp_client.call_tool("set_class_mapping_dataset_target", fn_args)
-        )
-        # No error sentinel from this MCP tool — it always returns a success string.
-        # Follow-up: add a sentinel on the MCP server side (e.g. "INVALID_TARGET") so
-        # an unlisted target dataset name can be detected before setting this flag.
-        stop = self._set_flag_if_ok(result, [], lambda: setattr(self.state.class_mapping, "target_dataset_set", True))
-        if stop:
-            return result, [stop]
-        tgt = fn_args.get("dataset_target", "?")
-        return result, [Injection(
-            f"CLASS_MAPPING_TARGET_SET: target={tgt!r}. "
-            f"Acknowledge to the user that the target dataset is confirmed. "
-            f"Ask the user to provide their class mapping (e.g., 'Map Car to car and van'). "
-            f"Suggest opening Voxel51 to inspect both datasets — label names are case-sensitive."
-        )]
-
-    async def _handle_set_class_mapping_candidate_labels(
-        self, fn_args: dict, mcp_client
-    ) -> tuple[str, list[ToolRouting]]:
-        if self.state.class_mapping is None:
-            self.state.class_mapping = ClassMappingState()
-        result = unwrap_tool_output(
-            await mcp_client.call_tool("set_class_mapping_candidate_labels", fn_args)
-        )
-        # "Failed to locate" means the AST rewrite could not find the candidate_labels
-        # block — config was NOT written; do not set the flag.
-        stop = self._set_flag_if_ok(result, ["Failed to locate"], lambda: setattr(self.state.class_mapping, "candidate_labels_set", True))
-        if stop:
-            return result, [stop]
-        labels = fn_args.get("candidate_labels", {})
-        mapping_lines = "\n".join(
-            f"- {src_cls} → {', '.join(tgts)}"
-            for src_cls, tgts in labels.items()
-        )
-        return result, [Injection(
-            f"CLASS_MAPPING_LABELS_SET:\n{mapping_lines}\n"
-            f"Show the user the mapping summary above. "
-            f"Tell them to confirm when ready to run class mapping."
-        )]
-
-    async def _handle_run_class_mapping(
-        self, mcp_client
-    ) -> tuple[str, list[ToolRouting]]:
-        if self.state.class_mapping is None:
-            self.state.class_mapping = ClassMappingState()
-        ok, msg = self.state.class_mapping.can_run_class_mapping(self.state.dataset_confirmed)
-        if not ok:
-            return msg, [FallThrough()]
-        result = unwrap_tool_output(await mcp_client.call_tool("run_class_mapping", {}))
-        return result, [HardStop(await self._format_class_mapping_reply(result))]
-
-    # Anomaly detection
-
-    async def _handle_configure_anomaly_detection_model(
-        self, fn_args: dict, mcp_client
-    ) -> tuple[str, list[ToolRouting]]:
-        if self.state.anomaly_detection is None:
-            self.state.anomaly_detection = AnomalyDetectionState()
-        result = unwrap_tool_output(
-            await mcp_client.call_tool("configure_anomaly_detection_model", fn_args)
-        )
-        # "not found in" means the model name is not in anomalib_image_models;
-        # the MCP tool returns before writing to config — do not set the flag.
-        stop = self._set_flag_if_ok(result, ["not found in"], lambda: setattr(self.state.anomaly_detection, "model_configured", True))
-        if stop:
-            return result, [stop]
-        model = fn_args.get("selected_model", "?")
-        return result, [Injection(
-            f"ANOMALY_MODEL_CONFIGURED: model={model!r}. "
-            f"Acknowledge that the model is configured. Suggest visualizing the dataset "
-            f"in Voxel51 to explore camera locations and rare classes. "
-            f"Ask the user to provide a camera location (e.g., cam1, cam2) "
-            f"and the rare class to treat as anomaly (e.g., Bus, Pedestrian)."
-        )]
-
-    async def _handle_set_anomaly_detection_data_source(
-        self, fn_args: dict, mcp_client
-    ) -> tuple[str, list[ToolRouting]]:
-        if self.state.anomaly_detection is None:
-            self.state.anomaly_detection = AnomalyDetectionState()
-        result = unwrap_tool_output(
-            await mcp_client.call_tool("set_anomaly_detection_data_source", fn_args)
-        )
-        # No error sentinel from this MCP tool — it always returns a success string.
-        # Follow-up: add a sentinel on the MCP server side (e.g. "INVALID_LOCATION")
-        # so invalid location/rare_class values can be detected before setting this flag.
-        stop = self._set_flag_if_ok(result, [], lambda: setattr(self.state.anomaly_detection, "data_source_set", True))
-        if stop:
-            return result, [stop]
-        location   = fn_args.get("location", "?")
-        rare_class = fn_args.get("rare_class", "?")
-        return result, [Injection(
-            f"ANOMALY_DATA_SOURCE_SET: location={location!r} rare_class={rare_class!r}. "
-            f"Acknowledge that data source is configured. "
-            f"Ask if they want to adjust hyperparameters (mode, epochs, early_stop_patience) "
-            f"or if they are ready to run."
-        )]
-
-    async def _handle_set_anomaly_detection_hyperparams(
-        self, fn_args: dict, mcp_client
-    ) -> tuple[str, list[ToolRouting]]:
-        if self.state.anomaly_detection is None:
-            self.state.anomaly_detection = AnomalyDetectionState()
-        for k, v in fn_args.items():
-            if v is not None:
-                self.anomaly_detection_cache[k] = v
-        result = unwrap_tool_output(
-            await mcp_client.call_tool(
-                "set_anomaly_detection_hyperparams", self.anomaly_detection_cache.copy()
-            )
-        )
-        # No error sentinel from this MCP tool — it always returns a success string.
-        # Follow-up: add a sentinel on the MCP server side for out-of-range values.
-        stop = self._set_flag_if_ok(result, [], lambda: setattr(self.state.anomaly_detection, "hyperparams_confirmed", True))
-        if stop:
-            return result, [stop]
-        changed = {k: v for k, v in fn_args.items() if v is not None}
-        changed_lines = "\n".join(f"- **{k}**: {v}" for k, v in changed.items())
-        d = self.anomaly_detection_cache
-        return result, [HardStop(
-            f"Updated:\n{changed_lines}\n\n"
-            f"Current hyperparameters:\n\n"
-            f"- mode: {d.get('mode')}\n"
-            f"- epochs: {d.get('epochs')}\n"
-            f"- early_stop_patience: {d.get('early_stop_patience')}\n\n"
-            f"Would you like to change anything else, or are you ready to run?"
-        )]
-
-    async def _handle_run_anomaly_detection(
-        self, mcp_client
-    ) -> tuple[str, list[ToolRouting]]:
-        if self.state.anomaly_detection is None:
-            self.state.anomaly_detection = AnomalyDetectionState()
-        ok, msg = self.state.anomaly_detection.can_run_anomaly_detection(self.state.dataset_confirmed)
-        if not ok:
-            return msg, [FallThrough()]
-        result = unwrap_tool_output(await mcp_client.call_tool("run_anomaly_detection", {}))
-        return result, [HardStop(await self._format_anomaly_detection_reply(result))]
-
-    # Embedding selection
-
-    async def _handle_configure_embedding_selection_model(
-        self, fn_args: dict, mcp_client
-    ) -> tuple[str, list[ToolRouting]]:
-        if self.state.embedding_selection is None:
-            self.state.embedding_selection = EmbeddingSelectionState()
-        result = unwrap_tool_output(
-            await mcp_client.call_tool("configure_embedding_selection_model", fn_args)
-        )
-        # No error sentinel from this MCP tool — it always returns a success string.
-        # Follow-up: add a sentinel on the MCP server side (e.g. "INVALID_MODEL") so
-        # an unlisted model name can be detected before setting this flag.
-        stop = self._set_flag_if_ok(result, [], lambda: setattr(self.state.embedding_selection, "model_configured", True))
-        if stop:
-            return result, [stop]
-        model = fn_args.get("selected_model", "?")
-        d = self.embedding_selection_cache
-        return result, [Injection(
-            f"EMBEDDING_MODEL_CONFIGURED: model={model!r}. "
-            f"Acknowledge that the model is configured. "
-            f"List the adjustable parameters with their current defaults: "
-            f"compute_representativeness={d.get('compute_representativeness')}, "
-            f"compute_unique_images_greedy={d.get('compute_unique_images_greedy')}, "
-            f"compute_unique_images_deterministic={d.get('compute_unique_images_deterministic')}, "
-            f"compute_similar_images={d.get('compute_similar_images')}, "
-            f"neighbour_count={d.get('neighbour_count')}. "
-            f"Ask if they want to modify any or proceed with defaults."
-        )]
-
-    async def _handle_set_embedding_selection_params(
-        self, fn_args: dict, mcp_client
-    ) -> tuple[str, list[ToolRouting]]:
-        if self.state.embedding_selection is None:
-            self.state.embedding_selection = EmbeddingSelectionState()
-        for k, v in fn_args.items():
-            if v is not None:
-                self.embedding_selection_cache[k] = v
-        result = unwrap_tool_output(
-            await mcp_client.call_tool(
-                "set_embedding_selection_params", self.embedding_selection_cache.copy()
-            )
-        )
-        # No error sentinel from this MCP tool — it always returns a success string.
-        # Follow-up: add a sentinel on the MCP server side for out-of-range parameters.
-        stop = self._set_flag_if_ok(result, [], lambda: setattr(self.state.embedding_selection, "params_set", True))
-        if stop:
-            return result, [stop]
-        changed = {k: v for k, v in fn_args.items() if v is not None}
-        changed_lines = "\n".join(f"- **{k}**: {v}" for k, v in changed.items())
-        d = self.embedding_selection_cache
-        return result, [HardStop(
-            f"Updated:\n{changed_lines}\n\n"
-            f"Current parameters:\n\n"
-            f"- compute_representativeness: {d.get('compute_representativeness')}\n"
-            f"- compute_unique_images_greedy: {d.get('compute_unique_images_greedy')}\n"
-            f"- compute_unique_images_deterministic: {d.get('compute_unique_images_deterministic')}\n"
-            f"- compute_similar_images: {d.get('compute_similar_images')}\n"
-            f"- neighbour_count: {d.get('neighbour_count')}\n\n"
-            f"Would you like to change anything else, or are you ready to run?"
-        )]
-
-    async def _handle_run_embedding_selection(
-        self, mcp_client
-    ) -> tuple[str, list[ToolRouting]]:
-        if self.state.embedding_selection is None:
-            self.state.embedding_selection = EmbeddingSelectionState()
-        ok, msg = self.state.embedding_selection.can_run_embedding_selection(self.state.dataset_confirmed)
-        if not ok:
-            return msg, [FallThrough()]
-        result = unwrap_tool_output(await mcp_client.call_tool("run_embedding_selection", {}))
-        return result, [HardStop(self._format_embedding_selection_reply(result))]
-
-    # Zero-shot auto-labeling
-
-    async def _handle_configure_auto_labeling_zero_shot_models(
-        self, fn_args: dict, mcp_client
-    ) -> tuple[str, list[ToolRouting]]:
-        if self.state.auto_labeling_zero_shot is None:
-            self.state.auto_labeling_zero_shot = ZeroShotAutoLabelingState()
-        result = unwrap_tool_output(
-            await mcp_client.call_tool("configure_auto_labeling_zero_shot_models", fn_args)
-        )
-        # No error sentinel from this MCP tool — it always returns a success string.
-        # Follow-up: add a sentinel on the MCP server side (e.g. "INVALID_MODEL") so
-        # unlisted model names can be detected before setting this flag.
-        stop = self._set_flag_if_ok(result, [], lambda: setattr(self.state.auto_labeling_zero_shot, "models_configured", True))
-        if stop:
-            return result, [stop]
-        models   = fn_args.get("selected_models", [])
-        models_s = ", ".join(models) if models else "?"
-        return result, [Injection(
-            f"ZERO_SHOT_MODELS_CONFIGURED: models=[{models_s}]. "
-            f"Acknowledge that the models are configured. "
-            f"Ask for detection threshold (default: 0.2)."
-        )]
-
-    async def _handle_set_auto_labeling_zero_shot_threshold(
-        self, fn_args: dict, mcp_client
-    ) -> tuple[str, list[ToolRouting]]:
-        if self.state.auto_labeling_zero_shot is None:
-            self.state.auto_labeling_zero_shot = ZeroShotAutoLabelingState()
-        result = unwrap_tool_output(
-            await mcp_client.call_tool("set_auto_labeling_zero_shot_threshold", fn_args)
-        )
-        # No error sentinel from this MCP tool — it always returns a success string.
-        # Follow-up: add a sentinel on the MCP server side for out-of-range threshold.
-        stop = self._set_flag_if_ok(result, [], lambda: setattr(self.state.auto_labeling_zero_shot, "threshold_set", True))
-        if stop:
-            return result, [stop]
-        threshold = fn_args.get("threshold", "?")
-        return result, [Injection(
-            f"ZERO_SHOT_THRESHOLD_SET: threshold={threshold}. "
-            f"Acknowledge that threshold is set. "
-            f"Ask what object classes to detect (e.g., car, bus, pedestrian)."
-        )]
-
-    async def _handle_set_auto_labeling_zero_shot_classes(
-        self, fn_args: dict, mcp_client
-    ) -> tuple[str, list[ToolRouting]]:
-        if self.state.auto_labeling_zero_shot is None:
-            self.state.auto_labeling_zero_shot = ZeroShotAutoLabelingState()
-        result = unwrap_tool_output(
-            await mcp_client.call_tool("set_auto_labeling_zero_shot_classes", fn_args)
-        )
-        # No error sentinel from this MCP tool — it always returns a success string.
-        # Follow-up: add a sentinel on the MCP server side for empty/invalid class lists.
-        stop = self._set_flag_if_ok(result, [], lambda: setattr(self.state.auto_labeling_zero_shot, "classes_set", True))
-        if stop:
-            return result, [stop]
-        classes   = fn_args.get("object_classes", [])
-        classes_s = ", ".join(classes) if classes else "?"
-        return result, [Injection(
-            f"ZERO_SHOT_CLASSES_SET: classes=[{classes_s}]. "
-            f"Acknowledge that detection classes are set. "
-            f"Tell the user to confirm when ready to run zero-shot auto-labeling."
-        )]
-
-    async def _handle_run_zero_shot_auto_labeling(
-        self, mcp_client
-    ) -> tuple[str, list[ToolRouting]]:
-        if self.state.auto_labeling_zero_shot is None:
-            self.state.auto_labeling_zero_shot = ZeroShotAutoLabelingState()
-        ok, msg = self.state.auto_labeling_zero_shot.can_run_zero_shot(self.state.dataset_confirmed)
-        if not ok:
-            return msg, [FallThrough()]
-        result = unwrap_tool_output(await mcp_client.call_tool("run_zero_shot_auto_labeling", {}))
-        return result, [HardStop(self._format_zero_shot_reply(result))]
-
-    # Ensemble selection
-
-    async def _handle_set_ensemble_selection_parameters(
-        self, fn_args: dict, mcp_client
-    ) -> tuple[str, list[ToolRouting]]:
-        if self.state.ensemble_selection is None:
-            self.state.ensemble_selection = EnsembleSelectionState()
-        for k, v in fn_args.items():
-            if v is not None:
-                self.ensemble_selection_cache[k] = v
-        result = unwrap_tool_output(
-            await mcp_client.call_tool(
-                "set_ensemble_selection_parameters", self.ensemble_selection_cache.copy()
-            )
-        )
-        # No error sentinel from this MCP tool — it always returns a success string.
-        # Follow-up: add a sentinel on the MCP server side for out-of-range parameters.
-        stop = self._set_flag_if_ok(result, [], lambda: setattr(self.state.ensemble_selection, "params_set", True))
-        if stop:
-            return result, [stop]
-        changed = {k: v for k, v in fn_args.items() if v is not None}
-        changed_lines = "\n".join(f"- **{k}**: {v}" for k, v in changed.items())
-        d = self.ensemble_selection_cache
-        return result, [HardStop(
-            f"Updated:\n{changed_lines}\n\n"
-            f"Current parameters:\n\n"
-            f"- agreement_threshold: {d.get('agreement_threshold')}\n"
-            f"- iou_threshold: {d.get('iou_threshold')}\n"
-            f"- max_bbox_size: {d.get('max_bbox_size')}\n\n"
-            f"Which classes would you like to use as positives for ensemble selection? "
-            f"(Should be a subset of your zero-shot auto-labeling classes.)"
-        )]
-
-    async def _handle_set_ensemble_classes(
-        self, fn_args: dict, mcp_client
-    ) -> tuple[str, list[ToolRouting]]:
-        if self.state.ensemble_selection is None:
-            self.state.ensemble_selection = EnsembleSelectionState()
-        result = unwrap_tool_output(
-            await mcp_client.call_tool("set_ensemble_selection_classes", fn_args)
-        )
-        # No error sentinel from this MCP tool — it always returns a success string.
-        # Follow-up: add a sentinel on the MCP server side for empty/invalid class lists.
-        stop = self._set_flag_if_ok(result, [], lambda: setattr(self.state.ensemble_selection, "classes_set", True))
-        if stop:
-            return result, [stop]
-        classes   = fn_args.get("positive_classes", [])
-        classes_s = ", ".join(classes) if classes else "?"
-        return result, [Injection(
-            f"ENSEMBLE_CLASSES_SET: classes=[{classes_s}]. "
-            f"Acknowledge that positive classes are set. "
-            f"Tell the user to confirm when ready to run ensemble selection."
-        )]
-
-    async def _handle_run_ensemble_selection(
-        self, mcp_client
-    ) -> tuple[str, list[ToolRouting]]:
-        if self.state.ensemble_selection is None:
-            self.state.ensemble_selection = EnsembleSelectionState()
-        ok, msg = self.state.ensemble_selection.can_run_ensemble_selection(self.state.dataset_confirmed)
-        if not ok:
-            return msg, [FallThrough()]
-        result = unwrap_tool_output(await mcp_client.call_tool("run_ensemble_selection", {}))
-        return result, [HardStop(self._format_ensemble_reply(result))]
-
     async def _handle_confirm_export(self) -> tuple[str, list[ToolRouting]]:
         if self.state.auto_labeling is None:
             self.state.auto_labeling = AutoLabelingState()
@@ -1729,7 +1118,7 @@ class ChatPipeline:
             return sentinel, [HardStop(self._format_run_confirmation_prompt())]
 
         process = await asyncio.create_subprocess_exec(
-            "python", "-u", str(MAIN_PATH),
+            sys.executable, "-u", str(MAIN_PATH),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(MAIN_PATH.parent),
@@ -2065,10 +1454,11 @@ class ChatPipeline:
             tool_name, {"dataset_name": dataset_name, "with_predictions": True}
         )
         export_msg = unwrap_tool_output(export_result)
+        success = ("Project ID" in export_msg) if is_ls else ("Task ID:" in export_msg)
 
         al = self.state.auto_labeling
-        if al:
-            if is_ls and "Project ID" in export_msg:
+        if al and success:
+            if is_ls:
                 try:
                     tasks_file = Path(__file__).resolve().parents[1] / "output" / "ls_tasks.json"
                     if tasks_file.exists():
@@ -2078,13 +1468,20 @@ class ChatPipeline:
                             self.state.save()
                 except Exception:
                     pass
-            elif not is_ls and "Task ID:" in export_msg:
+            else:
                 try:
                     task_id = int(export_msg.split("Task ID:")[1].split()[0].strip())
                     al.cvat_task_id = task_id
                     self.state.save()
                 except Exception:
                     pass
+
+        if not success:
+            return (
+                f"\n\n{export_msg}"
+                f"\n\nExport to {backend_label} did not complete — the predictions were not uploaded. "
+                f"Let me know how you'd like to proceed."
+            )
 
         return (
             f"\n\n{export_msg}"
@@ -2145,67 +1542,24 @@ class ChatPipeline:
             )
         return tool_output.strip()
 
-    async def _format_class_mapping_reply(self, tool_output: str) -> str:
-        summary = await self.llm.summarize_class_mapping_output(tool_output)
-        return (
-            f"{summary}\n[source: tool result — run_class_mapping]\n\n"
-            f"Class Mapping Output:\n```\n{tool_output.strip()}\n```"
-        )
-
-    async def _format_anomaly_detection_reply(self, tool_output: str) -> str:
-        summary = await self.llm.summarize_anomaly_detection_output(tool_output)
-        return (
-            f"{summary}\n[source: tool result — run_anomaly_detection]\n\n"
-            f"Anomaly Detection Output:\n```\n{tool_output.strip()}\n```"
-        )
-
-    def _format_embedding_selection_reply(self, tool_output: str) -> str:
-        return (
-            f"{tool_output.strip()}\n\n"
-            f"Would you like to launch Voxel51 to explore the curated subset?"
-        )
-
-    def _format_zero_shot_reply(self, tool_output: str) -> str:
-        return (
-            f"{tool_output.strip()}\n"
-            f"You can now use the Ensemble Selection workflow to identify detections "
-            f"where multiple models agree.\n"
-            f"Would you like to launch Voxel51 to explore the results?"
-        )
-
-    def _format_ensemble_reply(self, tool_output: str) -> str:
-        return (
-            f"{tool_output.strip()}\n\n"
-            f"Would you like to launch Voxel51 to explore the results?\n\n"
-            f"- In the ENSEMBLE SELECTION section of the left sidebar, use the "
-            f"`n_unique_ensemble_selection` field as a filter. "
-            f"- It represents the number of overlapping objects retained in each "
-            f"sample based on model agreement. "
-            f"- Once you select a sample image, use the `detections_overlap` tag "
-            f"from the TAGS panel to visualize only those detections that had "
-            f"sufficient overlap and were retained by the ensemble logic."
-        )
-
     async def _dataset_not_found_reply(self) -> str:
-        async with Client(self.transport) as list_client:
-            try:
-                list_result = await list_client.call_tool("list_datasets", {})
-                list_output = unwrap_tool_output(list_result)
-                return (
-                    f"That dataset name wasn't recognized. "
-                    f"Here are the available datasets:\n\n{list_output}\n\n"
-                    f"Please select the correct name or re-ingest if needed."
-                )
-            except Exception as e:
-                return f"Dataset not found and couldn't fetch the list: {e}"
+        try:
+            list_result = await self.mcp_client.call_tool("list_datasets", {})
+            list_output = unwrap_tool_output(list_result)
+            return (
+                f"That dataset name wasn't recognized. "
+                f"Here are the available datasets:\n\n{list_output}\n\n"
+                f"Please select the correct name or re-ingest if needed."
+            )
+        except Exception as e:
+            return f"Dataset not found and couldn't fetch the list: {e}"
 
     async def _fetch_and_return_dataset_list(self) -> str:
         """Fetch and format the dataset list for display after a workflow switch."""
-        async with Client(self.transport) as mcp_client:
-            try:
-                raw = unwrap_tool_output(await mcp_client.call_tool("list_datasets", {}))
-            except Exception as e:
-                return f"Workflow switched. Could not fetch datasets: {e}"
+        try:
+            raw = unwrap_tool_output(await self.mcp_client.call_tool("list_datasets", {}))
+        except Exception as e:
+            return f"Workflow switched. Could not fetch datasets: {e}"
         try:
             datasets = json.loads(raw)
             if isinstance(datasets, list):

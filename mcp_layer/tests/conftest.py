@@ -8,7 +8,7 @@ Adds the project root and mcp_layer/ to sys.path so that:
 import sys
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]   # .../mcity_data_engine_msight
+_REPO_ROOT = Path(__file__).resolve().parents[2]   # .../mcity_data_agent
 _MCP_LAYER  = _REPO_ROOT / "mcp_layer"
 
 for _p in (_REPO_ROOT, _MCP_LAYER):

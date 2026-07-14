@@ -18,7 +18,6 @@ django-filter==2.4.0
 djangorestframework==3.15.2
 einops==0.8.0
 filelock==3.16.1
-fiftyone==1.4.1
 fiftyone-brain==0.20.1
 fonttools==4.54.1
 fsspec==2024.6.1
@@ -71,7 +70,6 @@ fastapi==0.115.12
 fastmcp==2.3.3
 uvicorn==0.34.2
 
-openai==2.15.0
 google-generativeai==0.8.5
 google-ai-generativelanguage==0.6.15
 google-api-python-client==2.170.0
@@ -115,4 +113,4 @@ groovy==0.1.2
 datasets==3.5.0
 nuscenes-devkit @ git+https://github.com/daniel-bogdoll/nuscenes-devkit.git@e9a832e608484c5496c6236ed78a185be6d7a44b
 colorlog==6.8.2
-imgaug @ git+https://github.com/beastless/imgaug.git@a24a2215d3efb6260ea8456c7661ddc91b1a9160
+imgaug==0.4.0
