@@ -19,7 +19,7 @@ from validate_workflow_state import WorkflowState, AutoLabelingState
 
 
 def make_pipeline():
-    pipeline = ChatPipeline(mcp_transport=MagicMock(), llm=MagicMock())
+    pipeline = ChatPipeline(mcp_client=MagicMock(), llm=MagicMock())
     pipeline.state = WorkflowState(
         workflow_name="auto_labeling",
         auto_labeling=AutoLabelingState(),

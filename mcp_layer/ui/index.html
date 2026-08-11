@@ -97,9 +97,28 @@ box-shadow:var(--shadow);line-height:1.45;white-space:pre-wrap;word-wrap:break-w
 .agent .bubble{background:var(--agent);border:1px solid var(--border);border-bottom-left-radius:6px}
 .typing{opacity:.7;font-size:13px;color:var(--muted);padding:0 4px 6px 4px}
 .composer{
-display:grid;grid-template-columns:1fr auto;gap:10px;padding:12px;border-top:1px solid var(--border);
+display:grid;grid-template-columns:1fr auto auto;gap:10px;padding:12px;border-top:1px solid var(--border);
 background:linear-gradient(180deg, rgba(3,6,18,.6), rgba(3,6,18,.85))
 }
+#calibUploadBtn{min-width:44px;padding:0;font-size:18px;background:#0a1224}
+#calibUploadBtn:hover{background:#101c36}
+.calib-modal{
+position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:50
+}
+.calib-modal.hidden{display:none}
+.calib-modal-inner{
+background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);
+padding:20px;width:min(90vw,380px);display:flex;flex-direction:column;gap:10px
+}
+.calib-modal-inner h3{margin:0 0 4px 0}
+.calib-modal-inner label{font-weight:600;color:var(--muted);font-size:13px}
+.calib-modal-inner input[type="file"]{
+padding:8px;border-radius:8px;border:1px solid var(--border);background:#0a1224;color:var(--text);width:100%
+}
+.calib-modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:6px}
+.calib-modal-actions button{min-width:70px}
+#calibCancelBtn{background:transparent}
+.calib-status{font-size:13px;color:var(--muted);min-height:16px}
 textarea{
 width:100%;resize:none;max-height:160px;padding:12px;border-radius:10px;border:1px solid var(--border);
 background:#0a1224;color:var(--text);outline:none
@@ -197,6 +216,12 @@ border-radius:10px;border:1px solid #1d273f;font-family: ui-monospace, SFMono-Re
   white-space: pre-wrap; word-break: break-all;
   border-top: 1px solid var(--border); padding-top: 4px; margin-top: 6px;
 }
+
+/* ── Intro-converted status bubble (see convertStatusBubbleToIntro) ──────── */
+.intro-text { margin-bottom: 4px; }
+.intro-followup {
+  margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border);
+}
 /* ─────────────────────────────────────────────────────────── */
 
 /* Only stack on very small screens */
@@ -230,16 +255,32 @@ min-width:auto;
 <section class="pane pane-chat">
 <main id="chat" class="chat"></main>
 <form id="form" class="composer">
-  <div id="chat-helper" style="grid-column:1/3; color: var(--muted); font-size: 13px; margin-bottom: 4px;">
+  <div id="chat-helper" style="grid-column:1/4; color: var(--muted); font-size: 13px; margin-bottom: 4px;">
     Type <strong>hi</strong> and click <strong>Send</strong> button.
   </div>
   <textarea id="input" rows="1" placeholder="Type a message…" autocomplete="off"></textarea>
+  <button id="calibUploadBtn" type="button" title="Upload MSight camera calibration files">📐</button>
   <button id="send" type="submit">Send</button>
-  <div style="grid-column:2/3; display:flex; justify-content:flex-end;">
+  <div style="grid-column:3/4; display:flex; justify-content:flex-end;">
     <select id="providerSelect" class="provider-select"></select>
   </div>
 </form>
 </section>
+<!-- Camera calibration upload modal (hidden until the upload button is clicked) -->
+<div id="calibModal" class="calib-modal hidden">
+  <div class="calib-modal-inner">
+    <h3>Upload Camera Calibration</h3>
+    <label>Intrinsics JSON (f, x0, y0)</label>
+    <input type="file" id="calibIntrinsicsFile" accept=".json">
+    <label>Calibration Map (.npz, x_map/y_map)</label>
+    <input type="file" id="calibLocmapFile" accept=".npz">
+    <div id="calibStatus" class="calib-status"></div>
+    <div class="calib-modal-actions">
+      <button type="button" id="calibCancelBtn">Cancel</button>
+      <button type="button" id="calibSubmitBtn">Upload</button>
+    </div>
+  </div>
+</div>
 <!-- RIGHT: Ingestion (30%) -->
 <aside class="pane pane-ingest">
 <div class="ingest-card">
@@ -362,6 +403,17 @@ function classifySource(source) {
     return { level: "caution", note: "⚠ LLM knowledge — proceed with reasonable caution" };
 }
 
+function sourceFootnoteEl(source) {
+    const { level, note } = classifySource(source);
+    const fn = document.createElement("div");
+    fn.className = "msg-source";
+    fn.innerHTML =
+        `<span class="msg-source-icon">📚</span>` +
+        `<span class="source-tag">${source}</span>` +
+        `<span class="source-reliability ${level}">${note}</span>`;
+    return fn;
+}
+
 function addMsg(role, text) {
     const line   = document.createElement("div");
     line.className = `msg ${role}`;
@@ -371,16 +423,7 @@ function addMsg(role, text) {
     if (role === "agent") {
         const { body, source } = extractSource(text);
         bubble.innerHTML = renderText(body);
-        if (source) {
-            const { level, note } = classifySource(source);
-            const fn = document.createElement("div");
-            fn.className = "msg-source";
-            fn.innerHTML =
-                `<span class="msg-source-icon">📚</span>` +
-                `<span class="source-tag">${source}</span>` +
-                `<span class="source-reliability ${level}">${note}</span>`;
-            bubble.appendChild(fn);
-        }
+        if (source) bubble.appendChild(sourceFootnoteEl(source));
     } else {
         bubble.innerHTML = renderText(text);
     }
@@ -415,11 +458,41 @@ function createStatusBubble() {
 const MAX_LOG_LINES = 6;
 let _logLines = [];
 
+// Converts the transient "Thinking…" bubble into a persistent message once an
+// "intro" event arrives -- the bubble is no longer discarded when the turn ends.
+function convertStatusBubbleToIntro(container, introText) {
+    const bubble = container.querySelector(".bubble");
+    const statusText = bubble.querySelector(".status-text");
+    if (statusText) {
+        const introEl = document.createElement("div");
+        introEl.className = "intro-text";
+        introEl.innerHTML = renderText(introText);
+        statusText.replaceWith(introEl);
+    }
+    container.dataset.hasIntro = "1";
+}
+
+// Appends the turn's final reply to an intro-converted bubble instead of replacing it.
+function finalizeIntroBubble(container, reply) {
+    const bubble = container.querySelector(".bubble");
+    bubble.classList.remove("status-bubble");
+    if (reply) {
+        const { body, source } = extractSource(reply);
+        const followup = document.createElement("div");
+        followup.className = "intro-followup";
+        followup.innerHTML = renderText(body);
+        bubble.appendChild(followup);
+        if (source) bubble.appendChild(sourceFootnoteEl(source));
+    }
+}
+
 function updateStatusBubble(container, update) {
     const bubble = container.querySelector(".bubble");
 
     if (update.status !== undefined) {
-        bubble.querySelector(".status-label").textContent = update.status;
+        // Absent once convertStatusBubbleToIntro has replaced it.
+        const label = bubble.querySelector(".status-label");
+        if (label) label.textContent = update.status;
         // Clear log pane when a new tool starts (except run_auto_labeling which accumulates).
         if (!update.keepLog) {
             _logLines = [];
@@ -494,6 +567,9 @@ async function chatSend(content) {
             sseBuffer = remaining;
 
             for (const { type, data } of events) {
+                if (type === "intro" && !statusContainer.dataset.hasIntro) {
+                    convertStatusBubbleToIntro(statusContainer, data.message || "");
+                }
                 if (type === "status") {
                     // Keep accumulated log lines while run_auto_labeling is active.
                     const keepLog = _logLines.length > 0;
@@ -511,11 +587,14 @@ async function chatSend(content) {
         setChatStatus(false);
     } finally {
         sendBtn.disabled = false;
-        statusContainer.remove();
-        if (reply) {
-            addMsg("agent", reply);
-            history.push([content, reply]);
+        if (statusContainer.dataset.hasIntro) {
+            finalizeIntroBubble(statusContainer, reply);
+            chatEl.scrollTop = chatEl.scrollHeight;
+        } else {
+            statusContainer.remove();
+            if (reply) addMsg("agent", reply);
         }
+        if (reply) history.push([content, reply]);
     }
 }
 
@@ -640,6 +719,68 @@ document.getElementById('ingestForm').addEventListener('submit', async function(
         logsEl.textContent += `  • Verify CORS is enabled on the server\n`;
         logsEl.textContent += `  • Check network connectivity\n`;
         logsEl.scrollTop = logsEl.scrollHeight;
+    }
+});
+
+// ── MSight camera calibration upload ───────────────────────────────────────
+const calibBtn = document.getElementById("calibUploadBtn");
+const calibModal = document.getElementById("calibModal");
+const calibCancelBtn = document.getElementById("calibCancelBtn");
+const calibSubmitBtn = document.getElementById("calibSubmitBtn");
+const calibStatus = document.getElementById("calibStatus");
+const calibIntrinsicsInput = document.getElementById("calibIntrinsicsFile");
+const calibLocmapInput = document.getElementById("calibLocmapFile");
+
+calibBtn.addEventListener("click", () => {
+    calibStatus.textContent = "";
+    calibIntrinsicsInput.value = "";
+    calibLocmapInput.value = "";
+    calibModal.classList.remove("hidden");
+});
+
+calibCancelBtn.addEventListener("click", () => {
+    calibModal.classList.add("hidden");
+});
+
+calibModal.addEventListener("click", (e) => {
+    if (e.target === calibModal) calibModal.classList.add("hidden");
+});
+
+calibSubmitBtn.addEventListener("click", async () => {
+    const intrinsicsFile = calibIntrinsicsInput.files[0];
+    const locmapFile = calibLocmapInput.files[0];
+    if (!intrinsicsFile || !locmapFile) {
+        calibStatus.textContent = "Please select both files.";
+        return;
+    }
+
+    calibSubmitBtn.disabled = true;
+    calibStatus.textContent = "Uploading…";
+
+    try {
+        const fd = new FormData();
+        fd.append("intrinsics", intrinsicsFile);
+        fd.append("locmap", locmapFile);
+        const res = await fetch(`${CHAT_BASE}/msight/upload_calibration`, {
+            method: "POST",
+            body: fd,
+        });
+        const data = await res.json();
+
+        if (!res.ok || data.status === "error") {
+            calibStatus.textContent = data.message || "Upload failed.";
+            addMsg("agent", `Calibration upload failed: ${data.message || "unknown error"}`);
+        } else {
+            calibStatus.textContent = "Uploaded.";
+            addMsg("agent", data.message || "Calibration uploaded.");
+            // Give the LLM turn context so it can acknowledge the upload naturally.
+            history.push(["[Uploaded camera calibration files via the upload button]", data.message || "Calibration uploaded."]);
+            calibModal.classList.add("hidden");
+        }
+    } catch (e) {
+        calibStatus.textContent = `Error: ${e.message}`;
+    } finally {
+        calibSubmitBtn.disabled = false;
     }
 });
 </script>

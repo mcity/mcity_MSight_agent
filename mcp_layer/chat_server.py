@@ -2,14 +2,15 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastmcp import Client
 from fastmcp.client.transports import SSETransport
 
@@ -23,8 +24,16 @@ logging.basicConfig(
 from chat_pipeline import ChatPipeline
 from host_utils import resolve_host
 from llm_clients import ClaudeClient, GeminiClient, GroqClient, OpenAIClient
+from mcptools.msight_docker import (
+    CALIBRATION_INTRINSICS_REL, CALIBRATION_LOCMAP_REL,
+    _calibration_status, _get_msight_path, calibration_state_label,
+)
+from mcptools.msight_record_archive import DOWNLOAD_DIR as MSIGHT_DOWNLOAD_DIR
+from progress_relay import get_active_progress_cb
 from tool_schema import tools
-from validate_workflow_state import LabelingBackend, AutoLabelingPhase, LabelingPath, WorkflowState
+from validate_workflow_state import (
+    LabelingBackend, AutoLabelingPhase, LabelingPath, WorkflowState, WORKFLOW_SPECS,
+)
 
 load_dotenv()
 
@@ -84,6 +93,16 @@ def _reset_state_on_startup() -> None:
         logging.warning(f"[STARTUP] Could not reset WORKFLOW_STATE: {e}")
 
 
+async def _mcp_log_handler(params) -> None:
+    """Relay ctx.log() notifications from a running MCP tool call to whichever
+    /chat/stream request is awaiting one, via progress_relay, as an SSE "log" event."""
+    cb = get_active_progress_cb()
+    if not cb:
+        return
+    text = params.data if isinstance(params.data, str) else str(params.data)
+    await cb("log", {"line": text})
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     _reset_state_on_startup()
@@ -97,7 +116,7 @@ async def _lifespan(app: FastAPI):
     # deploy-agent.yml launches mcp_server.py and chat_server.py back-to-back
     # with no ordering guarantee, so mcp_server may not be listening yet on
     # the first attempt -- retry with backoff instead of failing startup.
-    mcp_client_cm = Client(mcp_transport)
+    mcp_client_cm = Client(mcp_transport, log_handler=_mcp_log_handler)
     last_exc: Exception | None = None
     for attempt in range(15):
         try:
@@ -127,27 +146,65 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Maps workflow_name -> (display label for the greeting list, prompt filename).
-# Add an entry here + drop the file in prompts/workflows/ to register a new workflow.
-WORKFLOW_META = {
-    "auto_labeling": {"label": "Auto Labeling", "file": "auto_labeling.txt"},
-}
-
+# Workflow registration lives in validate_workflow_state.WORKFLOW_SPECS — add an
+# entry there + drop the file in prompts/workflows/ to register a new workflow.
 _PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 WORKFLOW_PROMPT_TEXT = {
-    name: (_PROMPTS_DIR / "workflows" / meta["file"]).read_text()
-    for name, meta in WORKFLOW_META.items()
+    name: (_PROMPTS_DIR / "workflows" / spec.prompt_file).read_text()
+    for name, spec in WORKFLOW_SPECS.items()
 }
 
+# Demo mode's default video source is deployment-specific, so it's read from
+# .env rather than hardcoded in the prompt file.
+_MSIGHT_DEMO_VIDEO_PATH = os.environ.get("MSIGHT_DEMO_VIDEO_PATH", "").strip()
+if _MSIGHT_DEMO_VIDEO_PATH:
+    _DEMO_VIDEO_HINT = (
+        f"The developer's own test video folder is available as a ready-made "
+        f"default: video_input='{_MSIGHT_DEMO_VIDEO_PATH}'. This is the whole "
+        f"point of Demo mode — \"minimal setup\" — so unless the user's message "
+        f"already named their own source, use this default automatically: "
+        f"explain what's about to run (this default source, that it's the demo "
+        f"calibration) and call start_msight_pipeline with it in the same "
+        f"reply. Do NOT ask the user to confirm or choose first — Demo has no "
+        f"consent exchange (see STEP 3); asking here just reintroduces the "
+        f"round trip that removes."
+    )
+else:
+    _DEMO_VIDEO_HINT = (
+        "No default demo video is configured on this host "
+        "(MSIGHT_DEMO_VIDEO_PATH is not set in .env) — ask the user for a "
+        "video file/folder path or an RTSP stream URL, the same as you would "
+        "for \"run your own pipeline\"."
+    )
+if "msight_pipeline" in WORKFLOW_PROMPT_TEXT:
+    WORKFLOW_PROMPT_TEXT["msight_pipeline"] = WORKFLOW_PROMPT_TEXT["msight_pipeline"].replace(
+        "{DEMO_VIDEO_HINT}", _DEMO_VIDEO_HINT
+    )
+
 _WORKFLOW_LIST = "\n".join(
-    f"{i + 1}. {meta['label']} (internal name: {name})"
-    for i, (name, meta) in enumerate(WORKFLOW_META.items())
+    f"{i + 1}. {spec.label} (internal name: {name})"
+    for i, (name, spec) in enumerate(WORKFLOW_SPECS.items())
 )
 
 BASE_PROMPT = (
     (_PROMPTS_DIR / "base_prompt.txt").read_text().replace("{WORKFLOW_LIST}", _WORKFLOW_LIST)
 )
+
+
+def _load_state_hints() -> dict[str, str]:
+    """Parse prompts/state_hints.txt into {name: template}, sections delimited
+    by "=== name ===" marker lines. Filled in via .format() in _build_state_hint."""
+    text = (_PROMPTS_DIR / "state_hints.txt").read_text()
+    sections = re.split(r"^=== (\w+) ===\s*$", text, flags=re.MULTILINE)
+    # re.split with a capturing group returns [preamble, name1, body1, name2, body2, ...]
+    return {
+        name: body.strip()
+        for name, body in zip(sections[1::2], sections[2::2])
+    }
+
+
+STATE_HINTS = _load_state_hints()
 
 
 def _build_system_prompt(state) -> str:
@@ -178,6 +235,45 @@ def filter_tools_for_state(all_tools: list, state) -> list:
     return [t for t in all_tools if t["function"]["name"] in valid_names]
 
 
+def _msight_calibration_hint() -> str:
+    """Live filesystem+checksum check, called directly (not via MCP round trip)
+    since it must run on every turn's state hint, not only when the LLM asks."""
+    msight_path, err = _get_msight_path()
+    if err:
+        return "calibration=unknown (MSIGHT_VISION_PATH not configured)"
+    return calibration_state_label(_calibration_status(msight_path)["state"], prefixed=True)
+
+
+def _msight_pipeline_state_hint(mp) -> str:
+    """Status for msight_pipeline's customize checklist, reported every turn
+    so the LLM never has to infer checklist progress from conversation memory."""
+    if mp is None:
+        return (
+            "msight_checklist(mode=not set, source=not set, "
+            f"{_msight_calibration_hint()}, "
+            "recording=not active, archiving=not active)"
+        )
+    if mp.rtsp_url:
+        source = f"source=rtsp_url:{mp.rtsp_url}"
+    elif mp.video_input:
+        source = f"source=video_input:{mp.video_input}"
+    else:
+        source = "source=not set"
+    parts = [f"mode={mp.mode or 'not set'}", source, _msight_calibration_hint()]
+    if mp.sensor_name:
+        parts.append(f"sensor_name={mp.sensor_name}")
+    parts.append(f"recording={'active' if mp.recording_active else 'not active'}")
+    parts.append(f"archiving={'active' if mp.archiving_active else 'not active'}")
+    parts.append(f"pipeline_running={mp.pipeline_running}")
+    checklist = "msight_checklist(" + ", ".join(parts) + ")"
+    if mp.run_awaiting_confirmation and not mp.run_confirmed:
+        return checklist + " | " + STATE_HINTS["msight_run_awaiting_confirm"]
+    if mp.pipeline_running:
+        source_label = f"rtsp_url:{mp.rtsp_url}" if mp.rtsp_url else f"video_input:{mp.video_input}"
+        return checklist + " | " + STATE_HINTS["msight_pipeline_running"].format(source=source_label)
+    return checklist
+
+
 def _build_state_hint(state=None) -> str:
     """Return SESSION_STATE string injected before each user message."""
     try:
@@ -186,34 +282,22 @@ def _build_state_hint(state=None) -> str:
         if not state.workflow_name:
             return ""
         parts = [f"workflow={state.workflow_name}"]
+        spec = WORKFLOW_SPECS.get(state.workflow_name)
+        if spec and not spec.requires_dataset:
+            if state.workflow_name == "msight_pipeline":
+                parts.append(_msight_pipeline_state_hint(state.msight_pipeline))
+            return "SESSION_STATE: " + " | ".join(parts)
         if state.dataset_confirmed and state.dataset_name:
             parts.append(f"dataset={state.dataset_name}")
         else:
-            parts.append(
-                "dataset=not confirmed — "
-                "NEXT STEP: wait for the user to name a dataset, then call set_selected_dataset immediately. "
-                "Do NOT infer or reuse a dataset name from earlier in the conversation — "
-                "the user must explicitly type a dataset name in their CURRENT message. "
-                "Do NOT call switch_workflow or select_workflow again."
-            )
+            parts.append(STATE_HINTS["dataset_not_confirmed"])
         al = state.auto_labeling
         if al:
             if al.labeling_backend == LabelingBackend.BOTH:
-                parts.append(
-                    "backend=AWAITING_CHOICE — user must choose annotation backend. "
-                    "Classify intent and act: "
-                    "user names a backend preference → call set_labeling_backend(backend=...) immediately; "
-                    "user provides a new dataset name → call set_selected_dataset; "
-                    "user provides both dataset and backend → call set_selected_dataset then set_labeling_backend."
-                )
+                parts.append(STATE_HINTS["backend_both"])
             elif al.labeling_backend and not al.labeling_path:
                 parts.append(
-                    f"LABELING_BACKEND: {al.labeling_backend} — already confirmed. "
-                    f"NEXT STEP: present Manual vs Auto Labeling options if the user has not yet chosen. "
-                    f"user wants a different backend → call set_labeling_backend with the new backend; "
-                    f"user wants a different dataset → call set_selected_dataset; "
-                    f"user chose manual labeling → call set_labeling_path('manual'); "
-                    f"user chose auto labeling → call set_labeling_path('auto')."
+                    STATE_HINTS["backend_confirmed_no_path"].format(backend=al.labeling_backend)
                 )
             elif al.labeling_backend:
                 parts.append(f"backend={al.labeling_backend}")
@@ -225,9 +309,9 @@ def _build_state_hint(state=None) -> str:
                         else "export_to_cvat"
                     )
                     parts.append(
-                        f"labeling_path=manual — awaiting annotation class names. "
-                        f"When user provides class names → call "
-                        f"{export_fn}(dataset_name='{state.dataset_name or '?'}', classes=[...])."
+                        STATE_HINTS["manual_no_classes"].format(
+                            export_fn=export_fn, dataset_name=state.dataset_name or "?"
+                        )
                     )
                 else:
                     parts.append(f"labeling_path={al.labeling_path}")
@@ -236,90 +320,48 @@ def _build_state_hint(state=None) -> str:
                 classes_s = ", ".join(al.manual_classes)
                 if al.export_confirmed:
                     parts.append(
-                        f"manual_classes=[{classes_s}], export_confirmed=True — "
-                        f"call the export tool immediately with these classes."
+                        STATE_HINTS["manual_classes_export_confirmed"].format(classes=classes_s)
                     )
                 else:
                     parts.append(
-                        f"manual_classes=[{classes_s}] — classes provided, awaiting export confirmation. "
-                        f"When user confirms, call confirm_export() then the export tool with these classes."
+                        STATE_HINTS["manual_classes_awaiting_confirm"].format(classes=classes_s)
                     )
-            if al.phase in (AutoLabelingPhase.ANNOTATING, AutoLabelingPhase.TRAINING, AutoLabelingPhase.COMPLETE):
+            if al.phase in (AutoLabelingPhase.ANNOTATING, AutoLabelingPhase.TRAINING):
+                # COMPLETE deliberately excluded: it's handled below by the
+                # labels_imported check instead. Including it here used to make
+                # both hints fire at once with contradictory advice.
                 action = {
                     AutoLabelingPhase.ANNOTATING: "export complete — awaiting annotation",
                     AutoLabelingPhase.TRAINING:   "auto-labeling complete — awaiting import",
-                    AutoLabelingPhase.COMPLETE:   "labels imported — workflow complete",
                 }[al.phase]
                 parts.append(
-                    f"phase={al.phase} ({action}). "
-                    f"Parameters are LOCKED — do not reconfigure. "
-                    f"If the user asks to change a parameter: tell them the workflow is locked. "
-                    f"If they want to discard all progress and restart from dataset selection: "
-                    f"confirm with them first (e.g. 'This will discard the current run — are you sure?'), "
-                    f"then call switch_workflow(workflow_name='{state.workflow_name}', confirm_restart=true) "
-                    f"to force the reset."
+                    STATE_HINTS["phase_locked"].format(
+                        phase=al.phase, action=action, workflow_name=state.workflow_name
+                    )
                 )
             if al.models_listed and not al.model_configured:
-                parts.append(
-                    "models_listed=True — user has seen the model list. "
-                    "When the user names a model (e.g. 'rfdetr_2xlarge', 'yolo11n', 'facebook/detr-resnet-50') "
-                    "→ call configure_auto_labeling(selected_source=<infer from name>, selected_model=<exact name>) immediately. "
-                    "Do NOT call set_selected_dataset or set_labeling_backend when the user is naming a model. "
-                    "If user describes their use case or asks for advice, use send_reply to recommend options "
-                    "and end with 'Which model would you like to use?' — then wait for their reply."
-                )
+                parts.append(STATE_HINTS["models_listed_not_configured"])
             if al.model_configured:
                 if not al.auto_labeling_complete:
                     if al.run_awaiting_confirmation and not al.run_confirmed:
-                        parts.append(
-                            "model=configured, run summary shown — awaiting user confirmation. "
-                            "user confirms (yes, proceed, go ahead, etc.) → call confirm_run; "
-                            "user requests changes → call set_auto_labeling_hyperparams with ONLY changed values; "
-                            "to change the model → call configure_auto_labeling immediately "
-                            "(no need to re-list models if the user already named one)"
-                        )
+                        parts.append(STATE_HINTS["model_configured_awaiting_run_confirm"])
                     else:
-                        parts.append(
-                            "model=configured — "
-                            "user confirms defaults or says ready (e.g. 'these parameters are good', 'looks good', 'go ahead', 'yes') "
-                            "→ call run_auto_labeling immediately — do NOT use send_reply to ask for confirmation first, "
-                            "run_auto_labeling shows its own pre-flight summary and handles the confirmation step itself; "
-                            "any message with a hyperparam name or value (e.g. 'epochs 20', 'set learning rate to 0.001', '5 epochs') "
-                            "→ call set_auto_labeling_hyperparams immediately with ONLY the changed values — "
-                            "do NOT re-call configure_auto_labeling for hyperparam-only requests; "
-                            "to change the model → call configure_auto_labeling immediately "
-                            "(no need to re-list models if the user already named one)"
-                        )
+                        parts.append(STATE_HINTS["model_configured_ready"])
                 else:
                     parts.append("model=configured")
             if al.auto_labeling_complete:
                 parts.append("auto_labeling=complete")
+            if al.labeling_path == LabelingPath.AUTO:
+                parts.append(f"localization={'enabled' if al.localization_enabled else 'not configured'}")
             if al.labels_imported:
                 parts.append(
-                    "workflow_complete — "
-                    "if user wants to start over: call switch_workflow(workflow_name='auto_labeling'). "
-                    "Generic words like 'done', 'ok', 'thanks', 'exit' do NOT mean start over — "
-                    "respond with send_reply asking if they want to run auto-labeling again or are finished."
+                    STATE_HINTS["workflow_complete"].format(
+                        labeled_dataset_name=state.labeled_dataset_name
+                    )
                 )
             if not al.phase and not al.auto_labeling_complete and (al.labeling_path or al.model_configured):
-                backend_rule = (
-                    "to change the backend → call set_labeling_backend directly; "
-                )
-                path_rule = (
-                    "user wants to switch labeling approach / use auto generated instead / use manual instead → "
-                    "call set_labeling_path('auto' or 'manual') — "
-                    "dataset, backend, and classes are preserved, only path-specific state resets; "
-                    "user explicitly wants to start completely over and discard everything → "
-                    f"call switch_workflow(workflow_name='{state.workflow_name}') — "
-                    "clears ALL state including dataset, returning to dataset selection; "
-                )
                 parts.append(
-                    "RECONFIGURABLE (Zone A — before the workflow locks): "
-                    "to change the dataset → call set_selected_dataset; "
-                    "to change the model → call configure_auto_labeling "
-                    "(call list_model_sources_and_models first if user doesn't know the model name); "
-                    + backend_rule
-                    + path_rule
+                    STATE_HINTS["reconfigurable_zone_a"].format(workflow_name=state.workflow_name)
                 )
         return "SESSION_STATE: " + " | ".join(parts)
     except Exception:
@@ -329,6 +371,97 @@ def _build_state_hint(state=None) -> str:
 @app.get("/chat/providers")
 async def chat_providers():
     return {"providers": available_providers(), "default": "openai"}
+
+
+@app.post("/msight/upload_calibration")
+async def msight_upload_calibration(
+    intrinsics: UploadFile = File(...),
+    locmap: UploadFile = File(...),
+):
+    """Writes the user's calibration files into MSight_Vision at the fixed
+    paths rfdetr_config.yaml already points at, so the config never needs touching."""
+    msight_path, err = _get_msight_path()
+    if err:
+        return JSONResponse({"status": "error", "message": err}, status_code=400)
+
+    intrinsics_bytes = await intrinsics.read()
+    try:
+        intrinsics_data = json.loads(intrinsics_bytes)
+    except json.JSONDecodeError as e:
+        return JSONResponse(
+            {"status": "error", "message": f"'{intrinsics.filename}' is not valid JSON: {e}"},
+            status_code=400,
+        )
+
+    missing_keys = {"f", "x0", "y0"} - set(intrinsics_data.keys())
+    if missing_keys:
+        return JSONResponse(
+            {
+                "status": "error",
+                "message": f"'{intrinsics.filename}' is missing required key(s): {sorted(missing_keys)}.",
+            },
+            status_code=400,
+        )
+
+    locmap_bytes = await locmap.read()
+    try:
+        import io
+        import numpy as np
+        locmap_data = np.load(io.BytesIO(locmap_bytes))
+        locmap_keys = set(locmap_data.keys())
+    except Exception as e:
+        return JSONResponse(
+            {"status": "error", "message": f"Could not read '{locmap.filename}' as a .npz file: {e}"},
+            status_code=400,
+        )
+    if "x_map" not in locmap_keys or "y_map" not in locmap_keys:
+        if "lat_map" in locmap_keys or "lon_map" in locmap_keys:
+            return JSONResponse(
+                {
+                    "status": "error",
+                    "message": (
+                        f"'{locmap.filename}' has lat_map/lon_map keys — that's Auto Labeling's "
+                        "localization format, not the live pipeline's. The live pipeline needs a "
+                        ".npz with x_map/y_map keys instead."
+                    ),
+                },
+                status_code=400,
+            )
+        return JSONResponse(
+            {
+                "status": "error",
+                "message": f"'{locmap.filename}' is missing required key(s) x_map/y_map (found: {sorted(locmap_keys)}).",
+            },
+            status_code=400,
+        )
+
+    intrinsics_dest = msight_path / CALIBRATION_INTRINSICS_REL
+    locmap_dest = msight_path / CALIBRATION_LOCMAP_REL
+    intrinsics_dest.parent.mkdir(parents=True, exist_ok=True)
+    locmap_dest.parent.mkdir(parents=True, exist_ok=True)
+    intrinsics_dest.write_bytes(intrinsics_bytes)
+    locmap_dest.write_bytes(locmap_bytes)
+
+    return JSONResponse({
+        "status": "ok",
+        "message": "Calibration files uploaded and applied — they'll be used the next time the pipeline starts.",
+        **_calibration_status(msight_path),
+    })
+
+
+@app.get("/msight/download_recording/{filename}")
+async def msight_download_recording(filename: str):
+    """Serves a finished recording as a browser download, since a chat reply
+    can only hand back a server-local path the user may have no access to."""
+    # Reject anything but a bare filename so a crafted "../.." can't escape the dir.
+    if "/" in filename or "\\" in filename or filename in (".", ".."):
+        return JSONResponse({"status": "error", "message": "Invalid filename."}, status_code=400)
+
+    path = (MSIGHT_DOWNLOAD_DIR / filename).resolve()
+    if MSIGHT_DOWNLOAD_DIR.resolve() not in path.parents or not path.is_file():
+        return JSONResponse({"status": "error", "message": "Recording not found."}, status_code=404)
+
+    return FileResponse(path, media_type="video/mp4", filename=filename)
 
 
 @app.post("/chat/stream")
@@ -467,9 +600,17 @@ async def chat_stream(request: Request):
 
                 current_tools = filter_tools_for_state(tools, pipeline.state)
 
+                # Rebuild so a workflow change earlier this iteration (e.g.
+                # select_workflow) is reflected for the rest of the turn --
+                # needed by workflows that fall through instead of HardStop
+                # right after selection (e.g. msight_pipeline).
+                messages[0]["content"] = _build_system_prompt(pipeline.state)
+
+                workflow_spec = WORKFLOW_SPECS.get(pipeline.state.workflow_name)
                 tools_called = [r["name"] for r in tool_results]
                 if (
                     pipeline.state.workflow_name
+                    and workflow_spec is not None and workflow_spec.requires_dataset
                     and not pipeline.state.dataset_confirmed
                     and "list_datasets" not in tools_called
                 ):

@@ -11,7 +11,7 @@ SELECTED_DATASET = {
 }
 
 #: Runtime session state — managed by the agent via WorkflowState, do not edit manually
-WORKFLOW_STATE = {'workflow_name': '', 'dataset_name': '', 'dataset_confirmed': False, 'labeled_dataset_name': '', 'auto_labeling': None, 'workflow_just_reset': False}
+WORKFLOW_STATE = {'workflow_name': '', 'dataset_name': '', 'dataset_confirmed': False, 'labeled_dataset_name': '', 'auto_labeling': None, 'msight_pipeline': None, 'workflow_just_reset': False}
 
 #: Workflows and associated parameters
 WORKFLOWS = {
@@ -33,6 +33,11 @@ WORKFLOWS = {
         "learning_rate": 2e-05,
         "weight_decay": 0.0001,
         "max_grad_norm": 0.01,
+        "localization_enabled": False,
+        "localization_detection_field": "",
+        # Hardcoded to the Ashley/Huron intersection camera's calibration (single-camera only).
+        "localization_intrinsics_path": "MSight/data/ashley_huron_intrinsic.json",
+        "localization_locmap_path": "MSight/data/calibration_results_ashley_huron.npz",
         "inference_settings": {
             "do_eval": False,
             "inference_on_test": False,

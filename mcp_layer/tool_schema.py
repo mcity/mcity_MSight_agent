@@ -36,6 +36,33 @@ tools = [
         {
             "type": "function",
             "function": {
+                "name": "send_intro",
+                "description": (
+                    "Show an informational message to the user BEFORE a slower action's own "
+                    "progress/log output streams in — currently only used for msight_pipeline's "
+                    "Demo start (see STEP 2a): explain what MSight Pipeline does and what's about "
+                    "to run, THEN call start_msight_pipeline as your very next tool call in this "
+                    "same turn. Unlike send_reply, this does NOT end your turn — you MUST keep "
+                    "going and actually call the tool you just described; calling send_intro alone "
+                    "with no follow-up tool call leaves the user with an explanation but nothing "
+                    "actually happening. Do not use this anywhere else — every other reply goes "
+                    "through send_reply as usual."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message": {
+                            "type": "string",
+                            "description": "The informational text to show, e.g. what MSight Pipeline does and what's about to run."
+                        }
+                    },
+                    "required": ["message"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "confirm_export",
                 "description": (
                     "Call this ONLY after the user has explicitly confirmed they want to export "
@@ -56,11 +83,14 @@ tools = [
             "function": {
                 "name": "confirm_run",
                 "description": (
-                    "Call this ONLY after the user has explicitly confirmed they want to start auto-labeling "
-                    "(e.g., responded 'yes', 'proceed', 'go ahead', 'start it', 'run it'). "
-                    "This records their consent and unlocks the run_auto_labeling tool for this session. "
-                    "After calling this, immediately call run_auto_labeling. "
-                    "Do NOT call this speculatively — only call it when the user has actually confirmed."
+                    "Call this ONLY after the user has explicitly confirmed they want to proceed "
+                    "(e.g., responded 'yes', 'proceed', 'go ahead', 'start it', 'run it') in response "
+                    "to a pre-run confirmation summary. This is shared across workflows — what it "
+                    "unlocks depends on which one is active: in auto_labeling, it unlocks "
+                    "run_auto_labeling and you should call that next; in msight_pipeline, it unlocks "
+                    "start_msight_pipeline and you should call that again with the same source you "
+                    "already stated. Do NOT call this speculatively — only call it when the user has "
+                    "actually confirmed."
                 ),
                 "parameters": {
                     "type": "object",
@@ -246,6 +276,41 @@ tools = [
         {
             "type": "function",
             "function": {
+                "name": "set_msight_localization_config",
+                "description": (
+                    "Configure MSight geolocation for the auto_labeling workflow's detections — "
+                    "optional, only relevant on the 'auto' labeling path (it geolocates model "
+                    "predictions, which only exist after auto-generated labeling). Only call this "
+                    "after the user has explicitly confirmed they want to geolocate detections — "
+                    "never call speculatively. "
+                    "IMPORTANT LIMITATION: the calibration (camera intrinsics + lat/lon map) is "
+                    "currently hardcoded to the Ashley/Huron intersection camera — there is no "
+                    "per-dataset or per-camera calibration selection. Only offer this if the "
+                    "dataset's footage is actually from that camera; if the user asks to geolocate "
+                    "a dataset from a different camera/location, tell them that calibration isn't "
+                    "supported yet rather than calling this tool. detection_field should default to "
+                    "'pred_od_<model_name>-<dataset_name>' using the currently configured model and "
+                    "dataset, unless the user names a different field explicitly."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "detection_field": {
+                            "type": "string",
+                            "description": "FiftyOne field holding the fo.Detections to geolocate, e.g. 'pred_od_rfdetr_2xlarge-mydataset'."
+                        },
+                        "enabled": {
+                            "type": "boolean",
+                            "description": "True to enable localization (default), false to save the config but leave it off."
+                        }
+                    },
+                    "required": ["detection_field"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "launch_voxel51_session",
                 "description": "Launch the Voxel51 session for a specific dataset. Always pass dataset_name explicitly — never call without it.",
                 "parameters": {
@@ -264,7 +329,17 @@ tools = [
             "type": "function",
             "function": {
                 "name": "reset_workflow_state",
-                "description": "Reset workflow selection state after a workflow is complete",
+                "description": (
+                    "Fully resets workflow, dataset, and all in-progress state so the user can "
+                    "leave the current workflow entirely — the next greeting will show the full "
+                    "workflow list again. Use this when the user is done with the workflow itself "
+                    "(e.g. says 'that's all', 'thanks, I'm finished', or explicitly asks to exit or "
+                    "start over from the top). "
+                    "This is a bigger action than switch_workflow(confirm_restart=true): to restart "
+                    "the CURRENT auto_labeling run while staying in auto_labeling (e.g. after it "
+                    "locks mid-export/mid-training), use switch_workflow(workflow_name='auto_labeling', "
+                    "confirm_restart=true) instead — that's the targeted action for that case, not this one."
+                ),
                 "parameters": {
                 "type": "object",
                 "properties": {},
@@ -429,6 +504,189 @@ tools = [
                     },
                     "required": ["dataset_name"]
                 }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "start_msight_pipeline",
+                "description": (
+                    "Start the MSight_Vision RF-DETR camera-detection pipeline (redis, "
+                    "video_source, rfdetr_detector, detection_viewer) as detached Docker "
+                    "containers, driven from whatever MSight_Vision checkout MSIGHT_VISION_PATH "
+                    "points at (this repo does not vendor a copy of MSight_Vision's docker files). "
+                    "Provide exactly one of video_input (path to a video file or folder of .mp4 "
+                    "files, must exist on this host — not a URL or upload) or rtsp_url (a live "
+                    "RTSP stream URL; the primary intended mode for real deployments, though still "
+                    "work-in-progress in MSight_Vision so treat failures here as less predictable "
+                    "than the file-path mode). Requires Docker Engine + Compose "
+                    "plugin and, for GPU mode, the NVIDIA Container Toolkit on this host. Returns a "
+                    "friendly error for known failure modes instead of raw docker output: missing/"
+                    "misconfigured MSIGHT_VISION_PATH, a malformed line in MSight_Vision's own .env, "
+                    "port 6379 already bound by a host redis-server, or a missing NVIDIA Container "
+                    "Toolkit. On success, includes the web viewer URL (port 9010)."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "video_input": {"type": "string", "description": "Absolute path to a video file or folder of .mp4 files on this host."},
+                        "rtsp_url": {"type": "string", "description": "Live RTSP stream URL. Takes priority over video_input if both are set."},
+                        "sensor_name": {"type": "string", "description": "Logical camera/sensor name. Optional — MSight_Vision defaults to gs_mcity_1 if omitted."},
+                        "build": {"type": "boolean", "description": "Rebuild Docker images before starting (default true). Set false for a faster restart when images are already current."}
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "select_msight_mode",
+                "description": (
+                    "Call this exactly once, right after the user answers STEP 1's Demo-vs-"
+                    "run-your-own-pipeline question — before showing the checklist (custom) or "
+                    "collecting a source (Demo). Records which mode is active so the consent "
+                    "behavior around start_msight_pipeline is applied consistently for the rest "
+                    "of the session: Demo starts immediately once a source is known, no "
+                    "confirmation exchange; 'run your own pipeline' always shows a consent "
+                    "summary first. Do not call this again just to keep going within the mode "
+                    "already active — only if the user explicitly switches modes."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {"type": "string", "enum": ["demo", "custom"], "description": "'demo' or 'custom' (custom = 'run your own pipeline')."}
+                    },
+                    "required": ["mode"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "stop_msight_pipeline",
+                "description": "Stop the MSight_Vision pipeline containers (docker compose down). Does not delete the MSight_Vision checkout or its .env.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "remove_volumes": {"type": "boolean", "description": "If true, also removes anonymous volumes (docker compose down -v). Default false."}
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_msight_status",
+                "description": "Report the current state (running/exited/etc.) of each MSight_Vision pipeline container, plus the web viewer URL if reachable.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_msight_logs",
+                "description": "Fetch recent MSight_Vision pipeline logs, e.g. to diagnose why detections aren't showing up in the viewer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "service": {"type": "string", "description": "Optional: one of redis, video_source, rfdetr_detector, detection_viewer. Omit for logs from all services."},
+                        "tail": {"type": "integer", "description": "Number of trailing log lines to fetch per service (default 200, max 2000)."}
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "check_msight_calibration_status",
+                "description": (
+                    "Check whether the user's own camera calibration is in place for the live "
+                    "MSight_Vision pipeline, or if it's still the shipped demo calibration. Call "
+                    "this if the user asks about calibration status directly — SESSION_STATE's "
+                    "msight_checklist already reports the same thing every turn "
+                    "(calibration=default/user-uploaded/missing/partial/unknown), so you usually "
+                    "don't need to call this explicitly; prefer reading that first."
+                ),
+                "parameters": {"type": "object", "properties": {}}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "start_msight_recording",
+                "description": (
+                    "Start local video recording — a tracked host subprocess (not a Docker "
+                    "container), independent of the core detection pipeline's own lifecycle. Safe "
+                    "to call before start_msight_pipeline too: it just waits idle for the first "
+                    "frame. No AWS credentials needed; this only writes to local disk. Does not "
+                    "require start_msight_archiving to be active or vice versa — independent sinks."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "sensor_name": {
+                            "type": "string",
+                            "description": "Sensor name to subscribe to. Should match the sensor_name used in start_msight_pipeline, if one was given. Optional — defaults to gs_mcity_1."
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "start_msight_archiving",
+                "description": (
+                    "Start pushing recorded video to an S3 bucket — a tracked host subprocess, "
+                    "independent of start_msight_recording (does not require it to be active "
+                    "first) and safe to call before start_msight_pipeline too. Requires "
+                    "AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY to already be configured in this "
+                    "host's .env — if the tool returns an error about missing credentials, tell "
+                    "the user plainly rather than guessing at a fix."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "s3_bucket": {
+                            "type": "string",
+                            "description": "Name of the S3 bucket to push recorded video to. Must come from the user — never invent or guess a bucket name."
+                        },
+                        "s3_prefix": {
+                            "type": "string",
+                            "description": "Optional S3 key prefix (folder path) within the bucket."
+                        }
+                    },
+                    "required": ["s3_bucket"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "stop_msight_recording",
+                "description": "Stop local video recording. Independent of archiving — if archiving is still active, the shared upstream aggregator node keeps running for it.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "stop_msight_archiving",
+                "description": "Stop pushing video to S3. Independent of local recording — if recording is still active, the shared upstream aggregator node keeps running for it.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_msight_record_archive_status",
+                "description": (
+                    "Report whether local recording and/or S3 archiving are currently running. "
+                    "SESSION_STATE's msight_checklist already reports recording/archiving status "
+                    "every turn from the same underlying state, so you usually don't need to call "
+                    "this explicitly; prefer reading that first."
+                ),
+                "parameters": {"type": "object", "properties": {}}
             }
         },
 

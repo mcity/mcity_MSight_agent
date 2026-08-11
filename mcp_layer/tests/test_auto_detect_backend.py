@@ -17,7 +17,7 @@ from validate_workflow_state import (
 
 
 def make_pipeline():
-    pipeline = ChatPipeline(mcp_transport=MagicMock(), llm=MagicMock())
+    pipeline = ChatPipeline(mcp_client=MagicMock(), llm=MagicMock())
     pipeline.state = WorkflowState(
         workflow_name="auto_labeling",
         auto_labeling=AutoLabelingState(),
@@ -29,7 +29,7 @@ def detect(cvat_token: str = "", ls_token: str = "") -> dict | None:
     """Run _auto_detect_backend with controlled env vars, return the result."""
     pipeline = make_pipeline()
     env = {"CVAT_ACCESS_TOKEN": cvat_token, "LS_TOKEN": ls_token}
-    with patch("chat_pipeline.os.getenv", side_effect=lambda key, default="": env.get(key, default)):
+    with patch("pipeline_handlers.auto_labeling.os.getenv", side_effect=lambda key, default="": env.get(key, default)):
         with patch.object(WorkflowState, "save"):
             return pipeline, asyncio.run(pipeline._auto_detect_backend(mcp_client=MagicMock()))
 
@@ -44,7 +44,8 @@ def test_auto_detect_backend_no_nameerror():
         _, result = detect(cvat_token="", ls_token="")
     except AttributeError as exc:
         raise AssertionError(
-            "chat_pipeline.os is not defined — check that 'import os' exists at module level"
+            "pipeline_handlers.auto_labeling.os is not defined — check that 'import os' "
+            "exists at module level"
         ) from exc
     assert result is not None, (
         "_auto_detect_backend returned None — "
@@ -107,7 +108,7 @@ def test_auto_detect_backend_both():
 def test_auto_detect_backend_writes_state_for_ls():
     pipeline = make_pipeline()
     env = {"CVAT_ACCESS_TOKEN": "", "LS_TOKEN": "tok"}
-    with patch("chat_pipeline.os.getenv", side_effect=lambda key, default="": env.get(key, default)):
+    with patch("pipeline_handlers.auto_labeling.os.getenv", side_effect=lambda key, default="": env.get(key, default)):
         with patch.object(WorkflowState, "save") as mock_save:
             asyncio.run(pipeline._auto_detect_backend(mcp_client=MagicMock()))
     assert pipeline.state.auto_labeling.labeling_backend == LabelingBackend.LABEL_STUDIO
@@ -117,7 +118,7 @@ def test_auto_detect_backend_writes_state_for_ls():
 def test_auto_detect_backend_does_not_write_state_for_none():
     pipeline = make_pipeline()
     env = {"CVAT_ACCESS_TOKEN": "", "LS_TOKEN": ""}
-    with patch("chat_pipeline.os.getenv", side_effect=lambda key, default="": env.get(key, default)):
+    with patch("pipeline_handlers.auto_labeling.os.getenv", side_effect=lambda key, default="": env.get(key, default)):
         with patch.object(WorkflowState, "save") as mock_save:
             asyncio.run(pipeline._auto_detect_backend(mcp_client=MagicMock()))
     assert pipeline.state.auto_labeling.labeling_backend == ""

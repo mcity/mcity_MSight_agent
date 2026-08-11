@@ -201,6 +201,13 @@ def export_to_cvat(
                     "CVAT_TASK_LIMIT_REACHED: Your CVAT account has reached the maximum number of tasks. "
                     "Please delete some existing tasks at app.cvat.ai to free up space, then try again."
                 )
+            # Same 403 as an expired token -- check storage quota first so we don't misreport it.
+            if "maximum usage of internal storage" in err_str or "maximum usage of internal storage" in tb:
+                return (
+                    "CVAT_STORAGE_LIMIT_REACHED: Your CVAT account has reached its storage quota — "
+                    "this is not a token problem. Please delete some existing tasks/data at app.cvat.ai "
+                    "to free up space, or upgrade your plan at app.cvat.ai/billing, then try again."
+                )
             return (
                 "CVAT_FORBIDDEN: Access denied by CVAT. "
                 "Please check your CVAT_ACCESS_TOKEN in .env is valid and has not expired."

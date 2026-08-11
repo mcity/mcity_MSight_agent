@@ -6,6 +6,7 @@ Provides typed schemas, precondition guards, tool input validation, and persiste
 import ast
 import importlib
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar, Literal, Optional
 
@@ -14,6 +15,56 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 import config.config as _cc
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "config.py"
+
+
+@dataclass(frozen=True)
+class WorkflowSpec:
+    """Single registration point for a workflow. chat_server.py, chat_pipeline.py,
+    and WorkflowState all read from WORKFLOW_SPECS instead of hardcoding names."""
+    label: str                            # display label in the greeting list
+    prompt_file: str                      # prompts/workflows/<file> — per-workflow LLM guidance
+    requires_dataset: bool = True         # False = skip the FiftyOne dataset step entirely
+    substate_cls_name: Optional[str] = None    # name of the Pydantic substate model, if any
+    tool_router_method: Optional[str] = None   # WorkflowState method name: (self, ALWAYS) -> set[str]
+
+
+def _resolve_substate_cls(name: Optional[str]) -> Optional[type[BaseModel]]:
+    """Resolve a WorkflowSpec.substate_cls_name to its class object. String-based
+    and resolved lazily so WORKFLOW_SPECS can be declared before the models it references."""
+    return globals()[name] if name else None
+
+
+WORKFLOW_SPECS: dict[str, WorkflowSpec] = {
+    "auto_labeling": WorkflowSpec(
+        label="Auto Labeling",
+        prompt_file="auto_labeling.txt",
+        requires_dataset=True,
+        substate_cls_name="AutoLabelingState",
+        tool_router_method="_auto_labeling_tools",
+    ),
+    "msight_pipeline": WorkflowSpec(
+        label="MSight Pipeline",
+        prompt_file="msight_pipeline.txt",
+        requires_dataset=False,
+        substate_cls_name="MsightPipelineState",
+    ),
+}
+
+#: Derived from WORKFLOW_SPECS' keys so there is no second list to fall out of sync.
+VALID_WORKFLOW = Literal[tuple(WORKFLOW_SPECS) + ("",)]
+
+#: Tools callable regardless of workflow/step. Module-level so tests and other
+#: consumers import the same object instead of keeping their own copy in sync by hand.
+ALWAYS_TOOLS: frozenset[str] = frozenset({
+    "send_reply", "send_intro", "switch_workflow", "reset_workflow_state",
+    "select_msight_mode",
+    "start_msight_pipeline", "stop_msight_pipeline",
+    "get_msight_status", "get_msight_logs",
+    "check_msight_calibration_status",
+    "start_msight_recording", "start_msight_archiving",
+    "stop_msight_recording", "stop_msight_archiving",
+    "get_msight_record_archive_status",
+})
 
 
 class LabelingBackend:
@@ -113,6 +164,10 @@ class AutoLabelingState(BaseModel):
     model_name: str = ""
     # "" = Zone A (mutable), "annotating" = post-export, "training" = post-run, "complete" = terminal
     phase: Literal["", "annotating", "training", "complete"] = ""
+    # Chat-session tracking only -- main.py reads the actual values from
+    # config.WORKFLOWS["auto_labeling"], not here. Lets the prompt know whether
+    # the user has already configured it, so it isn't re-asked.
+    localization_enabled: bool = False
 
     _RESET_SEQUENCE: ClassVar[list[str]] = [
         "models_listed",
@@ -203,7 +258,31 @@ class AutoLabelingState(BaseModel):
         return True, ""
 
 
-VALID_WORKFLOW = Literal["auto_labeling", ""]
+class MsightPipelineState(BaseModel):
+    """Tracks msight_pipeline's customize checklist deterministically -- not
+    phase-locked (items fire in any order), but "which items are done" must
+    never be something the LLM infers from conversation history; every field
+    here is surfaced to the LLM every turn via chat_server._build_state_hint."""
+    model_config = ConfigDict(extra="forbid")
+    # Set once via select_msight_mode -- real state, not a per-call LLM flag
+    # (testing showed the model wasn't reliably consistent re-deciding it).
+    mode: str = ""  # "" | "demo" | "custom"
+    video_input: str = ""
+    rtsp_url: str = ""
+    sensor_name: str = ""
+    recording_active: bool = False
+    archiving_active: bool = False
+    # True after a successful start_msight_pipeline, False after a
+    # successful stop -- surfaced every turn so the LLM can remind the user
+    # it's still running and confirm before replacing it, instead of relying
+    # on conversation memory. Not a live check; see get_msight_status for that.
+    pipeline_running: bool = False
+    # Mirrors AutoLabelingState's run_confirmed/run_awaiting_confirmation.
+    run_confirmed: bool = False
+    run_awaiting_confirmation: bool = False
+    # Dedicated short TTL, separate from the global config.py-mtime TTL below,
+    # since that mtime gets refreshed by unrelated state writes.
+    run_confirmation_requested_at: float = 0.0
 
 
 class WorkflowState(BaseModel):
@@ -215,6 +294,7 @@ class WorkflowState(BaseModel):
     labeled_dataset_name: str = ""
 
     auto_labeling: Optional[AutoLabelingState] = None
+    msight_pipeline: Optional[MsightPipelineState] = None
 
     # Triggers a WORKFLOW_RESET context injection in chat_server on next request.
     workflow_just_reset: bool = False
@@ -242,18 +322,24 @@ class WorkflowState(BaseModel):
 
     def valid_tool_names(self) -> set[str] | None:
         """Return valid tools for the current step, or None to expose all tools."""
-        ALWAYS = {"send_reply", "switch_workflow"}
+        ALWAYS = ALWAYS_TOOLS
 
         if not self.workflow_name:
             return ALWAYS | {"select_workflow"}
 
+        spec = WORKFLOW_SPECS[self.workflow_name]
+        if not spec.requires_dataset:
+            mp = self.msight_pipeline
+            if mp and mp.run_awaiting_confirmation and not mp.run_confirmed:
+                return ALWAYS | {"confirm_run"}
+            return ALWAYS
+
         if not self.dataset_confirmed:
             return ALWAYS | {"set_selected_dataset", "list_datasets"}
 
-        if self.workflow_name == "auto_labeling":
-            return self._auto_labeling_tools(ALWAYS)
-
-        return None
+        if spec.tool_router_method:
+            return getattr(self, spec.tool_router_method)(ALWAYS)
+        return ALWAYS
 
     def _auto_labeling_tools(self, ALWAYS: set[str]) -> set[str]:
         al = self.auto_labeling
@@ -301,6 +387,7 @@ class WorkflowState(BaseModel):
                     "configure_auto_labeling",
                     "list_model_sources_and_models",
                     "set_auto_labeling_hyperparams",
+                    "set_msight_localization_config",
                     "set_labeling_backend",
                     "set_labeling_path",
                 }
@@ -333,6 +420,21 @@ class WorkflowState(BaseModel):
                     if state.auto_labeling.export_confirmed:
                         state.auto_labeling.export_confirmed = False
                         logging.warning("[STATE] TTL: cleared stale export_confirmed")
+                # msight_pipeline uses its own dedicated, much shorter TTL below
+                # (run_confirmation_requested_at is always set alongside
+                # run_awaiting_confirmation, so that one always fires first) --
+                # an unanswered consent summary should not be silently revived
+                # by a later, unrelated message.
+                mp = state.msight_pipeline
+                if mp and mp.run_awaiting_confirmation and mp.run_confirmation_requested_at:
+                    pending_age = _time.time() - mp.run_confirmation_requested_at
+                    if pending_age > 300:
+                        mp.run_awaiting_confirmation = False
+                        mp.run_confirmation_requested_at = 0.0
+                        logging.warning(
+                            f"[STATE] TTL: cleared stale msight_pipeline pending "
+                            f"confirmation after {pending_age:.0f}s unanswered"
+                        )
             except Exception:
                 pass
 
@@ -380,9 +482,8 @@ class WorkflowState(BaseModel):
             al.pop("pending_dataset_change", None)
 
         known = {
-            "workflow_name", "dataset_name", "dataset_confirmed",
-            "labeled_dataset_name", "auto_labeling",
-        }
+            "workflow_name", "dataset_name", "dataset_confirmed", "labeled_dataset_name",
+        } | set(WORKFLOW_SPECS)
         for key in list(raw.keys()):
             if key not in known:
                 raw.pop(key)
@@ -415,8 +516,16 @@ class WorkflowState(BaseModel):
 
     def reset_for_workflow(self, workflow_name: str) -> "WorkflowState":
         fresh = WorkflowState(workflow_name=workflow_name)
-        if workflow_name == "auto_labeling":
-            fresh.auto_labeling = AutoLabelingState()
+        spec = WORKFLOW_SPECS.get(workflow_name)
+        substate_cls = _resolve_substate_cls(spec.substate_cls_name) if spec else None
+        if substate_cls:
+            # Relies on the WORKFLOW_SPECS key matching a WorkflowState field name 1:1.
+            assert workflow_name in fresh.model_fields, (
+                f"WorkflowSpec {workflow_name!r} has substate_cls_name="
+                f"{spec.substate_cls_name!r} but WorkflowState has no field "
+                f"named {workflow_name!r} to hold it."
+            )
+            setattr(fresh, workflow_name, substate_cls())
         fresh.workflow_just_reset = True
         fresh.save()
         return fresh

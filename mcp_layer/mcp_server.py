@@ -5,7 +5,10 @@ from mcptools import (
     data_ingest,
     v51,
     cvat_export,
-    label_studio_export
+    label_studio_export,
+    msight_docker,
+    msight_record_archive,
+    # msight_calibration_helper intentionally not imported -- auto-detect-intrinsics is benched.
 )
 
 if __name__ == "__main__":

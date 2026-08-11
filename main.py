@@ -700,6 +700,79 @@ class WorkflowExecutor:
         return True
 
 
+def _run_msight_localization(dataset: fo.Dataset) -> None:
+    """Localizes the configured detection_field and writes lat/lon detections
+    and keypoints back to the dataset. Reads localization_* config from
+    WORKFLOWS["auto_labeling"], not WORKFLOW_STATE (main.py never reads that)."""
+    import subprocess
+    import importlib
+
+    try:
+        importlib.import_module("msight_base")
+    except ModuleNotFoundError:
+        logging.info("msight_base not found — running MSight/install.sh")
+        install_script = os.path.join(os.path.dirname(__file__), "MSight", "install.sh")
+        result = subprocess.run(
+            ["bash", install_script], capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            logging.error(f"MSight install failed:\n{result.stderr}")
+            return
+        logging.info(result.stdout)
+        importlib.invalidate_caches()
+
+    try:
+        from MSight.localize_dataset import run_localization
+        from MSight.utils.load_locamaps import (
+            build_pixel_localizer,
+            load_intrinsics,
+            load_locmaps,
+        )
+    except ImportError as exc:
+        logging.error(f"Could not import MSight localization modules: {exc}")
+        return
+
+    al_config = WORKFLOWS.get("auto_labeling", {})
+    detection_field = al_config.get("localization_detection_field")
+    loc_maps_path = al_config.get("localization_locmap_path")
+    intrinsics_path = al_config.get("localization_intrinsics_path")
+
+    if not detection_field or not loc_maps_path or not intrinsics_path:
+        logging.error(
+            "MSight localization is enabled but missing one or more required config keys: "
+            "'localization_detection_field', 'localization_locmap_path', "
+            "'localization_intrinsics_path'. Skipping."
+        )
+        return
+
+    msight_field = f"msight_{detection_field}"
+
+    logging.info(f"MSight localization: '{detection_field}' -> '{msight_field}'")
+
+    try:
+        intrinsics = load_intrinsics(intrinsics_path)
+        x0, y0 = intrinsics["x0"], intrinsics["y0"]
+        logging.info(f"Camera intrinsics: f={intrinsics['f']}, x0={x0}, y0={y0}")
+
+        lat_map, lon_map = load_locmaps(loc_maps_path)
+        localizer = build_pixel_localizer(lat_map, lon_map)
+
+        run_localization(
+            dataset=dataset,
+            detection_field=detection_field,
+            msight_field=msight_field,
+            localizer=localizer,
+            x0=x0,
+            y0=y0,
+        )
+
+        dataset.save()
+        logging.info("MSight localization complete.")
+
+    except Exception as exc:
+        logging.error(f"MSight localization failed: {exc}")
+
+
 def main():
     """Executes the data processing workflow, loads dataset, and launches Voxel51 visualization interface."""
     time_start = time.time()
@@ -737,6 +810,9 @@ def main():
     if dataset is not None:
         dataset.reload()
         dataset.save()
+
+        if WORKFLOWS.get("auto_labeling", {}).get("localization_enabled", False):
+            _run_msight_localization(dataset)
 
         arrange_fields_in_groups(dataset)
         logging.info(f"Launching Voxel51 session for dataset {dataset_info['name']}.")

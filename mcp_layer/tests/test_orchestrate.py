@@ -19,7 +19,7 @@ from validate_workflow_state import WorkflowState
 
 def make_pipeline(dataset_confirmed=False):
     """Create a ChatPipeline with mocked dependencies and a fresh state."""
-    pipeline = ChatPipeline(mcp_transport=MagicMock(), llm=MagicMock())
+    pipeline = ChatPipeline(mcp_client=MagicMock(), llm=MagicMock())
     pipeline.state = WorkflowState()
     if dataset_confirmed:
         pipeline.state.dataset_name = "test_ds"

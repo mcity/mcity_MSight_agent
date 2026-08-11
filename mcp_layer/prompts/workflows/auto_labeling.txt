@@ -155,9 +155,35 @@ Hyperparam flow — the key distinction is whether the user asked for advice or 
     → Do NOT call set_auto_labeling_hyperparams.
 
 After each change, ask: "Would you like to modify any other hyperparameters before we start?"
-Once hyperparameters are finalised, tell the user the workflow is ready and ask for their
-confirmation to run (e.g. "Everything is configured. Shall I start the auto-labeling run?").
-Do not call run_auto_labeling until the user explicitly confirms.
+
+STEP R2b — MSIGHT LOCALIZATION (advanced, reactive only — "auto" path only)
+This only applies on the Auto Generated Labeling path — it geolocates model predictions,
+which don't exist yet on the Manual Labeling path.
+Do NOT proactively bring this up or ask the user if they want it — this is an advanced,
+niche capability (mapping detections to real-world lat/lon), not something most users need
+or expect to be asked about. Only engage with it if the user brings it up themselves —
+mentions geolocation, real-world coordinates, or lat/lon. Check SESSION_STATE before
+re-explaining or re-configuring — if already configured this session, don't ask again.
+
+IMPORTANT LIMITATION: calibration is currently hardcoded to the Ashley/Huron intersection
+camera — there is no per-dataset or per-camera calibration selection yet. Only offer this
+if the dataset's footage is actually from that camera. If the user asks to geolocate a
+dataset from a different camera or location, tell them calibration for that camera isn't
+supported yet — do not call the tool, since it would silently apply the wrong camera's
+calibration and produce incorrect coordinates.
+Construct detection_field yourself as "pred_od_<model_name>-<dataset_name>" using the
+currently configured model and dataset — do not ask the user to type this field name unless
+they want to override it.
+Once confirmed, call set_msight_localization_config(detection_field=...) immediately — no
+separate confirmation needed beyond the user's initial ask.
+If the tool returns an error, relay its message to the user verbatim — do not guess at a fix.
+This step must happen before run_auto_labeling fires — localization runs automatically as
+part of that same run, checked internally right after predictions are written; there's no
+separate "run localization" step or tool.
+
+Once hyperparameters (and localization, if used) are finalised, tell the user the workflow is
+ready and ask for their confirmation to run (e.g. "Everything is configured. Shall I start the
+auto-labeling run?"). Do not call run_auto_labeling until the user explicitly confirms.
 
 STEP R3 — RUN
 Trigger: User explicitly says to proceed (e.g. "yes", "run it", "go ahead", "start").
@@ -212,7 +238,14 @@ LOCKED — After export (manual) or after run (auto) completes:
   Parameters are LOCKED. Do NOT attempt to reconfigure.
   If the user asks to change something: tell them the workflow is locked and ask
   if they want to discard all progress and restart from dataset selection.
-  If yes, call switch_workflow(workflow_name=auto_labeling) to reset all state.
+  If yes, call switch_workflow(workflow_name='auto_labeling', confirm_restart=true) —
+  this discards the current run and returns to dataset selection, staying in
+  auto_labeling. (Calling switch_workflow without confirm_restart=true while locked
+  returns an error asking you to get the user's explicit confirmation first — that's
+  expected; get the confirmation, then call it again with confirm_restart=true.)
+  reset_workflow_state() is a different, bigger action — it leaves auto_labeling
+  entirely and returns to the very start (workflow selection). Only use it if the
+  user wants to stop working with auto_labeling altogether, not just restart this run.
 
 WORKFLOW COMPLETE (SESSION_STATE shows workflow_complete):
   Let the user know the auto labeling workflow has completed.

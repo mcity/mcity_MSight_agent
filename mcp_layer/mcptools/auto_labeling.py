@@ -204,6 +204,61 @@ def set_auto_labeling_hyperparams(
 
 
 @mcp.tool()
+def set_msight_localization_config(
+    detection_field: str,
+    enabled: bool = True,
+) -> str:
+    """
+    Configure MSight geolocation for the auto_labeling workflow's detections.
+    Writes into config.WORKFLOWS["auto_labeling"], not WORKFLOW_STATE.
+
+    intrinsics_path/locmap_path are NOT settable here -- hardcoded in config.py
+    to the Ashley/Huron intersection camera's calibration (single-camera only).
+    Only call this tool for a dataset that actually came from that camera.
+    """
+    lines = CONFIG_PATH.read_text().split("\n")
+    modified = []
+    in_auto_labeling = False
+    found_auto_labeling_block = False
+
+    updated_keys = {
+        "\"localization_enabled\"": str(enabled),
+        "\"localization_detection_field\"": repr(detection_field),
+    }
+
+    for line in lines:
+        if '"auto_labeling": {' in line:
+            in_auto_labeling = True
+            found_auto_labeling_block = True
+            modified.append(line)
+            continue
+
+        if in_auto_labeling:
+            stripped = line.strip()
+            key = stripped.split(":")[0]
+            if key in updated_keys:
+                line = f"        {key}: {updated_keys[key]},"
+            elif stripped.startswith("}"):
+                in_auto_labeling = False
+
+        modified.append(line)
+
+    if not found_auto_labeling_block:
+        return (
+            "MSIGHT_LOCALIZATION_ERROR: Could not find the \"auto_labeling\" block in "
+            "config.py — localization settings were not saved."
+        )
+
+    CONFIG_PATH.write_text("\n".join(modified).rstrip("\n") + "\n")
+    return (
+        "MSight localization configured — it will run automatically as part of the "
+        "next auto-labeling run, using the Ashley/Huron intersection camera's "
+        "calibration (hardcoded)." if enabled else
+        "MSight localization configuration saved (disabled)."
+    )
+
+
+@mcp.tool()
 def list_model_sources_and_models() -> dict:
     """
     Lists valid model sources and models for auto_labeling.

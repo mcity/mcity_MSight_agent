@@ -1,0 +1,53 @@
+Named SESSION_STATE hint fragments for _build_state_hint (chat_server.py).
+
+Machine-parsed: each fragment starts with a line of the form
+"=== name ===" and runs until the next such marker. {placeholder} tokens are
+filled in via str.format() at call time — see _build_state_hint for exactly
+which values are passed for which fragment. This file holds only the
+instructional prose; the branching logic (which fragment applies, and what
+values to interpolate) stays in chat_server.py, not here — splitting "which
+message" from "what the message says" across two files was judged not worth
+it for control flow this fine-grained (see msight-customizable-pipeline.md
+prompt-architecture note).
+
+=== dataset_not_confirmed ===
+dataset=not confirmed — NEXT STEP: wait for the user to name a dataset, then call set_selected_dataset immediately. Do NOT infer or reuse a dataset name from earlier in the conversation — the user must explicitly type a dataset name in their CURRENT message. Do NOT call switch_workflow or select_workflow again.
+
+=== backend_both ===
+backend=AWAITING_CHOICE — user must choose annotation backend. Classify intent and act: user names a backend preference → call set_labeling_backend(backend=...) immediately; user provides a new dataset name → call set_selected_dataset; user provides both dataset and backend → call set_selected_dataset then set_labeling_backend.
+
+=== backend_confirmed_no_path ===
+LABELING_BACKEND: {backend} — already confirmed. NEXT STEP: present Manual vs Auto Labeling options if the user has not yet chosen. user wants a different backend → call set_labeling_backend with the new backend; user wants a different dataset → call set_selected_dataset; user chose manual labeling → call set_labeling_path('manual'); user chose auto labeling → call set_labeling_path('auto').
+
+=== manual_no_classes ===
+labeling_path=manual — awaiting annotation class names. When user provides class names → call {export_fn}(dataset_name='{dataset_name}', classes=[...]).
+
+=== manual_classes_export_confirmed ===
+manual_classes=[{classes}], export_confirmed=True — call the export tool immediately with these classes.
+
+=== manual_classes_awaiting_confirm ===
+manual_classes=[{classes}] — classes provided, awaiting export confirmation. When user confirms, call confirm_export() then the export tool with these classes.
+
+=== phase_locked ===
+phase={phase} ({action}). Parameters are LOCKED — do not reconfigure. If the user asks to change a parameter: tell them the workflow is locked. If they want to discard all progress and restart from dataset selection: confirm with them first (e.g. 'This will discard the current run — are you sure?'), then call switch_workflow(workflow_name='{workflow_name}', confirm_restart=true) to force the reset.
+
+=== models_listed_not_configured ===
+models_listed=True — user has seen the model list. When the user names a model (e.g. 'rfdetr_2xlarge', 'yolo11n', 'facebook/detr-resnet-50') → call configure_auto_labeling(selected_source=<infer from name>, selected_model=<exact name>) immediately. Do NOT call set_selected_dataset or set_labeling_backend when the user is naming a model. If user describes their use case or asks for advice, use send_reply to recommend options and end with 'Which model would you like to use?' — then wait for their reply.
+
+=== model_configured_awaiting_run_confirm ===
+model=configured, run summary shown — awaiting user confirmation. user confirms (yes, proceed, go ahead, etc.) → call confirm_run; user requests changes → call set_auto_labeling_hyperparams with ONLY changed values; to change the model → call configure_auto_labeling immediately (no need to re-list models if the user already named one)
+
+=== model_configured_ready ===
+model=configured — user confirms defaults or says ready (e.g. 'these parameters are good', 'looks good', 'go ahead', 'yes') → call run_auto_labeling immediately — do NOT use send_reply to ask for confirmation first, run_auto_labeling shows its own pre-flight summary and handles the confirmation step itself; any message with a hyperparam name or value (e.g. 'epochs 20', 'set learning rate to 0.001', '5 epochs') → call set_auto_labeling_hyperparams immediately with ONLY the changed values — do NOT re-call configure_auto_labeling for hyperparam-only requests; to change the model → call configure_auto_labeling immediately (no need to re-list models if the user already named one)
+
+=== workflow_complete ===
+workflow_complete — labeled dataset: '{labeled_dataset_name}'. If the user wants to visualize/see/view the results (including answering 'yes' to a prior question about Voxel51) → call launch_voxel51_session(dataset_name='{labeled_dataset_name}') immediately — do NOT call switch_workflow for this. If user wants to start over: call switch_workflow(workflow_name='auto_labeling'). Generic words like 'done', 'ok', 'thanks', 'exit' do NOT mean start over — respond with send_reply asking if they want to run auto-labeling again or are finished.
+
+=== reconfigurable_zone_a ===
+RECONFIGURABLE (Zone A — before the workflow locks): to change the dataset → call set_selected_dataset; to change the model → call configure_auto_labeling (call list_model_sources_and_models first if user doesn't know the model name); to change the backend → call set_labeling_backend directly; user wants to switch labeling approach / use auto generated instead / use manual instead → call set_labeling_path('auto' or 'manual') — dataset, backend, and classes are preserved, only path-specific state resets; user explicitly wants to start completely over and discard everything → call switch_workflow(workflow_name='{workflow_name}') — clears ALL state including dataset, returning to dataset selection;
+
+=== msight_pipeline_running ===
+pipeline_running=True — the docker containers were last confirmed started and have not been stopped since (source: {source}). It keeps running indefinitely; nothing stops it automatically. If the current message is unrelated to the pipeline and looks like the user is wrapping up (e.g. "thanks", "that's all", "I'm done", ending the conversation), gently remind them it's still running and ask if they want to stop it — don't just answer and let it go unmentioned. If the current message would start the pipeline again with a DIFFERENT source/config than {source}, just call start_msight_pipeline as usual — its own consent gate will show a summary and require confirm_run before anything actually changes, even in Demo mode where that step is normally skipped, so you don't need to add an extra confirmation of your own on top of it. If the user's message already explicitly says to replace it (e.g. "stop it and start X instead"), call stop_msight_pipeline first, then start_msight_pipeline — nothing is running by the time the new one starts, so no summary appears, matching what they asked for.
+
+=== msight_run_awaiting_confirm ===
+run_awaiting_confirmation=True — a consent summary for this exact source was already shown. Only treat the user's CURRENT message as answering it if it is an unambiguous yes/no about starting the pipeline right now (e.g. "yes", "go ahead", "start it", "not yet", "wait"). If the conversation has since moved on to something else (calibration, a different checklist item, an unrelated question) and the current message could reasonably be about THAT instead, do NOT call confirm_run just because a word sounds vaguely affirmative — answer what they actually asked, and only return to this pending confirmation if they explicitly bring the pipeline start back up. When it does apply: user confirms → call confirm_run() immediately — do NOT call start_msight_pipeline again directly, it will just re-show the same summary since it isn't confirmed yet. user wants to change something first (different source, etc.) → call start_msight_pipeline again with the new values instead, which shows an updated summary.

@@ -7,9 +7,8 @@ Pydantic models — no state is loaded from or saved to config.py.
 import pytest
 from validate_workflow_state import (
     WorkflowState, AutoLabelingState, LabelingBackend, AutoLabelingPhase,
+    WORKFLOW_SPECS, ALWAYS_TOOLS as ALWAYS,
 )
-
-ALWAYS = {"send_reply", "switch_workflow"}
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +40,26 @@ def test_valid_tool_names_auto_labeling_dataset_not_confirmed():
     state = WorkflowState(workflow_name="auto_labeling")
     result = state.valid_tool_names()
     assert result == ALWAYS | {"set_selected_dataset", "list_datasets"}
+
+
+def test_valid_tool_names_msight_pipeline_skips_dataset_gate():
+    """msight_pipeline is registered with requires_dataset=False -- its tools
+    are already unconditionally in ALWAYS, so no dataset step should appear
+    even though dataset_confirmed is False (the default)."""
+    state = WorkflowState(workflow_name="msight_pipeline")
+    result = state.valid_tool_names()
+    assert result == ALWAYS
+
+
+def test_workflow_specs_registry_matches_valid_workflow_literal():
+    """WORKFLOW_SPECS is the single source of truth VALID_WORKFLOW derives
+    from -- this documents that invariant rather than testing something that
+    could actually drift (it can't, by construction)."""
+    assert set(WORKFLOW_SPECS) == {"auto_labeling", "msight_pipeline"}
+    for name in WORKFLOW_SPECS:
+        WorkflowState(workflow_name=name)  # must not raise
+    with pytest.raises(Exception):
+        WorkflowState(workflow_name="bogus_workflow")
 
 
 # ---------------------------------------------------------------------------
