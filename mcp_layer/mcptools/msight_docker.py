@@ -2,8 +2,10 @@ import os
 import re
 import json
 import socket
+import shutil
 import hashlib
 import asyncio
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -123,7 +125,6 @@ def _reset_calibration_to_default(msight_path: Path) -> None:
     Uses `git show HEAD:<path>` rather than `git checkout` so this only ever
     touches the two calibration files via a plain write, never the working
     tree, and can't clobber unrelated uncommitted changes in that repo."""
-    import subprocess
     for rel_path in (CALIBRATION_INTRINSICS_REL, CALIBRATION_LOCMAP_REL):
         result = subprocess.run(
             ["git", "show", f"HEAD:{rel_path.as_posix()}"],
@@ -183,9 +184,11 @@ def _friendly_error_from_output(stdout: str, stderr: str) -> Optional[str]:
         )
     if _NVIDIA_ERR_RE.search(combined):
         return (
-            "GPU device driver 'nvidia' could not be selected. The NVIDIA Container "
-            "Toolkit is likely missing or misconfigured on this host. Install it, or "
-            "run against docker-compose.cpu.yml instead."
+            "GPU device driver 'nvidia' could not be selected, despite nvidia-smi "
+            "reporting a GPU on this host -- the NVIDIA Container Toolkit is likely "
+            "missing or misconfigured. (If this host has no GPU at all, this "
+            "shouldn't happen -- docker-compose.cpu.yml should already be applied "
+            "automatically; that auto-detection may itself be the problem.)"
         )
     if _REDIS_PORT_ERR_RE.search(combined):
         return (
@@ -193,6 +196,28 @@ def _friendly_error_from_output(stdout: str, stderr: str) -> Optional[str]:
             "process on this host. Stop it and retry."
         )
     return None
+
+
+_gpu_available: Optional[bool] = None
+
+
+async def _has_gpu() -> bool:
+    """True if nvidia-smi reports a working GPU -- decides whether to layer in docker-compose.cpu.yml. Cached for the process lifetime."""
+    global _gpu_available
+    if _gpu_available is not None:
+        return _gpu_available
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi is None:
+        _gpu_available = False
+        return False
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            nvidia_smi, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        _gpu_available = await asyncio.wait_for(proc.wait(), timeout=5) == 0
+    except Exception:
+        _gpu_available = False
+    return _gpu_available
 
 
 async def _run_compose(
@@ -203,9 +228,13 @@ async def _run_compose(
     as they arrive -- a `--build` can take minutes, otherwise the user just
     stares at one static message. Still returns the full accumulated text
     for friendly-error matching and the truncated-tail fallback below."""
+    compose_files = ["-f", "docker-compose.yml"]
+    cpu_override = msight_path / "docker-compose.cpu.yml"
+    if not await _has_gpu() and cpu_override.is_file():
+        compose_files += ["-f", "docker-compose.cpu.yml"]
     try:
         proc = await asyncio.create_subprocess_exec(
-            "docker", "compose", "--env-file", ".env", *args,
+            "docker", "compose", *compose_files, "--env-file", ".env", *args,
             cwd=str(msight_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -248,7 +277,7 @@ async def start_msight_pipeline(
     video_input: Optional[str] = None,
     rtsp_url: Optional[str] = None,
     sensor_name: Optional[str] = None,
-    build: bool = True,
+    build: bool = False,
     ctx: Context = None,
 ) -> str:
     msight_path, err = _get_msight_path()

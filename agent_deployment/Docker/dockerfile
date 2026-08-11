@@ -4,8 +4,8 @@ FROM python:3.11-slim
 # Set work directory
 WORKDIR /app
 
-# Copy code and templates
-COPY app.py deploy-agent-AWS-AMI.yml ./
+# App.py imports config.py/redisManager.py/cloudFormationManager.py and reads the CFN yml directly -- all must be copied alongside it.
+COPY App.py config.py redisManager.py cloudFormationManager.py deploy-agent-AWS-AMI.yml ./
 COPY templates ./templates
 
 # Install dependencies
@@ -18,4 +18,4 @@ EXPOSE 5000
 # ENV AWS_ACCESS_KEY=your_access AWS_SECRET_KEY=your_secret ...
 
 # Entrypoint
-CMD ["python", "app.py"]
+CMD ["python", "App.py"]

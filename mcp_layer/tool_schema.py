@@ -519,12 +519,13 @@ tools = [
                     "files, must exist on this host — not a URL or upload) or rtsp_url (a live "
                     "RTSP stream URL; the primary intended mode for real deployments, though still "
                     "work-in-progress in MSight_Vision so treat failures here as less predictable "
-                    "than the file-path mode). Requires Docker Engine + Compose "
-                    "plugin and, for GPU mode, the NVIDIA Container Toolkit on this host. Returns a "
-                    "friendly error for known failure modes instead of raw docker output: missing/"
-                    "misconfigured MSIGHT_VISION_PATH, a malformed line in MSight_Vision's own .env, "
-                    "port 6379 already bound by a host redis-server, or a missing NVIDIA Container "
-                    "Toolkit. On success, includes the web viewer URL (port 9010)."
+                    "than the file-path mode). Requires Docker Engine + Compose plugin on this host. "
+                    "GPU vs CPU mode is auto-detected (nvidia-smi) — no GPU means MSight_Vision's "
+                    "docker-compose.cpu.yml override is applied automatically, nothing to specify. "
+                    "Returns a friendly error for known failure modes instead of raw docker output: "
+                    "missing/misconfigured MSIGHT_VISION_PATH, a malformed line in MSight_Vision's "
+                    "own .env, or port 6379 already bound by a host redis-server. On success, "
+                    "includes the web viewer URL (port 9010)."
                 ),
                 "parameters": {
                     "type": "object",
@@ -532,7 +533,7 @@ tools = [
                         "video_input": {"type": "string", "description": "Absolute path to a video file or folder of .mp4 files on this host."},
                         "rtsp_url": {"type": "string", "description": "Live RTSP stream URL. Takes priority over video_input if both are set."},
                         "sensor_name": {"type": "string", "description": "Logical camera/sensor name. Optional — MSight_Vision defaults to gs_mcity_1 if omitted."},
-                        "build": {"type": "boolean", "description": "Rebuild Docker images before starting (default true). Set false for a faster restart when images are already current."}
+                        "build": {"type": "boolean", "description": "Rebuild Docker images from source before starting (default false — a plain `docker compose up -d` using the already-built/published image, no rebuild output). Only set true if MSight_Vision's own source has changed and the running image is stale; a rebuild prints noisy 'exporting layers'-style BuildKit output that looks alarming but is normal — avoid triggering it unless actually needed."}
                     }
                 }
             }
@@ -615,11 +616,19 @@ tools = [
             "function": {
                 "name": "start_msight_recording",
                 "description": (
-                    "Start local video recording — a tracked host subprocess (not a Docker "
-                    "container), independent of the core detection pipeline's own lifecycle. Safe "
-                    "to call before start_msight_pipeline too: it just waits idle for the first "
-                    "frame. No AWS credentials needed; this only writes to local disk. Does not "
-                    "require start_msight_archiving to be active or vice versa — independent sinks."
+                    "Start local video recording — records the ANNOTATED feed (bounding boxes, "
+                    "class labels, confidence scores drawn in by a frame-annotator node this "
+                    "process launches), never raw/unannotated video: recording exactly what the "
+                    "user fed in, with no detection output, isn't useful. Tracked host subprocesses "
+                    "(not Docker containers). Safe to call before start_msight_pipeline too: if the "
+                    "pipeline isn't running yet, this doesn't launch anything — it saves the request "
+                    "and returns status='deferred'; recording is launched automatically, with no "
+                    "further tool call needed from you, the moment the pipeline containers start — "
+                    "but since it needs rfdetr_detector's detection output (not just raw camera "
+                    "frames) to draw anything, it may sit idle for a few seconds after that while "
+                    "the detector finishes loading its model, same as any other startup wait. No "
+                    "AWS credentials needed; this only writes to local disk. Does not require "
+                    "start_msight_archiving to be active or vice versa — independent sinks."
                 ),
                 "parameters": {
                     "type": "object",
@@ -637,9 +646,15 @@ tools = [
             "function": {
                 "name": "start_msight_archiving",
                 "description": (
-                    "Start pushing recorded video to an S3 bucket — a tracked host subprocess, "
-                    "independent of start_msight_recording (does not require it to be active "
-                    "first) and safe to call before start_msight_pipeline too. Requires "
+                    "Start pushing recorded video to an S3 bucket — pushes the ANNOTATED feed "
+                    "(bounding boxes/labels/scores drawn in), never raw video, same reasoning as "
+                    "start_msight_recording. A tracked host subprocess, independent of "
+                    "start_msight_recording (does not require it to be active first) and safe to "
+                    "call before start_msight_pipeline too: if the pipeline isn't running yet, this "
+                    "doesn't launch anything — it saves the request and returns status='deferred'; "
+                    "archiving is launched automatically, with no further tool call needed from "
+                    "you, the moment the pipeline containers start — but may sit idle briefly after "
+                    "that until rfdetr_detector actually begins publishing detections. Requires "
                     "AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY to already be configured in this "
                     "host's .env — if the tool returns an error about missing credentials, tell "
                     "the user plainly rather than guessing at a fix."

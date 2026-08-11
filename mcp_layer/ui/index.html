@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>Mcity AI Agent · Chat + Ingestion</title>
+<title>MSight AI Agent · Chat + Ingestion</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <link rel="icon" href="favicon.ico">
 <style>
@@ -51,6 +51,8 @@ html, body {
   color:var(--muted);font-size:13px;
 }
 .status-dot{color:#22c55e;font-size:14px;line-height:1}
+.recording-status{color:#f87171;font-size:13px}
+.recording-status.hidden{display:none}
 .provider-select{
   padding:4px 8px;border-radius:8px;border:1px solid var(--border);
   background:#0a1224;color:var(--text);font-size:13px;outline:none
@@ -100,8 +102,14 @@ box-shadow:var(--shadow);line-height:1.45;white-space:pre-wrap;word-wrap:break-w
 display:grid;grid-template-columns:1fr auto auto;gap:10px;padding:12px;border-top:1px solid var(--border);
 background:linear-gradient(180deg, rgba(3,6,18,.6), rgba(3,6,18,.85))
 }
-#calibUploadBtn{min-width:44px;padding:0;font-size:18px;background:#0a1224}
-#calibUploadBtn:hover{background:#101c36}
+#uploadBtn{min-width:44px;padding:0;font-size:18px;background:#0a1224}
+#uploadBtn:hover{background:#101c36}
+.upload-choice-btn{
+display:flex;align-items:center;gap:10px;width:100%;text-align:left;
+padding:10px 12px;font-size:15px;background:#0a1224;border:1px solid var(--border);border-radius:8px
+}
+.upload-choice-btn:hover{background:#101c36}
+.upload-choice-btn .emoji{font-size:20px}
 .calib-modal{
 position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:50
 }
@@ -244,7 +252,7 @@ min-width:auto;
 <body>
 <div class="app">
 <header class="app-header">
-<div class="brand">Mcity AI Agent</div>
+<div class="brand">MSight AI Agent</div>
 <div class="status">
 <span class="status-dot" id="chatStatus">●</span>
 <span id="chatStatusText">chat: ready</span>
@@ -258,15 +266,31 @@ min-width:auto;
   <div id="chat-helper" style="grid-column:1/4; color: var(--muted); font-size: 13px; margin-bottom: 4px;">
     Type <strong>hi</strong> and click <strong>Send</strong> button.
   </div>
+  <div id="recordingStatus" class="recording-status hidden" style="grid-column:1/4; margin-bottom: 4px;"></div>
   <textarea id="input" rows="1" placeholder="Type a message…" autocomplete="off"></textarea>
-  <button id="calibUploadBtn" type="button" title="Upload MSight camera calibration files">📐</button>
+  <button id="uploadBtn" type="button" title="Upload a file for MSight Pipeline">📤</button>
   <button id="send" type="submit">Send</button>
   <div style="grid-column:3/4; display:flex; justify-content:flex-end;">
     <select id="providerSelect" class="provider-select"></select>
   </div>
 </form>
 </section>
-<!-- Camera calibration upload modal (hidden until the upload button is clicked) -->
+<!-- Upload chooser (hidden until the upload button is clicked) -->
+<div id="uploadChooserModal" class="calib-modal hidden">
+  <div class="calib-modal-inner">
+    <h3>Upload for MSight Pipeline</h3>
+    <button type="button" id="chooseCalibBtn" class="upload-choice-btn">
+      <span class="emoji">📐</span> Camera calibration files (intrinsics + map)
+    </button>
+    <button type="button" id="chooseVideoBtn" class="upload-choice-btn">
+      <span class="emoji">🎥</span> Video source for the pipeline
+    </button>
+    <div class="calib-modal-actions">
+      <button type="button" id="uploadChooserCancelBtn">Cancel</button>
+    </div>
+  </div>
+</div>
+<!-- Camera calibration upload modal (hidden until chosen above) -->
 <div id="calibModal" class="calib-modal hidden">
   <div class="calib-modal-inner">
     <h3>Upload Camera Calibration</h3>
@@ -281,10 +305,23 @@ min-width:auto;
     </div>
   </div>
 </div>
+<!-- MSight video upload modal (hidden until chosen above) -->
+<div id="videoModal" class="calib-modal hidden">
+  <div class="calib-modal-inner">
+    <h3>Upload Video for MSight Pipeline</h3>
+    <label>Video file (.mp4, .mov, .avi, .mkv, .m4v)</label>
+    <input type="file" id="videoFile" accept=".mp4,.mov,.avi,.mkv,.m4v">
+    <div id="videoStatus" class="calib-status"></div>
+    <div class="calib-modal-actions">
+      <button type="button" id="videoCancelBtn">Cancel</button>
+      <button type="button" id="videoSubmitBtn">Upload</button>
+    </div>
+  </div>
+</div>
 <!-- RIGHT: Ingestion (30%) -->
 <aside class="pane pane-ingest">
 <div class="ingest-card">
-<h2>Data Ingestion</h2>
+<h2>Data Ingestion (For Auto Labeling)</h2>
 <form id="ingestForm" enctype="multipart/form-data" class="ingest-form">
 <label>Dataset ZIP</label>
 <input type="file" name="file" required accept=".zip">
@@ -722,8 +759,36 @@ document.getElementById('ingestForm').addEventListener('submit', async function(
     }
 });
 
+// ── Upload chooser (single entry point for the two upload flows below) ─────
+const uploadBtn = document.getElementById("uploadBtn");
+const uploadChooserModal = document.getElementById("uploadChooserModal");
+const uploadChooserCancelBtn = document.getElementById("uploadChooserCancelBtn");
+const chooseCalibBtn = document.getElementById("chooseCalibBtn");
+const chooseVideoBtn = document.getElementById("chooseVideoBtn");
+
+uploadBtn.addEventListener("click", () => {
+    uploadChooserModal.classList.remove("hidden");
+});
+
+uploadChooserCancelBtn.addEventListener("click", () => {
+    uploadChooserModal.classList.add("hidden");
+});
+
+uploadChooserModal.addEventListener("click", (e) => {
+    if (e.target === uploadChooserModal) uploadChooserModal.classList.add("hidden");
+});
+
+chooseCalibBtn.addEventListener("click", () => {
+    uploadChooserModal.classList.add("hidden");
+    openCalibModal();
+});
+
+chooseVideoBtn.addEventListener("click", () => {
+    uploadChooserModal.classList.add("hidden");
+    openVideoModal();
+});
+
 // ── MSight camera calibration upload ───────────────────────────────────────
-const calibBtn = document.getElementById("calibUploadBtn");
 const calibModal = document.getElementById("calibModal");
 const calibCancelBtn = document.getElementById("calibCancelBtn");
 const calibSubmitBtn = document.getElementById("calibSubmitBtn");
@@ -731,12 +796,12 @@ const calibStatus = document.getElementById("calibStatus");
 const calibIntrinsicsInput = document.getElementById("calibIntrinsicsFile");
 const calibLocmapInput = document.getElementById("calibLocmapFile");
 
-calibBtn.addEventListener("click", () => {
+function openCalibModal() {
     calibStatus.textContent = "";
     calibIntrinsicsInput.value = "";
     calibLocmapInput.value = "";
     calibModal.classList.remove("hidden");
-});
+}
 
 calibCancelBtn.addEventListener("click", () => {
     calibModal.classList.add("hidden");
@@ -783,6 +848,108 @@ calibSubmitBtn.addEventListener("click", async () => {
         calibSubmitBtn.disabled = false;
     }
 });
+
+// ── MSight video upload (for cloud sandboxes with no shared filesystem) ────
+const videoModal = document.getElementById("videoModal");
+const videoCancelBtn = document.getElementById("videoCancelBtn");
+const videoSubmitBtn = document.getElementById("videoSubmitBtn");
+const videoStatus = document.getElementById("videoStatus");
+const videoFileInput = document.getElementById("videoFile");
+
+function openVideoModal() {
+    videoStatus.textContent = "";
+    videoFileInput.value = "";
+    videoModal.classList.remove("hidden");
+}
+
+videoCancelBtn.addEventListener("click", () => {
+    videoModal.classList.add("hidden");
+});
+
+videoModal.addEventListener("click", (e) => {
+    if (e.target === videoModal) videoModal.classList.add("hidden");
+});
+
+videoSubmitBtn.addEventListener("click", async () => {
+    const file = videoFileInput.files[0];
+    if (!file) {
+        videoStatus.textContent = "Please select a video file.";
+        return;
+    }
+
+    videoSubmitBtn.disabled = true;
+    videoStatus.textContent = "Uploading… this can take a while for large files.";
+
+    try {
+        const fd = new FormData();
+        fd.append("video", file);
+        const res = await fetch(`${CHAT_BASE}/msight/upload_video`, {
+            method: "POST",
+            body: fd,
+        });
+        const data = await res.json();
+
+        if (!res.ok || data.status === "error") {
+            videoStatus.textContent = data.message || "Upload failed.";
+            addMsg("agent", `Video upload failed: ${data.message || "unknown error"}`);
+        } else {
+            videoStatus.textContent = "Uploaded.";
+            addMsg("agent", data.message || "Video uploaded.");
+            // LLM has no upload tool of its own -- give it the path via turn context instead.
+            history.push([
+                "[Uploaded a video via the upload button]",
+                `${data.message} Use this as video_input: ${data.video_input}`,
+            ]);
+            videoModal.classList.add("hidden");
+        }
+    } catch (e) {
+        videoStatus.textContent = `Error: ${e.message}`;
+    } finally {
+        videoSubmitBtn.disabled = false;
+    }
+});
+
+// ── MSight recording status polling (independent of the chat/LLM loop) ─────
+const recordingStatusEl = document.getElementById("recordingStatus");
+
+// Reset whenever recording isn't active, so the next session notifies again.
+let recordingFirstClipNotified = false;
+
+function notifyFirstClipCaptured() {
+    if (!("Notification" in window)) return;
+    const fire = () => new Notification("MSight recording", {
+        body: "First clip captured — recording is underway.",
+    });
+    if (Notification.permission === "granted") {
+        fire();
+    } else if (Notification.permission !== "denied") {
+        Notification.requestPermission().then((perm) => { if (perm === "granted") fire(); });
+    }
+}
+
+async function pollRecordingStatus() {
+    try {
+        const res = await fetch(`${CHAT_BASE}/msight/record_status`);
+        const data = await res.json();
+        if (!data.recording_active && !data.recording_pending) {
+            recordingStatusEl.classList.add("hidden");
+            recordingFirstClipNotified = false;
+            return;
+        }
+        recordingStatusEl.classList.remove("hidden");
+        recordingStatusEl.textContent = "🔴 " + data.message;
+
+        // One-shot alert for the specific moment the first clip is ready.
+        if (data.recording_active && data.segment_count >= 1 && !recordingFirstClipNotified) {
+            recordingFirstClipNotified = true;
+            notifyFirstClipCaptured();
+        }
+    } catch (e) {
+        // Background poll, not a user action -- stay quiet on a transient failure.
+    }
+}
+setInterval(pollRecordingStatus, 5000);
+pollRecordingStatus();
 </script>
 </body>
 </html>

@@ -272,6 +272,13 @@ class MsightPipelineState(BaseModel):
     sensor_name: str = ""
     recording_active: bool = False
     archiving_active: bool = False
+    # Deferred start_msight_recording/start_msight_archiving request, auto-fired once start_msight_pipeline next succeeds.
+    recording_pending: bool = False
+    recording_pending_since: float = 0.0
+    archiving_pending: bool = False
+    archiving_pending_since: float = 0.0
+    archiving_pending_bucket: str = ""
+    archiving_pending_prefix: str = ""
     # True after a successful start_msight_pipeline, False after a
     # successful stop -- surfaced every turn so the LLM can remind the user
     # it's still running and confirm before replacing it, instead of relying
@@ -435,6 +442,17 @@ class WorkflowState(BaseModel):
                             f"[STATE] TTL: cleared stale msight_pipeline pending "
                             f"confirmation after {pending_age:.0f}s unanswered"
                         )
+                # Same reasoning as above -- a deferred recording/archiving request should not auto-fire on a much-later, unrelated pipeline start.
+                if mp and mp.recording_pending and mp.recording_pending_since and _time.time() - mp.recording_pending_since > 3600:
+                    mp.recording_pending = False
+                    mp.recording_pending_since = 0.0
+                    logging.warning("[STATE] TTL: cleared stale recording_pending")
+                if mp and mp.archiving_pending and mp.archiving_pending_since and _time.time() - mp.archiving_pending_since > 3600:
+                    mp.archiving_pending = False
+                    mp.archiving_pending_since = 0.0
+                    mp.archiving_pending_bucket = ""
+                    mp.archiving_pending_prefix = ""
+                    logging.warning("[STATE] TTL: cleared stale archiving_pending")
             except Exception:
                 pass
 

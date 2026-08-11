@@ -5,6 +5,7 @@ import os
 import re
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -28,7 +29,12 @@ from mcptools.msight_docker import (
     CALIBRATION_INTRINSICS_REL, CALIBRATION_LOCMAP_REL,
     _calibration_status, _get_msight_path, calibration_state_label,
 )
-from mcptools.msight_record_archive import DOWNLOAD_DIR as MSIGHT_DOWNLOAD_DIR
+from mcptools.msight_record_archive import (
+    DEFAULT_SENSOR_NAME as MSIGHT_DEFAULT_SENSOR_NAME,
+    DOWNLOAD_DIR as MSIGHT_DOWNLOAD_DIR,
+    _active_sensor_name,
+    recording_segment_status,
+)
 from progress_relay import get_active_progress_cb
 from tool_schema import tools
 from validate_workflow_state import (
@@ -262,8 +268,8 @@ def _msight_pipeline_state_hint(mp) -> str:
     parts = [f"mode={mp.mode or 'not set'}", source, _msight_calibration_hint()]
     if mp.sensor_name:
         parts.append(f"sensor_name={mp.sensor_name}")
-    parts.append(f"recording={'active' if mp.recording_active else 'not active'}")
-    parts.append(f"archiving={'active' if mp.archiving_active else 'not active'}")
+    parts.append(f"recording={'active' if mp.recording_active else 'pending (will auto-start when pipeline starts)' if mp.recording_pending else 'not active'}")
+    parts.append(f"archiving={'active' if mp.archiving_active else 'pending (will auto-start when pipeline starts)' if mp.archiving_pending else 'not active'}")
     parts.append(f"pipeline_running={mp.pipeline_running}")
     checklist = "msight_checklist(" + ", ".join(parts) + ")"
     if mp.run_awaiting_confirmation and not mp.run_confirmed:
@@ -449,6 +455,59 @@ async def msight_upload_calibration(
     })
 
 
+# Lets a browser-uploaded video land on this server's disk for use as video_input (cloud sandboxes have no shared host filesystem with the user).
+MSIGHT_UPLOAD_DIR = Path("output/msight_uploads")
+MSIGHT_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
+MSIGHT_MAX_UPLOAD_BYTES = int(os.environ.get("MSIGHT_MAX_UPLOAD_BYTES", 2 * 1024**3))  # 2GB default
+_UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
+
+
+@app.post("/msight/upload_video")
+async def msight_upload_video(video: UploadFile = File(...)):
+    """Streams the upload to disk in chunks (unlike upload_calibration's small-file `read()`) and enforces MSIGHT_MAX_UPLOAD_BYTES while streaming."""
+    suffix = Path(video.filename or "").suffix.lower()
+    if suffix not in MSIGHT_VIDEO_EXTENSIONS:
+        return JSONResponse(
+            {
+                "status": "error",
+                "message": (
+                    f"Unsupported file type '{suffix or '(none)'}' — expected one of "
+                    f"{sorted(MSIGHT_VIDEO_EXTENSIONS)}."
+                ),
+            },
+            status_code=400,
+        )
+
+    MSIGHT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    dest = MSIGHT_UPLOAD_DIR / f"upload_{datetime.now().strftime('%Y%m%dT%H%M%S%f')}{suffix}"
+
+    written = 0
+    try:
+        with open(dest, "wb") as f:
+            while chunk := await video.read(_UPLOAD_CHUNK_SIZE):
+                written += len(chunk)
+                if written > MSIGHT_MAX_UPLOAD_BYTES:
+                    raise ValueError("size_limit_exceeded")
+                f.write(chunk)
+    except ValueError:
+        dest.unlink(missing_ok=True)
+        limit_gb = MSIGHT_MAX_UPLOAD_BYTES / 1024**3
+        return JSONResponse(
+            {"status": "error", "message": f"Upload exceeds the {limit_gb:.1f}GB limit for this sandbox."},
+            status_code=413,
+        )
+    except Exception as e:
+        dest.unlink(missing_ok=True)
+        return JSONResponse({"status": "error", "message": f"Upload failed: {e}"}, status_code=500)
+
+    return JSONResponse({
+        "status": "ok",
+        "message": f"Uploaded '{video.filename}' ({written / 1024**2:.1f} MB).",
+        # Absolute, since docker compose resolves VIDEO_INPUT relative to its own cwd, not this server's.
+        "video_input": str(dest.resolve()),
+    })
+
+
 @app.get("/msight/download_recording/{filename}")
 async def msight_download_recording(filename: str):
     """Serves a finished recording as a browser download, since a chat reply
@@ -462,6 +521,58 @@ async def msight_download_recording(filename: str):
         return JSONResponse({"status": "error", "message": "Recording not found."}, status_code=404)
 
     return FileResponse(path, media_type="video/mp4", filename=filename)
+
+
+@app.get("/msight/record_status")
+async def msight_record_status():
+    """Live recording-progress poll for the UI's status badge, independent of the chat/LLM loop."""
+    state = WorkflowState.load()
+    mp = state.msight_pipeline
+    if mp is None or not (mp.recording_active or mp.recording_pending):
+        return JSONResponse({
+            "status": "ok",
+            "recording_active": False,
+            "recording_pending": False,
+            "segment_count": 0,
+            "seconds_since_last": None,
+            "message": "Not recording.",
+        })
+
+    if mp.recording_pending:
+        return JSONResponse({
+            "status": "ok",
+            "recording_active": False,
+            "recording_pending": True,
+            "segment_count": 0,
+            "seconds_since_last": None,
+            "message": "Recording will start automatically once the pipeline is running.",
+        })
+
+    msight_path, path_err = _get_msight_path()
+    if mp.sensor_name:
+        sensor = mp.sensor_name
+    elif not path_err:
+        sensor = _active_sensor_name(msight_path)
+    else:
+        sensor = MSIGHT_DEFAULT_SENSOR_NAME
+    seg = recording_segment_status(sensor)
+
+    if seg["segment_count"] == 0:
+        message = "Recording — capturing first clip, nothing saved yet."
+    else:
+        plural = "s" if seg["segment_count"] != 1 else ""
+        message = (
+            f"Recording — {seg['segment_count']} clip{plural} captured "
+            f"(most recent {seg['seconds_since_last']}s ago). Stop recording to download."
+        )
+
+    return JSONResponse({
+        "status": "ok",
+        "recording_active": True,
+        "recording_pending": False,
+        **seg,
+        "message": message,
+    })
 
 
 @app.post("/chat/stream")

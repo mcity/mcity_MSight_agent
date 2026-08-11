@@ -1,35 +1,17 @@
-"""Record & Archive: tracked host subprocesses, not Docker containers.
+"""Record & Archive: tracked host subprocesses (not Docker containers) that record the *annotated* feed.
 
-Per the corrected node chain (msight-customizable-pipeline.md, Part 1d):
+    video_source --> camera/$SENSOR_NAME --> rfdetr_detector --> detection/$SENSOR_NAME
+        --> annotated_frame_publisher (ours, msight_nodes/) --> annotated/$SENSOR_NAME
+        --> image_to_video_aggregator (unmodified) --> video/$SENSOR_NAME --> video_local_dumper / aws_video_pusher
 
-    video_source --publishes--> camera/$SENSOR_NAME
-                                      |
-                                      v
-                       image_to_video_aggregator
-                         --subscribe camera/$SENSOR_NAME
-                         --publish   video/$SENSOR_NAME
-                                      |
-                                      v
-                             video/$SENSOR_NAME
-                              /              \\
-                             /                \\
-                  video_local_dumper      aws_video_pusher
-                  (RECORD, no AWS)        (ARCHIVE, opt-in, needs AWS creds)
-
-Chosen over a Docker Compose override (see plan doc's Piece C): zero
-changes to the MSight_Vision checkout, at the cost of losing Docker's
-health-check/restart-on-failure lifecycle -- acceptable for these
-short-lived, user-triggered nodes, unlike the always-on detection pipeline.
-
-The base pipeline runs with `network_mode: host`, so a bare host subprocess
-reaches Redis at localhost:6379 exactly like a container does -- no extra
-networking config needed.
+Host subprocesses rather than a Docker Compose override, to avoid touching the MSight_Vision checkout at all.
 """
 import asyncio
 import json
 import logging
 import os
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -55,9 +37,15 @@ LOG_DIR = Path("output/logs/msight_record_archive")
 # save_dir so a download is always one file, never a folder of chunks.
 DOWNLOAD_DIR = Path("output/msight_downloads")
 
+ANNOTATOR_NODE = "frame_annotator"
 AGGREGATOR_NODE = "video_aggregator"
 DUMPER_NODE = "local_dumper"
 PUSHER_NODE = "s3_pusher"
+
+# Ours, launched with MSight_Vision's own venv interpreter.
+_ANNOTATOR_SCRIPT = (
+    Path(__file__).resolve().parents[1] / "msight_nodes" / "annotated_frame_publisher.py"
+)
 
 DEFAULT_SENSOR_NAME = "gs_mcity_1"
 # The aggregator only publishes a clip once it's collected this many
@@ -90,6 +78,20 @@ def _active_sensor_name(msight_path: Path) -> str:
                 if value:
                     return value
     return DEFAULT_SENSOR_NAME
+
+
+def recording_segment_status(sensor: str) -> dict:
+    """Live on-disk scan of recorded segments -- the only honest way to know if a clip has landed yet."""
+    save_dir = Path(os.environ.get("MSIGHT_RECORDING_SAVE_DIR", "output/msight_recordings"))
+    segment_dir = save_dir / sensor
+    segments = sorted(segment_dir.glob(f"{sensor}_*.mp4")) if segment_dir.is_dir() else []
+    if not segments:
+        return {"segment_count": 0, "seconds_since_last": None}
+    last_mtime = max(p.stat().st_mtime for p in segments)
+    return {
+        "segment_count": len(segments),
+        "seconds_since_last": max(0, int(time.time() - last_mtime)),
+    }
 
 
 def _is_alive(name: str) -> bool:
@@ -162,23 +164,43 @@ async def _stop(name: str) -> str:
     return f"{name} stopped."
 
 
+async def _ensure_annotator(msight_path: Path, sensor_name: str) -> tuple[bool, str]:
+    """Idempotent, same pattern as _ensure_aggregator -- draws boxes onto detections and republishes for the aggregator to consume."""
+    if _is_alive(ANNOTATOR_NODE):
+        return True, ""
+    python_bin = _venv_bin(msight_path, "python3")
+    if python_bin is None:
+        return False, "python3 not found in MSight_Vision's venv."
+    cmd = [
+        str(python_bin), str(_ANNOTATOR_SCRIPT),
+        "--name", ANNOTATOR_NODE,
+        "--subscribe-topic", f"detection/{sensor_name}",
+        "--publish-topic", f"annotated/{sensor_name}",
+    ]
+    return await _launch(ANNOTATOR_NODE, cmd, msight_path)
+
+
 async def _ensure_aggregator(msight_path: Path, sensor_name: str) -> tuple[bool, str]:
     """Idempotent: archiving alone still needs the aggregator running,
     since the S3 pusher subscribes to the aggregator's video/ output, not
-    the raw camera/ feed. Starting recording first is not required.
+    the annotated frame feed directly. Starting recording first is not
+    required.
 
     Known gap: if the aggregator is already alive, sensor_name isn't
     checked against what it was actually launched with -- a topic mismatch
     from a prior call would go unnoticed here."""
     if _is_alive(AGGREGATOR_NODE):
         return True, ""
+    ok, msg = await _ensure_annotator(msight_path, sensor_name)
+    if not ok:
+        return False, msg
     binary = _venv_bin(msight_path, "msight_launch_image_to_video_aggregator")
     if binary is None:
         return False, "msight_launch_image_to_video_aggregator not found in MSight_Vision's venv."
     cmd = [
         str(binary),
         "--name", AGGREGATOR_NODE,
-        "--subscribe-topic", f"camera/{sensor_name}",
+        "--subscribe-topic", f"annotated/{sensor_name}",
         "--publish-topic", f"video/{sensor_name}",
         "--buffer-size", str(DEFAULT_BUFFER_SIZE),
         "--overlap-size", str(DEFAULT_OVERLAP_SIZE),
@@ -189,8 +211,7 @@ async def _ensure_aggregator(msight_path: Path, sensor_name: str) -> tuple[bool,
 
 @mcp.tool()
 async def start_msight_recording(sensor_name: Optional[str] = None) -> str:
-    """Start local video recording: the image-to-video aggregator plus a
-    local disk dumper. No AWS credentials required."""
+    """Start local recording of the annotated feed: frame annotator + aggregator + local disk dumper."""
     msight_path, err = _get_msight_path()
     if err:
         return json.dumps({"status": "error", "message": err})
@@ -284,10 +305,7 @@ async def _concat_recording_segments(save_dir: Path, sensor: str) -> tuple[Optio
 
 @mcp.tool()
 async def start_msight_archiving(s3_bucket: str, s3_prefix: Optional[str] = None) -> str:
-    """Start S3 archiving: the image-to-video aggregator (if not already
-    running) plus an S3 video pusher. Requires AWS credentials in this
-    process's environment (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) --
-    boto3's default credential chain, nothing MSight-specific."""
+    """Start S3 archiving of the annotated feed: frame annotator + aggregator + S3 pusher. Needs AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY."""
     msight_path, err = _get_msight_path()
     if err:
         return json.dumps({"status": "error", "message": err})
@@ -325,16 +343,20 @@ async def start_msight_archiving(s3_bucket: str, s3_prefix: Optional[str] = None
     })
 
 
+async def _stop_aggregator_chain() -> str:
+    """Stop the aggregator and its upstream annotator together."""
+    agg_msg = await _stop(AGGREGATOR_NODE)
+    ann_msg = await _stop(ANNOTATOR_NODE)
+    return f"{agg_msg} {ann_msg}"
+
+
 @mcp.tool()
 async def stop_msight_recording() -> str:
-    """Stop the local dumper. Leaves the aggregator running if archiving is
-    still active (shared upstream node), otherwise stops it too. Then
-    combines this session's segments into one downloadable .mp4 -- the
-    dumper has fully exited by this point, so every segment is on disk."""
+    """Stop the local dumper (and aggregator/annotator if archiving isn't also active), then combine segments into one downloadable .mp4."""
     msg = await _stop(DUMPER_NODE)
     agg_msg = ""
     if not _is_alive(PUSHER_NODE):
-        agg_msg = " " + await _stop(AGGREGATOR_NODE)
+        agg_msg = " " + await _stop_aggregator_chain()
 
     global _LAST_RECORDING_SENSOR
     sensor = _LAST_RECORDING_SENSOR
@@ -356,11 +378,10 @@ async def stop_msight_recording() -> str:
 
 @mcp.tool()
 async def stop_msight_archiving() -> str:
-    """Stop the S3 pusher. Leaves the aggregator running if recording is
-    still active, for the same reason as stop_msight_recording."""
+    """Stop the S3 pusher (and aggregator/annotator if recording isn't also active)."""
     msg = await _stop(PUSHER_NODE)
     if not _is_alive(DUMPER_NODE):
-        agg_msg = await _stop(AGGREGATOR_NODE)
+        agg_msg = await _stop_aggregator_chain()
         return json.dumps({"status": "ok", "message": f"{msg} {agg_msg}"})
     return json.dumps({"status": "ok", "message": msg})
 
@@ -371,6 +392,7 @@ def get_msight_record_archive_status() -> str:
     process's own tracking, not docker compose ps — these aren't
     containers)."""
     return json.dumps({
+        "frame_annotator": _is_alive(ANNOTATOR_NODE),
         "video_aggregator": _is_alive(AGGREGATOR_NODE),
         "local_dumper": _is_alive(DUMPER_NODE),
         "s3_pusher": _is_alive(PUSHER_NODE),

@@ -2,7 +2,7 @@ import os
 import psutil
 
 #: Select workflow list from 'WORKFLOWS = {...}' dictionary
-SELECTED_WORKFLOW = ["auto_labeling"]
+SELECTED_WORKFLOW = ["msight_pipeline"]
 #: Select dataset from config/datasets.yaml
 SELECTED_DATASET = {
     "name": "",
@@ -11,7 +11,7 @@ SELECTED_DATASET = {
 }
 
 #: Runtime session state — managed by the agent via WorkflowState, do not edit manually
-WORKFLOW_STATE = {'workflow_name': '', 'dataset_name': '', 'dataset_confirmed': False, 'labeled_dataset_name': '', 'auto_labeling': None, 'msight_pipeline': None, 'workflow_just_reset': False}
+WORKFLOW_STATE = {'workflow_name': 'msight_pipeline', 'dataset_name': '', 'dataset_confirmed': False, 'labeled_dataset_name': '', 'auto_labeling': None, 'msight_pipeline': {'mode': 'custom', 'video_input': '/home/dataengine/Github/mcity_MSight_agent/output/msight_uploads/upload_20260811T134429879150.mp4', 'rtsp_url': '', 'sensor_name': 'gs_mcity_1', 'recording_active': False, 'archiving_active': False, 'recording_pending': False, 'archiving_pending': False, 'archiving_pending_bucket': '', 'archiving_pending_prefix': '', 'pipeline_running': False, 'run_confirmed': False, 'run_awaiting_confirmation': False, 'run_confirmation_requested_at': 0.0}, 'workflow_just_reset': False}
 
 #: Workflows and associated parameters
 WORKFLOWS = {

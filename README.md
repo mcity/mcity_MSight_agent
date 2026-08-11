@@ -111,8 +111,9 @@ The `msight_pipeline` workflow lets the agent start, stop, and monitor MSight_Vi
 - **Demo or custom source:** either point the agent at the developer's own test video/stream (`MSIGHT_DEMO_VIDEO_PATH` in `.env`) for a zero-setup demo, or supply your own `video_input` (file/folder) or `rtsp_url`.
 - **Explicit run confirmation:** for a custom source, the first `start_msight_pipeline` call never launches anything — it returns a consent summary (source, calibration status, recording/archiving selection) that the user must confirm before any container actually starts.
 - **Camera calibration:** upload your own `intrinsics.json` + calibration `.npz` (built with [camera_calibration2](https://github.com/michigan-traffic-lab/camera_calibration2)) via the web UI's upload button; the agent validates the file formats and reports live calibration status (`default` / `user_calibrated` / `missing` / `partial`) every turn.
-- **Record & Archive:** independent, opt-in local video recording and S3 archiving, run as tracked host subprocesses alongside the Docker-based detection pipeline.
-- **Friendly error handling:** known Docker/host failure modes (missing NVIDIA Container Toolkit, a host process already bound to Redis's port, a malformed `.env` line) are translated into actionable messages instead of raw `docker compose` output.
+- **Record & Archive:** independent, opt-in local video recording and S3 archiving of the *annotated* feed (bounding boxes/labels/scores drawn in via a small frame-annotator node this agent launches, not MSight_Vision itself) — run as tracked host subprocesses alongside the Docker-based detection pipeline.
+- **GPU vs CPU auto-detected:** checks for a working `nvidia-smi` and transparently layers in MSight_Vision's `docker-compose.cpu.yml` override when no GPU is present — nothing to configure either way.
+- **Friendly error handling:** known Docker/host failure modes (a host process already bound to Redis's port, a malformed `.env` line) are translated into actionable messages instead of raw `docker compose` output.
 
 ## Online Demo: Data Selection with Embeddings
 
@@ -363,6 +364,9 @@ git add .gitmodules $(git submodule foreach --quiet 'echo $name')
 │  │   ├── msight_record_archive.py # Local recording + S3 archiving as tracked host subprocesses
 │  │   ├── msight_calibration_helper.py # Fisheye-intrinsics auto-detect (not yet registered)
 │  │   └── v51.py               # Voxel51 integration
+│  ├── msight_nodes/            # Standalone MSight nodes (not MCP tools) launched as
+│  │   │                        # subprocesses via MSight_Vision's own venv interpreter
+│  │   └── annotated_frame_publisher.py # Draws detection boxes, republishes for Record & Archive
 │  ├── llm_clients.py           # Multi-LLM support (OpenAI, Claude, Gemini, Groq)
 │  ├── tool_schema.py           # Tool definitions exposed to the LLM
 │  ├── prompts/                 # System + per-workflow prompt text

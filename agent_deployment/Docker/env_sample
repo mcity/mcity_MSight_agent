@@ -3,8 +3,16 @@ AWS_SECRET_KEY=your_secret_key
 REGION=us-east-1
 OPENAIAPIKEY=your_openai_api_key
 HFTOKEN=your_hf_token
+# Optional -- the launcher's own credential set, applied to every deployed sandbox.
+ANTHROPICAPIKEY=your_anthropic_api_key
+GEMINIAPIKEY=your_gemini_api_key
+GROQAPIKEY=your_groq_api_key
+LSTOKEN=your_label_studio_api_token
+LSURL=https://app.humansignal.com
+CVATACCESSTOKEN=your_cvat_access_token
 ROLE_ARN=arn:aws:iam::1234567800000:role/mcity-data-engine-agent-cf-role
 KEY_PAIR_NAME=mcity-data-engine-key
+# Confirmed: r5 family, no GPU.
 INSTANCE_TYPE=r5.large
 REDIS_HOST=redis
 REDIS_PORT=6379

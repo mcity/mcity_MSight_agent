@@ -9,13 +9,22 @@ class Config:
     REGION = os.getenv('REGION', 'us-east-1')
     OPENAIAPIKEY = os.getenv('OPENAIAPIKEY')
     HFTOKEN = os.getenv('HFTOKEN')
+    # cloudFormationManager.create_stack() reads these off self.config -- must stay defined.
+    ANTHROPICAPIKEY = os.getenv('ANTHROPICAPIKEY', '')
+    GEMINIAPIKEY = os.getenv('GEMINIAPIKEY', '')
+    GROQAPIKEY = os.getenv('GROQAPIKEY', '')
+    LSTOKEN = os.getenv('LSTOKEN', '')
+    LSURL = os.getenv('LSURL', 'https://app.humansignal.com')
+    CVATACCESSTOKEN = os.getenv('CVATACCESSTOKEN', '')
     ROLE_ARN = os.getenv('ROLE_ARN', 'arn:aws:iam::1234567800000:role/mcity-data-engine-agent-cf-role')
     KEY_PAIR_NAME = os.getenv('KEY_PAIR_NAME', 'mcity-data-engine-key')
+    # Confirmed: r5 family, no GPU -- msight_docker.py auto-detects and runs MSight_Vision's CPU compose override.
     INSTANCE_TYPE = os.getenv('INSTANCE_TYPE', 'r5.large')
-    STACK_NAME = "mcity-data-engine-agent"
+    STACK_NAME = "mcity-msight-agent"
     WHITELIST = set([
         "rpatnaik@umich.edu",
-        "admin@umich.edu"
+        "admin@umich.edu",
+        "saisneha@umich.edu"
         # Add more whitelisted emails here.
     ])
     REDIS_HOST = os.getenv('REDIS_HOST', 'redis')
