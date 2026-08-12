@@ -59,6 +59,11 @@ Parameters:
     Type: String
     Default: 'https://github.com/michigan-traffic-lab/MSight_Vision.git'
     Description: URL of the MSight_Vision git repository to clone alongside this agent
+  # TEMPORARY
+  MsightVisionRepoBranch:
+    Type: String
+    Default: rf-detr-detector
+    Description: Branch of MsightVisionRepoURL to clone -- docker-compose.cpu.yml lives here, not on main yet
   # Confirmed: r5 family, no GPU. msight_docker.py auto-detects this (no nvidia-smi) and applies MSight_Vision's docker-compose.cpu.yml override.
   InstanceType:
     Type: String
@@ -140,7 +145,7 @@ Resources:
 
           # ---- MSight_Vision checkout (never modified in place, only shelled out to) ----
           cd /home/ubuntu
-          git clone ${MsightVisionRepoURL} MSight_Vision
+          git clone --branch ${MsightVisionRepoBranch} ${MsightVisionRepoURL} MSight_Vision
           cd MSight_Vision
           python3 -m venv venv
           venv/bin/pip install --upgrade pip
