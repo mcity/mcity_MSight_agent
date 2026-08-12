@@ -144,12 +144,23 @@ Resources:
           cd MSight_Vision
           python3 -m venv venv
           venv/bin/pip install --upgrade pip
-          if [ -f requirements.txt ]; then venv/bin/pip install -r requirements.txt; fi
-          if [ -f install.sh ]; then bash install.sh || true; fi
+          # MSight_Vision is a pyproject.toml package (per its own README/Dockerfile-local) --
+          # this venv is what _ensure_annotator/_ensure_aggregator launch host-side for
+          # recording/archiving, so it needs msight_core/opencv/redis etc. actually installed.
+          venv/bin/pip install -e .
           # MSight_Vision's own .env -- just needs to exist for `docker compose --env-file .env`; VIDEO_INPUT/RTSP_URL are set per-run instead.
           if [ -f env_sample ] && [ ! -f .env ]; then cp env_sample .env; fi
-          # Pre-build the CPU-mode rfdetr_detector image now, so every later launch on this AMI is a plain `up -d` with no build.
+          # Pre-build the CPU-mode rfdetr_detector image, and pre-pull redis, so every later
+          # launch on this AMI is a plain `up -d` with no build or network dependency.
           docker compose -f docker-compose.yml -f docker-compose.cpu.yml --env-file .env build
+          docker compose -f docker-compose.yml -f docker-compose.cpu.yml --env-file .env pull redis
+
+          # Demo-mode sample video: MSight_Vision ships no video, only a real timestamped
+          # JPG sequence (examples/fullstack/sample_data/) from its own separate fullstack
+          # example -- stitch one angle into an actual .mp4 for Demo mode's zero-setup path.
+          ffmpeg -y -framerate 5 -pattern_type glob \
+            -i "examples/fullstack/sample_data/gs_State_Ellsworth_SE/*.jpg" \
+            -c:v libx264 -pix_fmt yuv420p /home/ubuntu/msight_demo_video.mp4
 
           # ---- Agent code ----
           cd /home/ubuntu
@@ -188,6 +199,7 @@ Resources:
           CVAT_ACCESS_TOKEN=${CVATACCESSTOKEN}
           HF_TOKEN=${HFTOKEN}
           MSIGHT_VISION_PATH=/home/ubuntu/MSight_Vision
+          MSIGHT_DEMO_VIDEO_PATH=/home/ubuntu/msight_demo_video.mp4
           EOF
           chmod 600 .env
 

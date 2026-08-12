@@ -128,6 +128,7 @@ Resources:
           CVAT_ACCESS_TOKEN=${CVATACCESSTOKEN}
           HF_TOKEN=${HFTOKEN}
           MSIGHT_VISION_PATH=/home/ubuntu/MSight_Vision
+          MSIGHT_DEMO_VIDEO_PATH=/home/ubuntu/msight_demo_video.mp4
           EOF
           chmod 600 .env
 

@@ -122,7 +122,11 @@ class MsightPipelineHandlers:
             ), [FallThrough()]
         if self.state.msight_pipeline is None:
             self.state.msight_pipeline = MsightPipelineState()
-        self.state.msight_pipeline.mode = mode
+        mp = self.state.msight_pipeline
+        if mp.mode != mode:
+            mp.video_input = ""
+            mp.rtsp_url = ""
+        mp.mode = mode
         self.state.save()
         logging.warning(f"[PIPELINE] select_msight_mode: mode={mode!r}")
         return f"MSIGHT_MODE_SET: mode={mode!r}", [FallThrough()]

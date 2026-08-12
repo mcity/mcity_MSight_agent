@@ -135,7 +135,11 @@ def _reset_calibration_to_default(msight_path: Path) -> None:
         dest.write_bytes(result.stdout)
 
 
-def _check_msight_env(msight_path: Path) -> Optional[str]:
+def _check_msight_env(msight_path: Path, overriding_source: bool = False) -> Optional[str]:
+    """overriding_source=True means the caller passed video_input/rtsp_url, which
+    docker compose applies as process env and takes precedence over --env-file for
+    ${VAR} interpolation -- so .env's own static VIDEO_INPUT/RTSP_URL value never
+    actually gets used and isn't worth validating."""
     env_path = msight_path / ".env"
     if not env_path.is_file():
         return None
@@ -148,6 +152,9 @@ def _check_msight_env(msight_path: Path) -> Optional[str]:
             f"MSight_Vision's .env has a malformed line for '{key}' (looks like "
             f"'{key}={key}=...'). Fix that line by hand before starting the pipeline."
         )
+
+    if overriding_source:
+        return None
 
     if re.search(r'^\s*RTSP_URL\s*=\s*\S+', text, re.MULTILINE):
         return None
@@ -296,7 +303,7 @@ async def start_msight_pipeline(
             "message": f"video_input path '{video_input}' does not exist on this host.",
         })
 
-    env_err = _check_msight_env(msight_path)
+    env_err = _check_msight_env(msight_path, overriding_source=bool(video_input or rtsp_url))
     if env_err:
         return json.dumps({"status": "error", "message": env_err})
 

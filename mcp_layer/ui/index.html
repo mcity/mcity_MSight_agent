@@ -837,10 +837,8 @@ calibSubmitBtn.addEventListener("click", async () => {
             addMsg("agent", `Calibration upload failed: ${data.message || "unknown error"}`);
         } else {
             calibStatus.textContent = "Uploaded.";
-            addMsg("agent", data.message || "Calibration uploaded.");
-            // Give the LLM turn context so it can acknowledge the upload naturally.
-            history.push(["[Uploaded camera calibration files via the upload button]", data.message || "Calibration uploaded."]);
             calibModal.classList.add("hidden");
+            chatSend("[Uploaded camera calibration files via the upload button]");
         }
     } catch (e) {
         calibStatus.textContent = `Error: ${e.message}`;
@@ -894,13 +892,10 @@ videoSubmitBtn.addEventListener("click", async () => {
             addMsg("agent", `Video upload failed: ${data.message || "unknown error"}`);
         } else {
             videoStatus.textContent = "Uploaded.";
-            addMsg("agent", data.message || "Video uploaded.");
-            // LLM has no upload tool of its own -- give it the path via turn context instead.
-            history.push([
-                "[Uploaded a video via the upload button]",
-                `${data.message} Use this as video_input: ${data.video_input}`,
-            ]);
             videoModal.classList.add("hidden");
+            // Route through the real chat turn (not a canned bubble) so the LLM reads
+            // SESSION_STATE, starts the pipeline with this path, and recaps the checklist.
+            chatSend(`[Uploaded a video via the upload button: ${data.message} Use this as video_input: ${data.video_input}]`);
         }
     } catch (e) {
         videoStatus.textContent = `Error: ${e.message}`;

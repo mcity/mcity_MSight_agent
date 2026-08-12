@@ -23,7 +23,7 @@ logging.basicConfig(
 )
 
 from chat_pipeline import ChatPipeline
-from host_utils import resolve_host
+from host_utils import is_cloud_deployment, resolve_host
 from llm_clients import ClaudeClient, GeminiClient, GroqClient, OpenAIClient
 from mcptools.msight_docker import (
     CALIBRATION_INTRINSICS_REL, CALIBRATION_LOCMAP_REL,
@@ -166,26 +166,42 @@ WORKFLOW_PROMPT_TEXT = {
 _MSIGHT_DEMO_VIDEO_PATH = os.environ.get("MSIGHT_DEMO_VIDEO_PATH", "").strip()
 if _MSIGHT_DEMO_VIDEO_PATH:
     _DEMO_VIDEO_HINT = (
-        f"The developer's own test video folder is available as a ready-made "
-        f"default: video_input='{_MSIGHT_DEMO_VIDEO_PATH}'. This is the whole "
-        f"point of Demo mode — \"minimal setup\" — so unless the user's message "
-        f"already named their own source, use this default automatically: "
-        f"explain what's about to run (this default source, that it's the demo "
-        f"calibration) and call start_msight_pipeline with it in the same "
-        f"reply. Do NOT ask the user to confirm or choose first — Demo has no "
-        f"consent exchange (see STEP 3); asking here just reintroduces the "
-        f"round trip that removes."
+        f"The built-in sample video is the fixed default for Demo mode, "
+        f"always: video_input='{_MSIGHT_DEMO_VIDEO_PATH}'. Demo takes zero "
+        f"input from the user, ever — explain what's about to run (this "
+        f"default source, that it's the demo calibration) and call "
+        f"start_msight_pipeline with it in the same reply. Do NOT ask the "
+        f"user to confirm or choose first — Demo has no consent exchange "
+        f"(see STEP 3); asking here just reintroduces the round trip that "
+        f"removes."
     )
 else:
     _DEMO_VIDEO_HINT = (
         "No default demo video is configured on this host "
-        "(MSIGHT_DEMO_VIDEO_PATH is not set in .env) — ask the user for a "
-        "video file/folder path or an RTSP stream URL, the same as you would "
-        "for \"run your own pipeline\"."
+        "(MSIGHT_DEMO_VIDEO_PATH is not set in .env) — Demo mode can't run "
+        "right now. Tell the user plainly that Demo isn't available on this "
+        "host (misconfiguration, not something they can fix), and offer "
+        "\"run your own pipeline\" instead. Do not ask them for a source "
+        "within Demo — Demo never takes one."
     )
+
+# Checked once at startup (IMDSv2) -- a local file/folder path is only a
+# meaningful thing to offer the user when they actually have access to this
+# host's filesystem, which isn't true for a cloud sandbox.
+_ENVIRONMENT_HINT = (
+    "This host is a cloud sandbox — the user has no access to its filesystem. "
+    "Never offer or accept a local file/folder path as a video source here; "
+    "only an rtsp:// URL or the 📤 upload button are valid ways for this user "
+    "to specify their own source."
+    if is_cloud_deployment() else
+    "This host is local/on-prem — the user may have direct filesystem access, "
+    "so a local file/folder path is a valid video source option here."
+)
 if "msight_pipeline" in WORKFLOW_PROMPT_TEXT:
-    WORKFLOW_PROMPT_TEXT["msight_pipeline"] = WORKFLOW_PROMPT_TEXT["msight_pipeline"].replace(
-        "{DEMO_VIDEO_HINT}", _DEMO_VIDEO_HINT
+    WORKFLOW_PROMPT_TEXT["msight_pipeline"] = (
+        WORKFLOW_PROMPT_TEXT["msight_pipeline"]
+        .replace("{DEMO_VIDEO_HINT}", _DEMO_VIDEO_HINT)
+        .replace("{ENVIRONMENT_HINT}", _ENVIRONMENT_HINT)
     )
 
 _WORKFLOW_LIST = "\n".join(

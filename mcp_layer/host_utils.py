@@ -34,3 +34,8 @@ def resolve_host() -> str:
             return host
     print("Could not obtain IMDSv2 token — falling back to localhost.")
     return "localhost"
+
+
+def is_cloud_deployment() -> bool:
+    """True if running on an EC2 instance -- used to decide whether a local host filesystem path is meaningful to offer the user."""
+    return get_imds_token() is not None
