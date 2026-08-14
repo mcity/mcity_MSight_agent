@@ -5,6 +5,7 @@ import socket
 import shutil
 import hashlib
 import asyncio
+import tempfile
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -194,8 +195,9 @@ def _friendly_error_from_output(stdout: str, stderr: str) -> Optional[str]:
             "GPU device driver 'nvidia' could not be selected, despite nvidia-smi "
             "reporting a GPU on this host -- the NVIDIA Container Toolkit is likely "
             "missing or misconfigured. (If this host has no GPU at all, this "
-            "shouldn't happen -- docker-compose.cpu.yml should already be applied "
-            "automatically; that auto-detection may itself be the problem.)"
+            "shouldn't happen -- this repo's own msight_cpu_override.yml should "
+            "already be applied automatically; that auto-detection may itself be "
+            "the problem.)"
         )
     if _REDIS_PORT_ERR_RE.search(combined):
         return (
@@ -227,6 +229,28 @@ async def _has_gpu() -> bool:
     return _gpu_available
 
 
+_rendered_cpu_override: Optional[Path] = None
+
+
+def _render_cpu_override() -> Path:
+    """msight_cpu_override.yml's build.dockerfile is a {DOCKERFILE_PATH}
+    placeholder -- substituted here with this repo's own Dockerfile.msight-cpu
+    (absolute path, since it lives outside MSight_Vision's checkout and the
+    override's build.context, so a relative path wouldn't reach it). Rendered
+    once per process into a temp file; the source template and the absolute
+    path of this file on disk are both fixed for the process lifetime."""
+    global _rendered_cpu_override
+    if _rendered_cpu_override is not None and _rendered_cpu_override.is_file():
+        return _rendered_cpu_override
+    template = (Path(__file__).parent / "msight_cpu_override.yml").read_text()
+    dockerfile = Path(__file__).parent / "Dockerfile.msight-cpu"
+    rendered = template.replace("{DOCKERFILE_PATH}", str(dockerfile))
+    out = Path(tempfile.gettempdir()) / "msight_cpu_override.rendered.yml"
+    out.write_text(rendered)
+    _rendered_cpu_override = out
+    return out
+
+
 async def _run_compose(
     msight_path: Path, args: list[str], timeout: int, env: Optional[dict] = None,
     ctx: Optional[Context] = None,
@@ -236,9 +260,14 @@ async def _run_compose(
     stares at one static message. Still returns the full accumulated text
     for friendly-error matching and the truncated-tail fallback below."""
     compose_files = ["-f", "docker-compose.yml"]
-    cpu_override = msight_path / "docker-compose.cpu.yml"
-    if not await _has_gpu() and cpu_override.is_file():
-        compose_files += ["-f", "docker-compose.cpu.yml"]
+    # Our own override, not MSight_Vision's docker-compose.cpu.yml -- that file's
+    # `deploy: {}` doesn't actually clear the base file's GPU device reservation
+    # (Compose merges mappings recursively; an empty override is a no-op), and its
+    # BASE_IMAGE build arg is a no-op too (Dockerfile-local hardcodes FROM with no
+    # ARG). Kept here rather than fixed in MSight_Vision's checkout, which is
+    # never modified.
+    if not await _has_gpu():
+        compose_files += ["-f", str(_render_cpu_override())]
     try:
         proc = await asyncio.create_subprocess_exec(
             "docker", "compose", *compose_files, "--env-file", ".env", *args,

@@ -1,0 +1,11 @@
+services:
+  rfdetr_detector:
+    build:
+      context: .
+      dockerfile: {DOCKERFILE_PATH}
+      args:
+        BASE_IMAGE: michigantrafficlab/msight-core:latest-pytorch2.7.1-cpu
+    deploy:
+      resources:
+        reservations:
+          devices: !reset null

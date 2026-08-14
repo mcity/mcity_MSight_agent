@@ -1,0 +1,11 @@
+ARG BASE_IMAGE=michigantrafficlab/msight-core:latest-pytorch2.7.1-cpu
+FROM ${BASE_IMAGE}
+
+RUN apt-get update && \
+    pip install --upgrade build
+
+COPY . /app/msight-vision
+
+WORKDIR /app/msight-vision
+
+RUN pip install -e .

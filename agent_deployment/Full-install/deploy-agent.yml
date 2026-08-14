@@ -59,12 +59,12 @@ Parameters:
     Type: String
     Default: 'https://github.com/michigan-traffic-lab/MSight_Vision.git'
     Description: URL of the MSight_Vision git repository to clone alongside this agent
-  # TEMPORARY
+  # TEMPORARY: rf-detr-detector's docker-compose.yml layout is what our calibration/CPU-override code depends on; not yet merged to main upstream.
   MsightVisionRepoBranch:
     Type: String
     Default: rf-detr-detector
-    Description: Branch of MsightVisionRepoURL to clone -- docker-compose.cpu.yml lives here, not on main yet
-  # Confirmed: r5 family, no GPU. msight_docker.py auto-detects this (no nvidia-smi) and applies MSight_Vision's docker-compose.cpu.yml override.
+    Description: Branch of MsightVisionRepoURL to clone -- not yet on main
+  # Confirmed: r5 family, no GPU. msight_docker.py auto-detects this and applies this repo's own CPU compose override (MSight_Vision's own docker-compose.cpu.yml doesn't actually work -- Compose merge quirk).
   InstanceType:
     Type: String
     Default: r5.large
@@ -141,7 +141,7 @@ Resources:
           apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
           usermod -aG docker ubuntu
 
-          # No GPU on this instance family -- no NVIDIA driver/Container Toolkit step. msight_docker.py auto-detects and runs MSight_Vision's CPU-only compose override instead.
+          # No GPU on this instance family -- no NVIDIA driver/Container Toolkit step. msight_docker.py auto-detects and applies this repo's own CPU compose override instead.
 
           # ---- MSight_Vision checkout (never modified in place, only shelled out to) ----
           cd /home/ubuntu
@@ -149,9 +149,7 @@ Resources:
           cd MSight_Vision
           python3 -m venv venv
           venv/bin/pip install --upgrade pip
-          # MSight_Vision is a pyproject.toml package (per its own README/Dockerfile-local) --
-          # this venv is what _ensure_annotator/_ensure_aggregator launch host-side for
-          # recording/archiving, so it needs msight_core/opencv/redis etc. actually installed.
+          # This venv is what _ensure_annotator/_ensure_aggregator launch host-side for recording/archiving.
           venv/bin/pip install -e .
           # MSight_Vision's own .env -- just needs to exist for `docker compose --env-file .env`; VIDEO_INPUT/RTSP_URL are set per-run instead.
           if [ -f env_sample ] && [ ! -f .env ]; then cp env_sample .env; fi
@@ -160,9 +158,7 @@ Resources:
           docker compose -f docker-compose.yml -f docker-compose.cpu.yml --env-file .env build
           docker compose -f docker-compose.yml -f docker-compose.cpu.yml --env-file .env pull redis
 
-          # Demo-mode sample video: MSight_Vision ships no video, only a real timestamped
-          # JPG sequence (examples/fullstack/sample_data/) from its own separate fullstack
-          # example -- stitch one angle into an actual .mp4 for Demo mode's zero-setup path.
+          # Demo-mode sample video: MSight_Vision ships no video, only a JPG sequence -- stitch one angle into an actual .mp4.
           ffmpeg -y -framerate 5 -pattern_type glob \
             -i "examples/fullstack/sample_data/gs_State_Ellsworth_SE/*.jpg" \
             -c:v libx264 -pix_fmt yuv420p /home/ubuntu/msight_demo_video.mp4
