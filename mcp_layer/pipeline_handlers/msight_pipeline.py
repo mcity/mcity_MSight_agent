@@ -259,10 +259,7 @@ class MsightPipelineHandlers:
     async def _handle_stop_msight_pipeline(
         self, fn_args: dict, mcp_client
     ) -> tuple[str, list[ToolRouting]]:
-        """Only real addition over calling the MCP tool directly: clears
-        pipeline_running on success, so SESSION_STATE stops telling the LLM
-        (and, via it, the user) that something's still running once it's
-        actually been stopped."""
+        """Clears pipeline_running on success"""
         result = unwrap_tool_output(await mcp_client.call_tool("stop_msight_pipeline", fn_args))
         try:
             ok = json.loads(result).get("status") == "ok"
@@ -271,7 +268,11 @@ class MsightPipelineHandlers:
         if ok:
             if self.state.msight_pipeline is None:
                 self.state.msight_pipeline = MsightPipelineState()
-            self.state.msight_pipeline.pipeline_running = False
+            mp = self.state.msight_pipeline
+            mp.pipeline_running = False
+            if mp.mode == "demo":
+                mp.video_input = ""
+                mp.rtsp_url = ""
             self.state.save()
         return result, [FallThrough()]
 
@@ -282,6 +283,14 @@ class MsightPipelineHandlers:
         if self.state.msight_pipeline is None:
             self.state.msight_pipeline = MsightPipelineState()
         mp = self.state.msight_pipeline
+
+        # Demo is watch-only -- enforced here, not just in the prompt, so a wayward
+        # LLM turn can't start recording/archiving against the shipped demo footage.
+        if fn_name in ("start_msight_recording", "start_msight_archiving") and mp.mode == "demo":
+            return json.dumps({
+                "status": "error",
+                "message": "Recording/archiving isn't available in Demo mode. Switch to \"run your own pipeline\" (select_msight_mode(mode=\"custom\")) to use it.",
+            }), [FallThrough()]
 
         if fn_name == "start_msight_recording" and not mp.pipeline_running:
             mp.recording_pending = True

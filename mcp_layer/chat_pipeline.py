@@ -73,6 +73,20 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
         self.state.save()
         return None
 
+    async def _emit_raw_logs(self, result: str, fn_args: dict, progress_cb) -> None:
+        """Surfaces get_msight_logs' real output to the frontend verbatim,
+        before the LLM's summary reply."""
+        try:
+            parsed = json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if parsed.get("status") != "ok" or not parsed.get("logs"):
+            return
+        await progress_cb("raw_logs", {
+            "service": fn_args.get("service") or "all services",
+            "text": parsed["logs"],
+        })
+
     async def run(self, tool_calls: list, messages: list, progress_cb=None) -> tuple[list, str | None]:
         """Process all tool calls for one request. Reloads WorkflowState from config.py each call."""
         self.state = WorkflowState.load()
@@ -127,6 +141,8 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
             result, routings = await self._dispatch(
                 fn_name, fn_args, call, mcp_client, messages, progress_cb
             )
+            if fn_name == "get_msight_logs" and progress_cb:
+                await self._emit_raw_logs(result, fn_args, progress_cb)
             tool_results.append({
                 "tool_call_id": call.id,
                 "name": fn_name,

@@ -343,10 +343,10 @@ async def start_msight_pipeline(
     compose_env = os.environ.copy()
     if video_input:
         compose_env["VIDEO_INPUT"] = video_input
-        compose_env.pop("RTSP_URL", None)
+        compose_env["RTSP_URL"] = ""
     elif rtsp_url:
         compose_env["RTSP_URL"] = rtsp_url
-        compose_env.pop("VIDEO_INPUT", None)
+        compose_env["VIDEO_INPUT"] = ""
     if sensor_name:
         compose_env["SENSOR_NAME"] = sensor_name
 

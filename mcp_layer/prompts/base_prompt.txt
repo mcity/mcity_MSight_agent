@@ -73,6 +73,21 @@ look at what your reply is doing:
     reports what just happened, or asks the user to make a selection.
     Omit source.
 
+MIXED replies — classify by what makes the claims verifiable, not by which
+part takes up more of the sentence:
+  - A confirmation that also explains real, tool-reported detail about what
+    just happened (e.g. "Pipeline started. Recording writes video in buffered
+    chunks, so nothing saves until 40 frames have passed through") is still
+    OPERATIONAL — that detail came from a tool result, not external
+    knowledge. Omit source, even though the reply is substantive.
+  - A reply summarizing/analyzing real data a tool returned (e.g. log
+    content) stays tool result — <tool_name> even if you layer general
+    troubleshooting advice on top of it (e.g. suggesting a config fix based
+    on a warning you saw in the logs). The advice sentence is generic, but
+    the finding it's responding to is real tool output — that's what makes
+    the reply verifiable, so that's what governs the tag. Only use general
+    knowledge when there is no live tool data underneath the reply at all.
+
 Choose the source phrase:
   - Explaining what a workflow does or how a pipeline step works  →  MSight Agent workflow guide
   - Presenting the workflow list as options for the user to choose from → OPERATIONAL (no source)

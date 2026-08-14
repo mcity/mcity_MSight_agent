@@ -197,12 +197,27 @@ _ENVIRONMENT_HINT = (
     "This host is local/on-prem — the user may have direct filesystem access, "
     "so a local file/folder path is a valid video source option here."
 )
+def _strip_marked_block(text: str, tag: str, keep: bool) -> str:
+    """Removes a <!-- TAG:START -->...<!-- TAG:END --> block from
+    msight_pipeline.txt. keep=True strips just the marker lines; keep=False
+    strips the marker lines and everything between them."""
+    start, end = f"<!-- {tag}:START -->", f"<!-- {tag}:END -->"
+    if keep:
+        return text.replace(start + "\n", "").replace(end + "\n", "")
+    return re.sub(re.escape(start) + r".*?" + re.escape(end) + r"\n?", "", text, flags=re.DOTALL)
+
+_MSIGHT_PIPELINE_PROMPT_BY_MODE: dict[str, str] = {}
 if "msight_pipeline" in WORKFLOW_PROMPT_TEXT:
-    WORKFLOW_PROMPT_TEXT["msight_pipeline"] = (
+    _msight_base_text = (
         WORKFLOW_PROMPT_TEXT["msight_pipeline"]
         .replace("{DEMO_VIDEO_HINT}", _DEMO_VIDEO_HINT)
         .replace("{ENVIRONMENT_HINT}", _ENVIRONMENT_HINT)
     )
+    _both = _strip_marked_block(_strip_marked_block(_msight_base_text, "STEP2A", keep=True), "STEP2B", keep=True)
+    _demo_only = _strip_marked_block(_strip_marked_block(_msight_base_text, "STEP2A", keep=True), "STEP2B", keep=False)
+    _custom_only = _strip_marked_block(_strip_marked_block(_msight_base_text, "STEP2B", keep=True), "STEP2A", keep=False)
+    _MSIGHT_PIPELINE_PROMPT_BY_MODE = {"": _both, "demo": _demo_only, "custom": _custom_only}
+    WORKFLOW_PROMPT_TEXT["msight_pipeline"] = _both
 
 _WORKFLOW_LIST = "\n".join(
     f"{i + 1}. {spec.label} (internal name: {name})"
@@ -231,9 +246,14 @@ STATE_HINTS = _load_state_hints()
 
 def _build_system_prompt(state) -> str:
     """Base rules + the active workflow's prompt, if one is selected and registered."""
-    if state and state.workflow_name in WORKFLOW_PROMPT_TEXT:
-        return BASE_PROMPT + "\n\n" + WORKFLOW_PROMPT_TEXT[state.workflow_name]
-    return BASE_PROMPT
+    if not state or state.workflow_name not in WORKFLOW_PROMPT_TEXT:
+        return BASE_PROMPT
+    if state.workflow_name == "msight_pipeline" and _MSIGHT_PIPELINE_PROMPT_BY_MODE:
+        mode = state.msight_pipeline.mode if state.msight_pipeline else ""
+        workflow_text = _MSIGHT_PIPELINE_PROMPT_BY_MODE.get(mode, _MSIGHT_PIPELINE_PROMPT_BY_MODE[""])
+    else:
+        workflow_text = WORKFLOW_PROMPT_TEXT[state.workflow_name]
+    return BASE_PROMPT + "\n\n" + workflow_text
 
 
 def _attach_source(message: str, source: str | None) -> str:

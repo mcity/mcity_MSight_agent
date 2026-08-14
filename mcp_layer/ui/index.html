@@ -470,6 +470,39 @@ function addMsg(role, text) {
     chatEl.scrollTop = chatEl.scrollHeight;
 }
 
+// Renders get_msight_logs' real output as a persistent, collapsible block,
+// separate from the LLM's summary reply.
+function addRawLogsBlock(service, text) {
+    const line = document.createElement("div");
+    line.className = "msg agent";
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.style.padding = "0";
+
+    const details = document.createElement("details");
+    details.style.padding = "10px 14px";
+    const summary = document.createElement("summary");
+    summary.style.cursor = "pointer";
+    summary.style.fontSize = "0.85em";
+    summary.style.opacity = "0.75";
+    summary.textContent = `📄 Raw logs — ${service} (click to expand)`;
+    const pre = document.createElement("pre");
+    pre.style.whiteSpace = "pre-wrap";
+    pre.style.wordBreak = "break-word";
+    pre.style.maxHeight = "320px";
+    pre.style.overflowY = "auto";
+    pre.style.fontSize = "0.8em";
+    pre.style.marginTop = "8px";
+    pre.textContent = text;
+
+    details.appendChild(summary);
+    details.appendChild(pre);
+    bubble.appendChild(details);
+    line.appendChild(bubble);
+    chatEl.appendChild(line);
+    chatEl.scrollTop = chatEl.scrollHeight;
+}
+
 function setChatStatus(ok) {
     chatDot.style.color = ok ? "#22c55e" : "#f97316";
     chatTxt.textContent = ok ? "chat: ready" : "chat: offline";
@@ -613,6 +646,7 @@ async function chatSend(content) {
                     updateStatusBubble(statusContainer, { status: data.message, keepLog });
                 }
                 if (type === "log")   updateStatusBubble(statusContainer, { log: data.line });
+                if (type === "raw_logs") addRawLogsBlock(data.service, data.text);
                 if (type === "reply") reply = data.message || "";
                 if (type === "error") reply = `❌ ${data.message}`;
             }
