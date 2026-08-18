@@ -478,14 +478,20 @@ function addRawLogsBlock(service, text) {
     const bubble = document.createElement("div");
     bubble.className = "bubble";
     bubble.style.padding = "0";
+    bubble.style.border = "1px solid rgba(127,127,127,0.35)";
+    bubble.style.borderRadius = "8px";
 
+    // Open by default -- a collapsed one-liner was easy to scroll past
+    // entirely, defeating the point of showing real data alongside the
+    // summary. Still collapsible if the user wants to shrink it back down.
     const details = document.createElement("details");
+    details.open = true;
     details.style.padding = "10px 14px";
     const summary = document.createElement("summary");
     summary.style.cursor = "pointer";
+    summary.style.fontWeight = "600";
     summary.style.fontSize = "0.85em";
-    summary.style.opacity = "0.75";
-    summary.textContent = `📄 Raw logs — ${service} (click to expand)`;
+    summary.textContent = `📄 Raw logs — ${service}`;
     const pre = document.createElement("pre");
     pre.style.whiteSpace = "pre-wrap";
     pre.style.wordBreak = "break-word";
@@ -493,6 +499,9 @@ function addRawLogsBlock(service, text) {
     pre.style.overflowY = "auto";
     pre.style.fontSize = "0.8em";
     pre.style.marginTop = "8px";
+    pre.style.padding = "8px";
+    pre.style.background = "rgba(127,127,127,0.08)";
+    pre.style.borderRadius = "6px";
     pre.textContent = text;
 
     details.appendChild(summary);

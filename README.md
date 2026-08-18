@@ -112,7 +112,7 @@ The `msight_pipeline` workflow lets the agent start, stop, and monitor MSight_Vi
 - **Explicit run confirmation:** for a custom source, the first `start_msight_pipeline` call never launches anything — it returns a consent summary (source, calibration status, recording/archiving selection) that the user must confirm before any container actually starts.
 - **Camera calibration:** upload your own `intrinsics.json` + calibration `.npz` (built with [camera_calibration2](https://github.com/michigan-traffic-lab/camera_calibration2)) via the web UI's upload button; the agent validates the file formats and reports live calibration status (`default` / `user_calibrated` / `missing` / `partial`) every turn.
 - **Record & Archive:** independent, opt-in local video recording and S3 archiving of the *annotated* feed (bounding boxes/labels/scores drawn in via a small frame-annotator node this agent launches, not MSight_Vision itself) — run as tracked host subprocesses alongside the Docker-based detection pipeline.
-- **GPU vs CPU auto-detected:** checks for a working `nvidia-smi` and transparently layers in MSight_Vision's `docker-compose.cpu.yml` override when no GPU is present — nothing to configure either way.
+- **GPU vs CPU auto-detected:** checks for a working `nvidia-smi` and transparently layers in this repo's own CPU compose override (`mcp_layer/mcptools/msight_cpu_override.yml`).
 - **Friendly error handling:** known Docker/host failure modes (a host process already bound to Redis's port, a malformed `.env` line) are translated into actionable messages instead of raw `docker compose` output.
 
 ## Online Demo: Data Selection with Embeddings

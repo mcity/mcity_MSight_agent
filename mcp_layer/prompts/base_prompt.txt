@@ -71,7 +71,9 @@ look at what your reply is doing:
   OPERATIONAL — your reply is driving the workflow:
     it confirms an action, presents a list of options for the user to choose from,
     reports what just happened, or asks the user to make a selection.
-    Omit source.
+    Omit source. This includes "X has been stopped/started — here are your next
+    options: 1. ... 2. ..." style replies -- a menu of what the user can do next
+    is not an explanation of anything, even when it's phrased as full sentences.
 
 MIXED replies — classify by what makes the claims verifiable, not by which
 part takes up more of the sentence:
