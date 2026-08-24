@@ -33,3 +33,5 @@ class Config:
     MAX_USERS_PER_DAY = 20
     MAX_USER_REQUESTS_PER_DAY = 1
     STACK_DELETE_DELAY = 3600  # seconds
+    # Shown as a link on the request form once recorded; blank shows "coming soon" instead.
+    CALIBRATION_TUTORIAL_URL = os.getenv('CALIBRATION_TUTORIAL_URL', '')

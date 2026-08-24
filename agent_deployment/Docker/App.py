@@ -15,7 +15,10 @@ class App:
     def setup_routes(self):
         @self.flask_app.route('/', methods=['GET'])
         def show_form():
-            return render_template('form.html')
+            return render_template(
+                'form.html',
+                calibration_tutorial_url=self.config.CALIBRATION_TUTORIAL_URL,
+            )
 
         @self.flask_app.route('/submit', methods=['POST'])
         def submit():

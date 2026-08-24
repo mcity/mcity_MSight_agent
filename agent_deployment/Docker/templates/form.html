@@ -132,6 +132,30 @@
             padding: 7px 10px;
             border-radius: 7px;
         }
+        .info-bulletin {
+            background: #eef4fc;
+            border: 1px solid #cddcf0;
+            border-radius: 9px;
+            padding: 13px 15px;
+            margin-bottom: 18px;
+            font-size: 0.92em;
+            color: #263248;
+            text-align: left;
+        }
+        .info-bulletin p {
+            margin: 0 0 8px 0;
+        }
+        .info-bulletin p:last-child {
+            margin-bottom: 0;
+        }
+        .info-bulletin ul {
+            margin: 4px 0 8px 0;
+            padding-left: 20px;
+        }
+        .info-bulletin a {
+            color: var(--um-blue);
+            font-weight: 600;
+        }
         /* Loading overlay */
         .loading-overlay {
             position: fixed;
@@ -182,6 +206,18 @@
             <div class="um-logo">Mcity@AgenticAI</div>
         </div>
         <h2>Mcity Data Engine Request Form</h2>
+
+        <div class="info-bulletin">
+            <p><strong>Submitting this form spins up a temporary AWS sandbox</strong> running the MSight AI Agent. It's automatically torn down <strong>1 hour</strong> after creation — download anything you want to keep (recordings, results) before then.</p>
+            <p>Before you begin, it may help to familiarize yourself with the resources this sandbox runs:</p>
+            <ul>
+                <li><a href="https://github.com/mcity/mcity_MSight_agent" target="_blank" rel="noopener">mcity_MSight_agent</a> — the agent that drives the pipeline</li>
+                <li><a href="https://github.com/michigan-traffic-lab/MSight_Vision" target="_blank" rel="noopener">MSight_Vision</a> — the underlying camera-perception pipeline</li>
+            </ul>
+            <p>Setting up your own camera calibration?
+                <a href="{{ calibration_tutorial_url }}" target="_blank" rel="noopener">Read the calibration walkthrough guide</a>.
+            </p>
+        </div>
 
         {% if message %}
         <div class="message {% if message_type == 'success' %}message-success{% else %}message-warning{% endif %}">
