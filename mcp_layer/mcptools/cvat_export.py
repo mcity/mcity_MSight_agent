@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 import fiftyone as fo
 import fiftyone.types as fot
 from cvat_sdk import make_client
-from cvat_sdk.api_client.model.data_request import DataRequest
+from cvat_sdk.core.proxies.tasks import ResourceType
 from mcptools import mcp
 
 load_dotenv()
@@ -62,6 +62,17 @@ def export_to_cvat(
 
     try:
         image_paths = [sample.filepath for sample in dataset]
+
+        # Checked before anything else: an empty export gives the user nothing to
+        # annotate, and an empty CVAT task cannot be imported back. Stopping here
+        # also skips the 20-second prediction-field poll below.
+        if not image_paths:
+            logging.warning(f"[CVAT] export_to_cvat: dataset '{dataset_name}' has no images")
+            return (
+                f"EXPORT_NO_IMAGES: Dataset '{dataset_name}' contains 0 images, "
+                f"so there is nothing to export to CVAT."
+            )
+
         schema = dataset.get_field_schema()
 
         label_field = None
@@ -105,15 +116,16 @@ def export_to_cvat(
             _UPLOAD_RETRIES = 3
             upload_ok = False
             for attempt in range(_UPLOAD_RETRIES):
-                file_objects = [open(p, "rb") for p in image_paths]
                 try:
-                    client.api_client.tasks_api.create_data(
-                        id=task_id,
-                        data_request=DataRequest(
-                            image_quality=70,
-                            client_files=file_objects,
-                        ),
-                        _content_type="multipart/form-data",
+                    # upload_data() blocks until CVAT has finished building the
+                    # task data. The low-level tasks_api.create_data() only
+                    # queues that background job and returns at once, so
+                    # import_annotations() below raced it and CVAT answered
+                    # 400 "This task data has not been initialized yet".
+                    task.upload_data(
+                        resources=image_paths,
+                        resource_type=ResourceType.LOCAL,
+                        params={"image_quality": 70},
                     )
                     upload_ok = True
                     break
@@ -135,9 +147,6 @@ def export_to_cvat(
                     except Exception:
                         pass
                     raise upload_err
-                finally:
-                    for f in file_objects:
-                        f.close()
 
             if not upload_ok:
                 # Should not reach here (raise above), but guard against logic errors.

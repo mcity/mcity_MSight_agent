@@ -1,11 +1,12 @@
 import json
 import logging
+import time
 
 from fastmcp import Client
 
 from pipeline_common import (
     Sentinels, HardStop, Injection, FallThrough, ToolRouting,
-    unwrap_tool_output, TOOL_STATUS_MESSAGES,
+    unwrap_tool_output, TOOL_STATUS_MESSAGES, user_texts,
 )
 from pipeline_handlers.auto_labeling import AutoLabelingHandlers
 from pipeline_handlers.msight_pipeline import MsightPipelineHandlers
@@ -49,6 +50,7 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
         # Set by _handle_send_intro; lets _handle_start_msight_pipeline's Demo path
         # inject a fallback intro if the LLM skipped calling send_intro itself.
         self._intro_sent_this_turn = False
+        self._user_texts: list[str] = []  # set by run(); used by provenance guards
 
     def _set_flag_if_ok(
         self,
@@ -91,6 +93,7 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
         """Process all tool calls for one request. Reloads WorkflowState from config.py each call."""
         self.state = WorkflowState.load()
         self._progress_cb = progress_cb
+        self._user_texts = user_texts(messages)
 
         # Sync caches from WORKFLOWS so displayed values reflect prior-request changes.
         try:
@@ -175,6 +178,17 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
                 self.state.dataset_name = dataset_name
                 self.state.dataset_confirmed = True
                 self.state.save()
+
+        if (
+            self.state.reset_awaiting_confirmation
+            and not any(r["name"] == "reset_workflow_state" for r in tool_results)
+        ):
+            logging.warning(
+                "[PIPELINE] reset confirmation dropped — the turn did something else"
+            )
+            self.state.reset_awaiting_confirmation = False
+            self.state.reset_confirmation_requested_at = 0.0
+            self.state.save()
 
         early_reply = self._orchestrate(all_routings, messages)
         return tool_results, early_reply
@@ -343,8 +357,19 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
                     f"from scratch, confirm with them first, then call switch_workflow "
                     f"again with confirm_restart=true."
                 )
-                msg = result.split("SWITCH_LOCKED: ", 1)[1] if "SWITCH_LOCKED: " in result else result
-                return result, [HardStop(msg)]
+                # The user must never read the second half of that text. A
+                # HardStop reply becomes an assistant turn in the chat history,
+                # where "then call switch_workflow again with confirm_restart=true"
+                # survives for four turns and reads as a standing order — the
+                # equivalent line already wiped one session while the user was
+                # choosing a dataset. The user-facing sentence therefore names no
+                # tool and asks no yes/no question.
+                return result, [HardStop(
+                    f"The workflow is locked while the {action} is in progress, so I "
+                    f"cannot change its settings until the labels are imported. If you "
+                    f"would rather discard all progress and start over from scratch, "
+                    f"tell me and I will confirm with you first."
+                )]
 
             logging.warning(
                 f"[PIPELINE] switch_workflow full-reset: '{workflow_name}'"
@@ -355,7 +380,12 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
             return result, [await self._post_workflow_select_routing(workflow_name)]
 
         if fn_name == "switch_workflow":
-            self.state = WorkflowState()
+            fresh = WorkflowState()
+            # A switch clears the parameters but not the conversation, so the
+            # history budget carries over. Only reset_workflow_state ends the
+            # session and sends it back to 0.
+            fresh.turns_since_reset = self.state.turns_since_reset
+            self.state = fresh
             self.state.save()
             result = unwrap_tool_output(await mcp_client.call_tool(fn_name, fn_args))
             return result, [await self._post_workflow_select_routing(workflow_name)]
@@ -396,11 +426,52 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
         return await self._handle_confirm_auto_labeling_run()
 
     async def _handle_reset_workflow_state(self, mcp_client) -> tuple[str, list[ToolRouting]]:
+        """Two-step: the first call asks, the second one wipes.
+
+        """
+        if self.state.has_session_data() and not self.state.reset_awaiting_confirmation:
+            self.state.reset_awaiting_confirmation = True
+            self.state.reset_confirmation_requested_at = time.time()
+            self.state.save()
+            logging.warning(
+                "[PIPELINE] reset_workflow_state: consent pending — nothing cleared"
+            )
+            return (
+                f"{Sentinels.RESET_NEEDS_CONFIRMATION}: Nothing has been cleared. "
+                f"The user must agree before the session is reset. If their next "
+                f"message agrees, call reset_workflow_state again to carry it out. "
+                f"If it does not, treat the reset as dropped and answer what they "
+                f"actually asked.",
+                [HardStop(self._format_reset_confirmation_prompt())],
+            )
+
         result = unwrap_tool_output(await mcp_client.call_tool("reset_workflow_state", {}))
         self.state = WorkflowState()
         self.state.save()
         logging.warning("[PIPELINE] reset_workflow_state: local state cleared and saved")
         return result, [HardStop(result)]
+
+    def _format_reset_confirmation_prompt(self) -> str:
+        """Name what a reset would discard, then ask."""
+        spec = WORKFLOW_SPECS.get(self.state.workflow_name)
+        lines = [f"- **Workflow:** {spec.label}"] if spec else []
+        if self.state.dataset_confirmed and self.state.dataset_name:
+            lines.append(f"- **Dataset:** {self.state.dataset_name}")
+        al = self.state.auto_labeling
+        if al and al.model_name:
+            lines.append(f"- **Model:** {al.model_name}")
+        if al and al.labeling_backend:
+            backend_label = (
+                "Label Studio" if al.labeling_backend == "label_studio" else "CVAT"
+            )
+            lines.append(f"- **Annotation backend:** {backend_label}")
+        summary = ("\n" + "\n".join(lines) + "\n") if lines else " "
+        return (
+            f"Starting over clears the whole session, including:\n{summary}\n"
+            f"Nothing has been cleared yet, and your progress is still in place.\n\n"
+            f"Shall I clear it and go back to the start? If you only want to "
+            f"change one setting, tell me which one instead."
+        )
 
     def _orchestrate(self, all_routings: list[list], messages: list) -> str | None:
         """Two-pass: inject all context first, then return last HardStop."""

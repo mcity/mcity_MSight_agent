@@ -107,6 +107,7 @@ fastapi==0.115.12
 fastjsonschema==2.20.0
 fastmcp==2.3.3
 ffmpy==0.5.0
+fiftyone==1.14.2
 fiftyone-brain==0.20.1
 fiftyone-desktop==0.34.1
 fiftyone_db==1.1.6
@@ -484,6 +485,7 @@ uvicorn==0.34.2
 velodyne-decoder==3.1.0
 voxel51-eta==0.14.0
 wandb==0.26.1
+watchfiles==1.2.0
 wcwidth==0.2.13
 webcolors==24.11.1
 webencodings==0.5.1

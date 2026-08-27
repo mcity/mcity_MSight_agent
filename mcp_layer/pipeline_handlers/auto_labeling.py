@@ -13,13 +13,81 @@ from pathlib import Path
 
 from pipeline_common import (
     MAIN_PATH, Sentinels, HardStop, Injection, FallThrough, ToolRouting,
-    unwrap_tool_output, _ANSI_RE,
+    unwrap_tool_output, _ANSI_RE, run_failed, export_empty, parse_run_failure,
+    free_value_named_by_user, value_named_by_user,
 )
 from validate_workflow_state import AutoLabelingState, LabelingBackend, AutoLabelingPhase, LabelingPath
+
+# Spellings that count as the user naming a choice in their own message. See the
+# "Provenance guards" note in pipeline_common.py for why these exist. Ordinals
+# are included because STEP 3b presents the paths as a numbered list.
+_BACKEND_USER_TOKENS: dict[str, tuple[str, ...]] = {
+    LabelingBackend.CVAT:         ("cvat",),
+    LabelingBackend.LABEL_STUDIO: ("label studio", "label_studio", "labelstudio", "label-studio"),
+}
+
+_PATH_USER_TOKENS: dict[str, tuple[str, ...]] = {
+    LabelingPath.MANUAL: ("manual", "manually", "myself", "my own", "by hand", "1", "first"),
+    LabelingPath.AUTO:   ("auto", "automatic", "automatically", "auto-generated",
+                          "generated", "predictions", "2", "second"),
+}
 
 
 class AutoLabelingHandlers:
     """Mixin: all auto_labeling-workflow tool handlers. See chat_pipeline.ChatPipeline."""
+
+    # What the user can change after a failed run, per workflow. Plain wording:
+    # this text goes into the reply, so it must not name tools.
+    _RETRY_HINTS: dict[str, str] = {
+        "auto_labeling":
+            "the model, or the hyperparameters (mode, epochs, learning rate, "
+            "weight decay, early stop patience)",
+    }
+
+    def _handle_run_failure(self, workflow: str, result: str) -> str:
+        """Record a failed run and build the reply.
+
+        The workflow's own flags are left as they are on purpose: no completion
+        flag is set and no phase advances, so the workflow stays in its mutable
+        zone. The configuration tools therefore stay in the tool list and the
+        user can change a parameter and run again. Any state the caller changed
+        before this call is persisted by record_run().
+        """
+        error, log_path = parse_run_failure(result)
+        self.state.record_run(workflow, failed=True, error=error, log_path=log_path)
+        attempts = self.state.last_run.attempts if self.state.last_run else 1
+        logging.warning(
+            f"[PIPELINE] {workflow} run failed (attempt {attempts}): {error}"
+        )
+        hint     = self._RETRY_HINTS.get(workflow, "the workflow parameters")
+        log_line = f"\n\nFull logs: `{log_path}`" if log_path else ""
+        return (
+            f"The {workflow.replace('_', ' ')} run did not finish.\n\n"
+            f"**Error:** {error}{log_line}\n\n"
+            f"Nothing was reset — your settings are still in place and you can "
+            f"change {hint}.\n\n"
+            f"Tell me what you would like to change, or say \"run it again\" to "
+            f"retry with the same settings."
+        )
+
+    def _handle_empty_export(self, workflow: str, backend_label: str, body: str) -> str:
+        """Record a run whose export delivered no images, and build the reply.
+
+        The run itself may have exited 0, but nothing reached the annotation
+        tool, so there is nothing to import. It is recorded as a failed run:
+        the workflow stays unlocked and the user can change a parameter and
+        run again. record_run() persists the flags the caller reset.
+        """
+        error = f"the export to {backend_label} contained 0 images"
+        self.state.record_run(workflow, failed=True, error=error)
+        logging.warning(f"[PIPELINE] {workflow}: empty export to {backend_label} — run marked failed")
+        hint = self._RETRY_HINTS.get(workflow, "the workflow parameters")
+        return (
+            f"{body}\n\n"
+            f"**The run did not produce anything to annotate — {error}.**\n\n"
+            f"Nothing was reset. Please check that the dataset has images, or "
+            f"change {hint} and run it again."
+        )
 
     def _snapshot_initial_backend(self) -> str:
         """Return the current labeling backend before any state modifications."""
@@ -485,7 +553,24 @@ class AutoLabelingHandlers:
     async def _handle_confirm_export(self) -> tuple[str, list[ToolRouting]]:
         if self.state.auto_labeling is None:
             self.state.auto_labeling = AutoLabelingState()
+
+        # Consent gate: only record consent for a summary the user actually saw.
+        # Tool filtering already hides confirm_export outside this window, but the
+        # handler must not trust that — a stale or replayed call would otherwise
+        # unlock the export with no user approval.
+        if not self.state.auto_labeling.export_awaiting_confirmation:
+            logging.warning(
+                "[PIPELINE] confirm_export BLOCKED — no export summary is pending"
+            )
+            return Sentinels.CONFIRM_NOT_PENDING, [Injection(
+                "confirm_export was blocked: no export confirmation summary is pending, "
+                "so there is nothing for the user to have approved. Do NOT call "
+                "confirm_export again. Call the export tool to produce a fresh summary, "
+                "and wait for the user to approve it."
+            )]
+
         self.state.auto_labeling.export_confirmed = True
+        self.state.auto_labeling.export_awaiting_confirmation = False
         self.state.save()
         backend      = self.state.auto_labeling.labeling_backend or LabelingBackend.CVAT
         classes      = self.state.auto_labeling.manual_classes or []
@@ -535,8 +620,12 @@ class AutoLabelingHandlers:
         if not effective_classes:
             return "CLASSES_REQUIRED: No annotation classes provided."
 
-        if classes and self.state.auto_labeling:
-            self.state.auto_labeling.manual_classes = classes
+        if self.state.auto_labeling:
+            if classes:
+                self.state.auto_labeling.manual_classes = classes
+            # Records that the summary below was actually shown, so confirm_export
+            # cannot record consent for a summary the user never saw.
+            self.state.auto_labeling.export_awaiting_confirmation = True
             self.state.save()
         dataset   = self.state.dataset_name or "?"
         classes_s = ", ".join(effective_classes)
@@ -621,6 +710,17 @@ class AutoLabelingHandlers:
             self.state.save()
 
         result = unwrap_tool_output(await mcp_client.call_tool(tool_name, fn_args))
+
+        # An export with 0 images is a failure on both backends: no task ids are
+        # recorded and the phase does not advance, so the workflow stays in Zone A.
+        if export_empty(result):
+            detail = result.split(":", 1)[1].strip() if ":" in result else result
+            logging.warning(f"[PIPELINE] {tool_name}: empty export — {detail}")
+            return result, [HardStop(
+                f"{detail}\n\n"
+                f"Nothing was exported to {backend_label}, so there is nothing to annotate. "
+                f"Please check that the dataset has images, or select a different dataset."
+            )]
 
         # CVAT-specific error sentinels checked first for CVAT exports.
         if not is_ls and any(s in result for s in [
@@ -769,7 +869,7 @@ class AutoLabelingHandlers:
             )
         else:
             result = (
-                f"Auto-labeling failed with exit code {process.returncode}.\n"
+                f"{Sentinels.RUN_FAILED}: Auto-labeling failed with exit code {process.returncode}.\n"
                 f"Error details:\n```\n{error_output[-3000:]}\n```\n"
                 f"Full logs saved to `{log_path}`"
             )
@@ -812,10 +912,30 @@ class AutoLabelingHandlers:
         self, fn_args: dict, mcp_client
     ) -> tuple[str, list[ToolRouting]]:
         """Validate credentials for the chosen backend, update state, and persist."""
-        requested = fn_args.get("backend", LabelingBackend.CVAT)
+        requested = fn_args.get("backend", "")
         current   = (
             self.state.auto_labeling.labeling_backend if self.state.auto_labeling else ""
         ) or ""
+
+        # Provenance guard: on the FIRST selection (state is still empty or the
+        # BOTH sentinel), only accept a backend the user named in their own
+        # message. tool_choice="required" forces a tool call on every turn, so
+        # an ambiguous reply ("try again", "ok") used to make the model invent a
+        # value here. Later changes in Zone A are exempt — the intent is clear
+        # once a backend is already confirmed.
+        if requested not in _BACKEND_USER_TOKENS or current in ("", LabelingBackend.BOTH):
+            if not value_named_by_user(requested, _BACKEND_USER_TOKENS, self._user_texts):
+                last = self._user_texts[-1] if self._user_texts else ""
+                logging.warning(
+                    f"[PIPELINE] set_labeling_backend({requested!r}) BLOCKED — "
+                    f"never named by the user; last message {last[:80]!r}"
+                )
+                return Sentinels.BACKEND_NOT_NAMED, [HardStop(
+                    "Which annotation tool would you like to use?\n\n"
+                    "1. CVAT\n"
+                    "2. Label Studio\n\n"
+                    "Please name one and I will set it up."
+                )]
 
         if current == requested:
             logging.warning(
@@ -861,6 +981,25 @@ class AutoLabelingHandlers:
         if path not in (LabelingPath.MANUAL, LabelingPath.AUTO):
             msg = f"INVALID_PATH: '{path}' is not a valid labeling path. Must be 'manual' or 'auto'."
             return msg, [FallThrough()]
+
+        # Provenance guard: same failure shape as set_labeling_backend, one step
+        # later. An ambiguous reply at STEP 3b must not pick a path for the user.
+        if not value_named_by_user(path, _PATH_USER_TOKENS, self._user_texts):
+            last = self._user_texts[-1] if self._user_texts else ""
+            logging.warning(
+                f"[PIPELINE] set_labeling_path({path!r}) BLOCKED — "
+                f"never named by the user; last message {last[:80]!r}"
+            )
+            return Sentinels.PATH_NOT_NAMED, [HardStop(
+                "How would you like to label this dataset?\n\n"
+                "1. **Manual Labeling** — I export your dataset to the annotation "
+                "tool, you annotate the images, then I import your labels back.\n"
+                "2. **Auto Generated Labeling** — I run a detection model of your "
+                "choice to generate predictions, then export them so you can review "
+                "and correct them.\n\n"
+                "Please name one and I will set it up."
+            )]
+
         if self.state.auto_labeling is None:
             self.state.auto_labeling = AutoLabelingState()
         al = self.state.auto_labeling
@@ -1003,10 +1142,13 @@ class AutoLabelingHandlers:
 
     async def _do_post_run_export(
         self, backend: str, dataset_name: str, mcp_client
-    ) -> str:
+    ) -> tuple[str, bool]:
         """Call the appropriate export tool after auto-labeling and update task-ID state.
 
-        Returns the text to append to the run reply.  Callers catch any exception.
+        Returns (text to append to the run reply, export delivered images).
+        A False flag makes the caller treat the whole run as failed, because a
+        run whose predictions never reached the annotation tool leaves the user
+        with nothing to import. Callers catch any exception.
         """
         is_ls = backend == LabelingBackend.LABEL_STUDIO
         tool_name     = "export_to_label_studio" if is_ls else "export_to_cvat"
@@ -1017,6 +1159,8 @@ class AutoLabelingHandlers:
         )
         export_msg = unwrap_tool_output(export_result)
         success = ("Project ID" in export_msg) if is_ls else ("Task ID:" in export_msg)
+        if export_empty(export_msg):
+            success = False
 
         al = self.state.auto_labeling
         if al and success:
@@ -1041,44 +1185,69 @@ class AutoLabelingHandlers:
         if not success:
             return (
                 f"\n\n{export_msg}"
-                f"\n\nExport to {backend_label} did not complete — the predictions were not uploaded. "
-                f"Let me know how you'd like to proceed."
+                f"\n\nExport to {backend_label} did not complete — the predictions were not uploaded.",
+                False,
             )
 
         return (
             f"\n\n{export_msg}"
             f"\n\nPlease review and correct the predictions in {backend_label}. "
-            f"Let me know when you're done and I'll import the labels back."
+            f"Let me know when you're done and I'll import the labels back.",
+            True,
         )
 
     async def _finalize_auto_labeling(self, tool_output: str, mcp_client) -> str:
         al = self.state.auto_labeling
+
+        if run_failed(tool_output):
+            # auto_labeling_complete and phase stay untouched: the workflow
+            # remains in Zone A, so every configuration tool stays available and
+            # the run can be repeated. The post-run export is skipped as well —
+            # a failed run produced no predictions to upload.
+            if al:
+                # Force a new pre-run summary, so the user sees the values that
+                # they changed before the retry starts.
+                al.run_confirmed = False
+                al.run_awaiting_confirmation = False
+            return self._handle_run_failure("auto_labeling", tool_output)
+
         if not (self.state.dataset_confirmed and al and al.model_configured and al.hyperparams_confirmed):
+            self.state.record_run("auto_labeling", failed=False)
             return tool_output
 
-        if self.state.auto_labeling:
-            self.state.auto_labeling.auto_labeling_complete = True
-            self.state.auto_labeling.phase = AutoLabelingPhase.TRAINING
-            self.state.save()
-
+        # auto_labeling_complete gates the with_predictions export below.
+        al.auto_labeling_complete = True
         reply = await self._format_auto_labeling_reply(tool_output)
         dataset_name = self.state.dataset_name
 
+        backend = (al.labeling_backend or LabelingBackend.CVAT)
+        backend_label = "Label Studio" if backend == LabelingBackend.LABEL_STUDIO else "CVAT"
+
         if dataset_name:
-            backend = (self.state.auto_labeling.labeling_backend if self.state.auto_labeling else LabelingBackend.CVAT) or LabelingBackend.CVAT
-
             if self._progress_cb:
-                backend_label = "Label Studio" if backend == LabelingBackend.LABEL_STUDIO else "CVAT"
                 await self._progress_cb("status", {"message": f"Exporting predictions to {backend_label}..."})
-
             try:
-                reply += await self._do_post_run_export(backend, dataset_name, mcp_client)
+                export_note, exported = await self._do_post_run_export(
+                    backend, dataset_name, mcp_client
+                )
             except Exception as e:
-                reply += f"\n\nNote: {backend} export failed: {str(e)}"
+                export_note, exported = f"\n\nNote: {backend} export failed: {str(e)}", False
         else:
-            reply += "\n\nNote: Could not determine dataset name for export."
+            export_note, exported = "\n\nNote: Could not determine dataset name for export.", False
 
-        return reply
+        # The phase advances only when the predictions reached the annotation
+        # tool. An export of 0 images leaves nothing to import, so the run counts
+        # as failed and the workflow stays reconfigurable instead of locking.
+        if not exported:
+            al.auto_labeling_complete = False
+            al.phase = AutoLabelingPhase.PENDING
+            al.run_confirmed = False
+            al.run_awaiting_confirmation = False
+            return self._handle_empty_export("auto_labeling", backend_label, reply + export_note)
+
+        al.phase = AutoLabelingPhase.TRAINING
+        self.state.record_run("auto_labeling", failed=False)
+        return reply + export_note
 
     def _finalize_import(self, fn_args: dict, tool_output: str) -> str:
         base_dataset = fn_args.get("dataset_name", "").removesuffix("_labeled")
@@ -1109,6 +1278,22 @@ class AutoLabelingHandlers:
         (dispatched from ChatPipeline._handle_confirm_run)."""
         if self.state.auto_labeling is None:
             self.state.auto_labeling = AutoLabelingState()
+
+        # Consent gate: this is the last checkpoint before a run that locks the
+        # workflow (phase=training). Only record consent for a summary the user
+        # actually saw. Recovery from a wrong run needs reset_workflow_state,
+        # which discards everything, so the handler must not trust the filter.
+        if not self.state.auto_labeling.run_awaiting_confirmation:
+            logging.warning(
+                "[PIPELINE] confirm_run BLOCKED — no pre-run summary is pending"
+            )
+            return Sentinels.CONFIRM_NOT_PENDING, [Injection(
+                "confirm_run was blocked: no pre-run confirmation summary is pending, "
+                "so there is nothing for the user to have approved. Do NOT call "
+                "confirm_run again. Call run_auto_labeling() to produce a fresh "
+                "summary, and wait for the user to approve it."
+            )]
+
         self.state.auto_labeling.run_confirmed = True
         self.state.auto_labeling.run_awaiting_confirmation = False
         self.state.save()
@@ -1128,12 +1313,9 @@ class AutoLabelingHandlers:
         user's recent messages -- guards against the LLM inferring/inventing a
         model choice instead of the user explicitly naming one."""
         model_name_raw = fn_args.get("selected_model", "")
-        recent_user_text = " ".join(
-            m["content"].lower()
-            for m in messages[-6:]
-            if m.get("role") == "user" and isinstance(m.get("content"), str)
-        )
-        if model_name_raw and model_name_raw.lower() not in recent_user_text:
+        if model_name_raw and not free_value_named_by_user(
+            model_name_raw, self._user_texts
+        ):
             logging.warning(
                 f"[PIPELINE] configure_auto_labeling blocked: "
                 f"'{model_name_raw}' not found in recent user messages"

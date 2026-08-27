@@ -263,9 +263,6 @@ min-width:auto;
 <section class="pane pane-chat">
 <main id="chat" class="chat"></main>
 <form id="form" class="composer">
-  <div id="chat-helper" style="grid-column:1/4; color: var(--muted); font-size: 13px; margin-bottom: 4px;">
-    Type <strong>hi</strong> and click <strong>Send</strong> button.
-  </div>
   <div id="recordingStatus" class="recording-status hidden" style="grid-column:1/4; margin-bottom: 4px;"></div>
   <textarea id="input" rows="1" placeholder="Type a message…" autocomplete="off"></textarea>
   <button id="uploadBtn" type="button" title="Upload a file for MSight Pipeline">📤</button>
@@ -391,7 +388,24 @@ async function initProviderDropdown() {
         localStorage.setItem(PROVIDER_KEY, selectedProvider);
     });
 }
+// Show the agent's starting information on page load, so the user does not
+// have to type "hi" first. This hits the read-only /chat/greeting endpoint
+// instead of /chat/stream: a refresh must not touch session state or fire a
+// tool call. It is also not pushed into `history` -- it is not a real turn.
+async function loadGreeting() {
+    try {
+        const res = await fetch(`${CHAT_BASE}/chat/greeting`);
+        if (!res.ok) return;
+        const { message } = await res.json();
+        if (message) addMsg("agent", message);
+    } catch {
+        // Chat server not up yet — stay silent rather than opening the page
+        // with an error bubble the user did nothing to cause.
+    }
+}
+
 initProviderDropdown();
+loadGreeting();
 
 // Extract [source: ...] tag from the end of a message, return {body, source}.
 function extractSource(text) {
@@ -686,6 +700,14 @@ formEl.addEventListener("submit", (e) => {
     chatSend(val);
 });
 
+// Enter sends the message, Shift+Enter makes a new line
+inputEl.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" || e.shiftKey) return;
+    if (e.isComposing || e.keyCode === 229) return;  // ignore IME input
+    e.preventDefault();
+    formEl.requestSubmit();
+});
+
 // Ingestion functionality
 document.getElementById('ingestForm').addEventListener('submit', async function(e) {
     e.preventDefault();
@@ -723,6 +745,10 @@ document.getElementById('ingestForm').addEventListener('submit', async function(
 
         // Listen to SSE events
         const evtSource = new EventSource(`${INGEST_BASE}/ingest/stream/${jobId}`);
+
+        // The stream always ends with a "done" event, including after a
+        // failure, so success must be proven rather than assumed.
+        let hadError = false;
 
         evtSource.onopen = () => {
             logsEl.textContent += `[INFO] Event stream connected\n`;
@@ -768,7 +794,10 @@ document.getElementById('ingestForm').addEventListener('submit', async function(
             }
         });
 
-        evtSource.addEventListener("error", (event) => {
+        // Named "ingest_error", not "error": EventSource reports its own
+        // transport failures as "error", which onerror above already covers.
+        evtSource.addEventListener("ingest_error", (event) => {
+            hadError = true;
             try {
                 const data = JSON.parse(event.data);
                 logsEl.textContent += `[ERROR] ${data.data.msg}\n`;
@@ -779,9 +808,22 @@ document.getElementById('ingestForm').addEventListener('submit', async function(
             }
         });
 
-        evtSource.addEventListener("done", () => {
-            statusEl.textContent = "✅ Ingestion complete";
-            logsEl.textContent += `[INFO] Ingestion completed successfully\n`;
+        evtSource.addEventListener("done", (event) => {
+            let ok = !hadError;
+            try {
+                const parsed = JSON.parse(event.data);
+                if (parsed && parsed.data && parsed.data.ok === false) ok = false;
+            } catch (e) {
+                /* Unparseable terminal event — fall back to the error flag. */
+            }
+
+            if (ok) {
+                statusEl.textContent = "✅ Ingestion complete";
+                logsEl.textContent += `[INFO] Ingestion completed successfully\n`;
+            } else {
+                statusEl.textContent = "❌ Ingestion failed";
+                logsEl.textContent += `[INFO] Ingestion failed — see the errors above\n`;
+            }
             logsEl.scrollTop = logsEl.scrollHeight;
             evtSource.close();
         });

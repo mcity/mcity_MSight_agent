@@ -331,14 +331,17 @@ tools = [
                 "name": "reset_workflow_state",
                 "description": (
                     "Fully resets workflow, dataset, and all in-progress state so the user can "
-                    "leave the current workflow entirely — the next greeting will show the full "
-                    "workflow list again. Use this when the user is done with the workflow itself "
+                    "leave the current workflow entirely — the next message starts a fresh session "
+                    "at the MSight Pipeline front door. Use this when the user is done with the workflow itself "
                     "(e.g. says 'that's all', 'thanks, I'm finished', or explicitly asks to exit or "
                     "start over from the top). "
                     "This is a bigger action than switch_workflow(confirm_restart=true): to restart "
                     "the CURRENT auto_labeling run while staying in auto_labeling (e.g. after it "
                     "locks mid-export/mid-training), use switch_workflow(workflow_name='auto_labeling', "
-                    "confirm_restart=true) instead — that's the targeted action for that case, not this one."
+                    "confirm_restart=true) instead — that's the targeted action for that case, not this one. "
+                    "Two-step when a session is active: the first call clears NOTHING and asks the user "
+                    "to agree. Call it a second time only if their next message agrees; if it does not, "
+                    "the reset is dropped and you answer what they actually asked."
                 ),
                 "parameters": {
                 "type": "object",

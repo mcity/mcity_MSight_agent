@@ -23,6 +23,7 @@ class WorkflowSpec:
     and WorkflowState all read from WORKFLOW_SPECS instead of hardcoding names."""
     label: str                            # display label in the greeting list
     prompt_file: str                      # prompts/workflows/<file> — per-workflow LLM guidance
+    entry_point: bool = True              # False = reachable, but never advertised in the greeting
     requires_dataset: bool = True         # False = skip the FiftyOne dataset step entirely
     substate_cls_name: Optional[str] = None    # name of the Pydantic substate model, if any
     tool_router_method: Optional[str] = None   # WorkflowState method name: (self, ALWAYS) -> set[str]
@@ -38,6 +39,7 @@ WORKFLOW_SPECS: dict[str, WorkflowSpec] = {
     "auto_labeling": WorkflowSpec(
         label="Auto Labeling",
         prompt_file="auto_labeling.txt",
+        entry_point=False,
         requires_dataset=True,
         substate_cls_name="AutoLabelingState",
         tool_router_method="_auto_labeling_tools",
@@ -157,6 +159,9 @@ class AutoLabelingState(BaseModel):
     ls_task_ids: list[int] = []
     labels_imported: bool = False
     export_confirmed: bool = False
+    # True while the export confirmation summary is shown; gates confirm_export.
+    # Mirrors run_awaiting_confirmation one step earlier in the workflow.
+    export_awaiting_confirmation: bool = False
     run_confirmed: bool = False
     # True while the pre-run confirmation summary is shown; gates confirm_run tool.
     run_awaiting_confirmation: bool = False
@@ -292,6 +297,21 @@ class MsightPipelineState(BaseModel):
     run_confirmation_requested_at: float = 0.0
 
 
+class LastRun(BaseModel):
+    """Outcome of the most recent run_* tool call, for any workflow.
+
+    Written by ChatPipeline after every run attempt. A failed run deliberately
+    leaves the workflow's own flags untouched, so the workflow stays in its
+    mutable zone: parameters remain editable and the run can be retried.
+    """
+    model_config = ConfigDict(extra="forbid")
+    workflow: str = ""
+    status: Literal["", "success", "failed"] = ""
+    error: str = ""
+    log_path: str = ""
+    attempts: int = 0
+
+
 class WorkflowState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -303,8 +323,16 @@ class WorkflowState(BaseModel):
     auto_labeling: Optional[AutoLabelingState] = None
     msight_pipeline: Optional[MsightPipelineState] = None
 
+    # Outcome of the last run_* call; drives the failed-run hint in chat_server.
+    last_run: Optional[LastRun] = None
+
     # Triggers a WORKFLOW_RESET context injection in chat_server on next request.
     workflow_just_reset: bool = False
+
+    turns_since_reset: int = 0
+
+    reset_awaiting_confirmation: bool = False
+    reset_confirmation_requested_at: float = 0.0
 
     @model_validator(mode="after")
     def dataset_confirmed_requires_name(self) -> "WorkflowState":
@@ -313,6 +341,16 @@ class WorkflowState(BaseModel):
                 "dataset_confirmed cannot be True when dataset_name is empty."
             )
         return self
+
+    def has_session_data(self) -> bool:
+        """True when a reset would discard something the user set up.
+        """
+        return bool(
+            self.workflow_name
+            or self.dataset_confirmed
+            or self.auto_labeling is not None
+            or self.msight_pipeline is not None
+        )
 
     def can_confirm_dataset(self) -> tuple[bool, str]:
         if not self.workflow_name:
@@ -326,6 +364,33 @@ class WorkflowState(BaseModel):
         if self.auto_labeling is not None:
             self.auto_labeling.reset_from_step(step)
         self.save()
+
+    def record_run(
+        self, workflow: str, failed: bool, error: str = "", log_path: str = ""
+    ) -> None:
+        """Store the outcome of a run_* tool call and persist the whole state.
+
+        `attempts` counts consecutive runs of the same workflow, so the LLM can
+        tell a first failure from a repeated one. Any state the caller mutated
+        before this call is saved in the same write.
+        """
+        prev = self.last_run
+        previous_attempts = prev.attempts if (prev and prev.workflow == workflow) else 0
+        self.last_run = LastRun(
+            workflow=workflow,
+            status="failed" if failed else "success",
+            error=error[:500],
+            log_path=log_path,
+            attempts=previous_attempts + 1,
+        )
+        self.save()
+
+    def failed_run(self) -> Optional[LastRun]:
+        """The last run record when it is a failure of the ACTIVE workflow, else None."""
+        lr = self.last_run
+        if lr and lr.status == "failed" and lr.workflow == self.workflow_name:
+            return lr
+        return None
 
     def valid_tool_names(self) -> set[str] | None:
         """Return valid tools for the current step, or None to expose all tools."""
@@ -427,6 +492,9 @@ class WorkflowState(BaseModel):
                     if state.auto_labeling.export_confirmed:
                         state.auto_labeling.export_confirmed = False
                         logging.warning("[STATE] TTL: cleared stale export_confirmed")
+                    if state.auto_labeling.export_awaiting_confirmation:
+                        state.auto_labeling.export_awaiting_confirmation = False
+                        logging.warning("[STATE] TTL: cleared stale export_awaiting_confirmation")
                 # msight_pipeline uses its own dedicated, much shorter TTL below
                 # (run_confirmation_requested_at is always set alongside
                 # run_awaiting_confirmation, so that one always fires first) --
@@ -453,6 +521,16 @@ class WorkflowState(BaseModel):
                     mp.archiving_pending_bucket = ""
                     mp.archiving_pending_prefix = ""
                     logging.warning("[STATE] TTL: cleared stale archiving_pending")
+
+                if state.reset_awaiting_confirmation and state.reset_confirmation_requested_at:
+                    pending_age = _time.time() - state.reset_confirmation_requested_at
+                    if pending_age > 300:
+                        state.reset_awaiting_confirmation = False
+                        state.reset_confirmation_requested_at = 0.0
+                        logging.warning(
+                            f"[STATE] TTL: cleared stale reset confirmation after "
+                            f"{pending_age:.0f}s unanswered"
+                        )
             except Exception:
                 pass
 
@@ -492,6 +570,7 @@ class WorkflowState(BaseModel):
             al.setdefault("manual_classes", [])
             al.setdefault("models_listed", False)
             al.setdefault("export_confirmed", False)
+            al.setdefault("export_awaiting_confirmation", False)
             al.setdefault("run_confirmed", False)
             al.setdefault("run_awaiting_confirmation", False)
             al.setdefault("model_source", "")
@@ -499,8 +578,19 @@ class WorkflowState(BaseModel):
             al.setdefault("phase", "")
             al.pop("pending_dataset_change", None)
 
+        lr = raw.get("last_run")
+        if isinstance(lr, dict):
+            # extra="forbid" rejects the whole state on one unknown key, which
+            # would drop the live session back to defaults.
+            for key in list(lr.keys()):
+                if key not in {"workflow", "status", "error", "log_path", "attempts"}:
+                    lr.pop(key)
+
         known = {
             "workflow_name", "dataset_name", "dataset_confirmed", "labeled_dataset_name",
+            "last_run",
+            "turns_since_reset",
+            "reset_awaiting_confirmation", "reset_confirmation_requested_at",
         } | set(WORKFLOW_SPECS)
         for key in list(raw.keys()):
             if key not in known:
@@ -528,12 +618,19 @@ class WorkflowState(BaseModel):
 
     @classmethod
     def reset(cls) -> "WorkflowState":
+        """End the session. Every field returns to its default, turns_since_reset
+        included, which is what stops chat_server from sending the turns of the
+        discarded session to the model."""
         fresh = cls()
         fresh.save()
         return fresh
 
     def reset_for_workflow(self, workflow_name: str) -> "WorkflowState":
         fresh = WorkflowState(workflow_name=workflow_name)
+        # A switch clears the parameters but keeps the conversation: only
+        # reset_workflow_state ends the session, so the history budget carries
+        # over. Setting it to 0 here would silently change switch_workflow too.
+        fresh.turns_since_reset = self.turns_since_reset
         spec = WORKFLOW_SPECS.get(workflow_name)
         substate_cls = _resolve_substate_cls(spec.substate_cls_name) if spec else None
         if substate_cls:

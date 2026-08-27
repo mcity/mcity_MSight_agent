@@ -40,6 +40,21 @@ class MsightPipelineHandlers:
         if self.state.msight_pipeline is None:
             self.state.msight_pipeline = MsightPipelineState()
         mp = self.state.msight_pipeline
+
+        # Consent gate: same reasoning as the auto_labeling side. Starting the
+        # pipeline launches docker containers that keep running until someone
+        # stops them, so consent must belong to a summary the user actually saw.
+        if not mp.run_awaiting_confirmation:
+            logging.warning(
+                "[PIPELINE] confirm_run (msight_pipeline) BLOCKED — no summary is pending"
+            )
+            return Sentinels.CONFIRM_NOT_PENDING, [Injection(
+                "confirm_run was blocked: no pre-run confirmation summary is pending, "
+                "so there is nothing for the user to have approved. Do NOT call "
+                "confirm_run again. Call start_msight_pipeline() to produce a fresh "
+                "summary, and wait for the user to approve it."
+            )]
+
         mp.run_confirmed = True
         mp.run_awaiting_confirmation = False
         mp.run_confirmation_requested_at = 0.0

@@ -482,8 +482,8 @@ Unlike auto_labeling, there is no phase flag to signal this workflow is
 "finished" — it ends when the user says it does. If the user indicates they're
 done with the pipeline (e.g. "that's all", "I'm finished", "no more testing
 needed", or they explicitly ask to reset/exit/start over), call
-reset_workflow_state() — this returns to the very start (workflow selection)
-so the next greeting shows the full workflow list again. Do NOT call it just
+reset_workflow_state() — this returns to the very start, so the next message
+begins a fresh session at the MSight Pipeline front door. Do NOT call it just
 because the pipeline was stopped — stopping and being done are different;
 stopping only means stop_msight_pipeline was called, the user may still want
 to restart it with different input.

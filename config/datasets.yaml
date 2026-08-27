@@ -89,3 +89,6 @@ datasets:
   - name: coco-2017-keypoints
     loader_fct: load_mcity_31k
     hf_dataset_name: coco-2017-keypoints
+  - name: "custom_dataset6"
+    loader_fct: "load_custom_dataset"
+    v51_type: "FiftyOneDataset"

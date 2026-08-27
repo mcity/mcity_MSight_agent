@@ -1,9 +1,12 @@
 import asyncio
+import copy
 import json
 import logging
 import os
 import re
 import sys
+import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +39,7 @@ from mcptools.msight_record_archive import (
     recording_segment_status,
 )
 from progress_relay import get_active_progress_cb
+from prompt_log import log_llm_call, provider_and_model
 from tool_schema import tools
 from validate_workflow_state import (
     LabelingBackend, AutoLabelingPhase, LabelingPath, WorkflowState, WORKFLOW_SPECS,
@@ -224,6 +228,26 @@ _WORKFLOW_LIST = "\n".join(
     for i, (name, spec) in enumerate(WORKFLOW_SPECS.items())
 )
 
+_ENTRY_LABELS = [spec.label for spec in WORKFLOW_SPECS.values() if spec.entry_point]
+
+if len(_ENTRY_LABELS) == 1:
+    # The normal case today: one front door, so offer the workflow itself
+    # rather than a choice the base prompt then refuses to honor.
+    GREETING_TEXT = (
+        f"Hello! I am the MSight AI Agent. I can help you run the {_ENTRY_LABELS[0]} "
+        "— either a quick demo with a built-in sample video, or your own setup.\n\n"
+        "Tell me what you want to do."
+    )
+else:
+    _numbered_labels = "\n".join(
+        f"{i + 1}. {label}" for i, label in enumerate(_ENTRY_LABELS)
+    )
+    GREETING_TEXT = (
+        "Hello! I am the MSight AI Agent. I can help you with these workflows:\n\n"
+        f"{_numbered_labels}\n\n"
+        "Tell me which workflow you want to start."
+    )
+
 BASE_PROMPT = (
     (_PROMPTS_DIR / "base_prompt.txt").read_text().replace("{WORKFLOW_LIST}", _WORKFLOW_LIST)
 )
@@ -277,6 +301,32 @@ def filter_tools_for_state(all_tools: list, state) -> list:
     return [t for t in all_tools if t["function"]["name"] in valid_names]
 
 
+# Longest chat history the model ever reads, in user/assistant turn pairs.
+MAX_HISTORY_TURNS = 4
+
+
+def history_for_session(history: list, state, max_turns: int = MAX_HISTORY_TURNS) -> list:
+    """Return the turns of `history` that belong to the CURRENT session.
+
+    The browser owns the conversation. It keeps every turn it has displayed and
+    sends them all back on each request, so a reset on this side cannot make it
+    forget anything — this trim is what keeps a discarded session out of the
+    prompt. reset_workflow_state puts turns_since_reset back to 0, so the next
+    request carries no history at all, and the window grows by one turn per
+    request after that. Without it the model kept reading the dead session: a
+    "call reset_workflow_state()" line left behind in an assistant turn wiped a
+    live session three turns after the reset it belonged to.
+
+    Fails open: with no state, the plain `max_turns` window applies.
+    """
+    if not history:
+        return []
+    allowed = max_turns if state is None else min(
+        max_turns, max(0, getattr(state, "turns_since_reset", max_turns))
+    )
+    return history[-allowed:] if allowed else []
+
+
 def _msight_calibration_hint() -> str:
     """Live filesystem+checksum check, called directly (not via MCP round trip)
     since it must run on every turn's state hint, not only when the LLM asks."""
@@ -324,6 +374,9 @@ def _build_state_hint(state=None) -> str:
         if not state.workflow_name:
             return ""
         parts = [f"workflow={state.workflow_name}"]
+
+        if state.reset_awaiting_confirmation:
+            parts.append(STATE_HINTS["reset_awaiting_confirm"])
         spec = WORKFLOW_SPECS.get(state.workflow_name)
         if spec and not spec.requires_dataset:
             if state.workflow_name == "msight_pipeline":
@@ -405,6 +458,19 @@ def _build_state_hint(state=None) -> str:
                 parts.append(
                     STATE_HINTS["reconfigurable_zone_a"].format(workflow_name=state.workflow_name)
                 )
+
+        # Failed run: nothing was locked or reset, so say so explicitly. Without
+        # this the model treats the failure as a dead end and offers only a restart.
+        lr = state.failed_run()
+        if lr:
+            parts.append(
+                STATE_HINTS["run_failed"].format(
+                    attempts=lr.attempts,
+                    error=lr.error,
+                    log_note=f" Logs: {lr.log_path}." if lr.log_path else "",
+                )
+            )
+
         return "SESSION_STATE: " + " | ".join(parts)
     except Exception:
         return ""
@@ -413,6 +479,18 @@ def _build_state_hint(state=None) -> str:
 @app.get("/chat/providers")
 async def chat_providers():
     return {"providers": available_providers(), "default": "openai"}
+
+
+@app.get("/chat/greeting")
+async def chat_greeting():
+    """Static greeting text for the UI to show on page load.
+
+    Read-only on purpose. It does not load WorkflowState, does not run the
+    tool loop, and does not clear workflow_just_reset -- a page refresh must
+    never mutate session state or fire a tool call. See chat_stream() below,
+    which does all three and is therefore unsafe to call automatically.
+    """
+    return {"message": GREETING_TEXT}
 
 
 @app.post("/msight/upload_calibration")
@@ -619,14 +697,28 @@ async def chat_stream(request: Request):
     history = data.get("history", [])
     llm_client = get_llm_client(request.app, data.get("provider", ""))
 
-    MAX_HISTORY_TURNS = 4
-    if len(history) > MAX_HISTORY_TURNS:
-        history = history[-MAX_HISTORY_TURNS:]
+    # Identify this request in logs/agent/prompts.jsonl: one id, every iteration.
+    request_id = uuid.uuid4().hex[:12]
+    provider_name, model_name = provider_and_model(llm_client)
 
     try:
         _state = WorkflowState.load()
     except Exception:
         _state = None
+
+    sent_turns = len(history)
+    history    = history_for_session(history, _state, MAX_HISTORY_TURNS)
+    if len(history) < sent_turns:
+        logging.warning(
+            f"[STREAM HISTORY] client sent {sent_turns} turn(s), keeping {len(history)} "
+            f"(turns_since_reset={_state.turns_since_reset if _state else 'no state'})"
+        )
+
+    # The browser records this exchange whether the reply is an answer or an
+    # error bubble, so the budget grows once per request, not once per success.
+    if _state and _state.turns_since_reset < MAX_HISTORY_TURNS:
+        _state.turns_since_reset += 1
+        _state.save()
 
     messages = [{"role": "system", "content": _build_system_prompt(_state)}]
     for user_msg, assistant_msg in history:
@@ -680,11 +772,24 @@ async def chat_stream(request: Request):
             for iteration in range(MAX_AGENTIC_ITERATIONS):
                 tool_choice = "required" if iteration == 0 else "auto"
 
+                # Snapshot before the call: `messages` grows during the turn.
+                sent_messages = copy.deepcopy(messages)
+                started = time.perf_counter()
+
                 try:
                     assistant_message = await llm_client.chat(
                         messages, tools=current_tools, tool_choice=tool_choice
                     )
                 except Exception as e:
+                    log_llm_call(
+                        request_id=request_id, iteration=iteration,
+                        provider=provider_name, model=model_name,
+                        tool_choice=tool_choice, active_tools=current_tools,
+                        messages=sent_messages,
+                        duration_ms=(time.perf_counter() - started) * 1000,
+                        user_message=message, history_turns=len(history),
+                        error=f"{type(e).__name__}: {e}",
+                    )
                     err = str(e).lower()
                     msg = (
                         "The request timed out reaching the AI service. Please try again."
@@ -693,6 +798,16 @@ async def chat_stream(request: Request):
                     )
                     await event_queue.put(("error", {"message": msg}))
                     return
+
+                log_llm_call(
+                    request_id=request_id, iteration=iteration,
+                    provider=provider_name, model=model_name,
+                    tool_choice=tool_choice, active_tools=current_tools,
+                    messages=sent_messages,
+                    duration_ms=(time.perf_counter() - started) * 1000,
+                    user_message=message, history_turns=len(history),
+                    assistant_message=assistant_message,
+                )
 
                 if not (hasattr(assistant_message, "tool_calls") and assistant_message.tool_calls):
                     reply = assistant_message.content or ""

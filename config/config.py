@@ -2,7 +2,7 @@ import os
 import psutil
 
 #: Select workflow list from 'WORKFLOWS = {...}' dictionary
-SELECTED_WORKFLOW = ["msight_pipeline"]
+SELECTED_WORKFLOW = ["auto_labeling"]
 #: Select dataset from config/datasets.yaml
 SELECTED_DATASET = {
     "name": "",
@@ -11,7 +11,7 @@ SELECTED_DATASET = {
 }
 
 #: Runtime session state — managed by the agent via WorkflowState, do not edit manually
-WORKFLOW_STATE = {'workflow_name': 'msight_pipeline', 'dataset_name': '', 'dataset_confirmed': False, 'labeled_dataset_name': '', 'auto_labeling': None, 'msight_pipeline': {'mode': 'custom', 'video_input': '/home/dataengine/Github/mcity_MSight_agent/output/msight_uploads/upload_20260811T134429879150.mp4', 'rtsp_url': '', 'sensor_name': 'gs_mcity_1', 'recording_active': False, 'archiving_active': False, 'recording_pending': False, 'archiving_pending': False, 'archiving_pending_bucket': '', 'archiving_pending_prefix': '', 'pipeline_running': False, 'run_confirmed': False, 'run_awaiting_confirmation': False, 'run_confirmation_requested_at': 0.0}, 'workflow_just_reset': False}
+WORKFLOW_STATE = {'workflow_name': 'auto_labeling', 'dataset_name': '', 'dataset_confirmed': False, 'labeled_dataset_name': '', 'auto_labeling': {'labeling_path': '', 'labeling_backend': '', 'manual_classes': [], 'models_listed': False, 'model_configured': False, 'hyperparams_confirmed': False, 'auto_labeling_complete': False, 'cvat_task_id': 0, 'ls_task_ids': [], 'labels_imported': False, 'export_confirmed': False, 'export_awaiting_confirmation': False, 'run_confirmed': False, 'run_awaiting_confirmation': False, 'model_source': '', 'model_name': '', 'phase': '', 'localization_enabled': False}, 'msight_pipeline': None, 'last_run': None, 'workflow_just_reset': True, 'turns_since_reset': 4, 'reset_awaiting_confirmation': False, 'reset_confirmation_requested_at': 0.0}
 
 #: Workflows and associated parameters
 WORKFLOWS = {
@@ -19,9 +19,9 @@ WORKFLOWS = {
         "mode": ['inference'],
         "model_source": [
         # "hf_models_objectdetection",
-        # "ultralytics",
+        "ultralytics",
         # "custom_codetr",
-        "roboflow",
+        # "roboflow",
         # "roboflow_keypoint",
         # "vitpose",
         # "roi_keypoint",
@@ -184,13 +184,13 @@ WORKFLOWS = {
             "multi_scale": False,
             "cos_lr": True,
             "models": {  # Pick from https://docs.ultralytics.com/models/
-                #"yolo11n": {"batch_size": 8, "img_size": 1280},
-                #"yolo11x": {"batch_size": 1, "img_size": 960},
-                #"yolo12n": {"batch_size": 8, "img_size": 1280},
-                #"yolo12x": {"batch_size": 1, "img_size": 960},
-		#"yolo26x": {"batch_size": 1, "img_size": 960},
-		#"yolo26l": {"batch_size": 1, "img_size": 960},
-#		"yolo26m": {"batch_size": 1, "img_size": 960},
+                # "yolo11n": {"batch_size": 8, "img_size": 1280},
+                # "yolo11x": {"batch_size": 1, "img_size": 960},
+                # "yolo12n": {"batch_size": 8, "img_size": 1280},
+                "yolo12x": {"batch_size": 1, "img_size": 960},
+                # "yolo26x": {"batch_size": 1, "img_size": 960},
+                # "yolo26l": {"batch_size": 1, "img_size": 960},
+                # "yolo26m": {"batch_size": 1, "img_size": 960},
             },
         },
     },
