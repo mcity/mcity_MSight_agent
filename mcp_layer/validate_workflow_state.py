@@ -64,6 +64,8 @@ ALWAYS_TOOLS: frozenset[str] = frozenset({
     "start_msight_recording", "start_msight_archiving",
     "stop_msight_recording", "stop_msight_archiving",
     "get_msight_record_archive_status",
+    "list_msight_node_types", "add_msight_node", "remove_msight_node",
+    "get_msight_reference",
 })
 
 
@@ -523,7 +525,7 @@ class WorkflowState(BaseModel):
                         CONFIG_PATH.write_text("\n".join(lines).rstrip("\n") + "\n")
                         return
         raise RuntimeError(
-            f"WORKFLOW_STATE assignment not found in config.py — save aborted"
+            "WORKFLOW_STATE assignment not found in config.py — save aborted"
         )
 
     @classmethod

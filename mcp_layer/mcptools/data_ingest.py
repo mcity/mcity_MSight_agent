@@ -1,5 +1,6 @@
 # mcptools/data_ingest.py
 from mcptools import mcp
+from mcptools.mcp_json import error_json
 import asyncio
 import json
 import logging
@@ -133,12 +134,12 @@ def _parse_name_samples(text: str) -> Tuple[Optional[str], Optional[int]]:
     m2 = re.search(r'(?:samples\s*=\s*|)(\d+)\s+samples', text, flags=re.IGNORECASE)
     if m2:
         try: samples = int(m2.group(1))
-        except: pass
+        except ValueError: pass
     if samples is None:
         m3 = re.search(r'samples\s*=\s*(\d+)', text, flags=re.IGNORECASE)
         if m3:
             try: samples = int(m3.group(1))
-            except: pass
+            except ValueError: pass
     return name, samples
 
 async def _stream_subprocess(proc: asyncio.subprocess.Process, on_line):
@@ -263,7 +264,7 @@ async def _run_data_ingest_streaming_core(
             if backup_path.exists():
                 _write(CONFIG_PATH, _read(backup_path))
                 backup_path.unlink(missing_ok=True)
-        except: pass
+        except Exception: pass
     finally:
         if extracted_tmp and extracted_tmp.exists():
             shutil.rmtree(extracted_tmp, ignore_errors=True)
@@ -314,7 +315,7 @@ async def run_data_ingest_tool(
 ):
 
     if not zip_path and not source_path:
-        return json.dumps({"status": "error", "message": "Provide zip_path or source_path"})
+        return error_json("Provide zip_path or source_path")
 
     extracted_tmp = None
     try:
@@ -391,7 +392,7 @@ async def run_data_ingest_tool(
                 CONFIG_PATH.with_suffix(".py.bak").unlink(missing_ok=True)
         except Exception:
             pass
-        return json.dumps({"status": "error", "message": str(e)})
+        return error_json(str(e))
     finally:
         if extracted_tmp and extracted_tmp.exists():
             try:

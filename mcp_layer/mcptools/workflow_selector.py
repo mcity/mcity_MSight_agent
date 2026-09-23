@@ -1,9 +1,7 @@
-import importlib
 import logging
 import re
 import sys
 import os
-import ast as _ast
 from pathlib import Path
 from typing import List
 
@@ -15,7 +13,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))       # mcp_layer/
 from utils.dataset_loader import load_dataset
 from mcptools import mcp
-import config.config as _cc
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 CONFIG_PATH = ROOT_DIR / "config" / "config.py"

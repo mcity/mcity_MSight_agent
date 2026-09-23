@@ -27,14 +27,17 @@ from host_utils import is_cloud_deployment, resolve_host
 from llm_clients import ClaudeClient, GeminiClient, GroqClient, OpenAIClient
 from mcptools.msight_docker import (
     CALIBRATION_INTRINSICS_REL, CALIBRATION_LOCMAP_REL,
-    _calibration_status, _get_msight_path, calibration_state_label,
+    _calibration_status, _control_plane, _get_msight_path, calibration_state_label,
 )
 from mcptools.msight_record_archive import (
     DEFAULT_SENSOR_NAME as MSIGHT_DEFAULT_SENSOR_NAME,
     DOWNLOAD_DIR as MSIGHT_DOWNLOAD_DIR,
+    DUMPER_NODE as MSIGHT_DUMPER_NODE,
+    PUSHER_NODE as MSIGHT_PUSHER_NODE,
     _active_sensor_name,
     recording_segment_status,
 )
+from pipeline_common import WRITE_TOOLS
 from progress_relay import get_active_progress_cb
 from tool_schema import tools
 from validate_workflow_state import (
@@ -263,6 +266,65 @@ def _attach_source(message: str, source: str | None) -> str:
     return message
 
 
+def _iteration_tool_choice(
+    iteration: int, force_ground_next: bool, allow_send_reply_on_iteration_0: bool, current_tools: list
+) -> tuple[str, bool, list]:
+    """(tool_choice, force_grounded, iteration_tools) for one run_pipeline
+    loop iteration -- see _GROUNDING_EXEMPT_TOOLS for why send_reply is
+    excluded on a grounded iteration."""
+    force_grounded = iteration == 0 or force_ground_next
+    tool_choice = "required" if force_grounded else "auto"
+    exclude_send_reply = force_grounded and not (iteration == 0 and allow_send_reply_on_iteration_0)
+    iteration_tools = (
+        [t for t in current_tools if t["function"]["name"] not in _GROUNDING_EXEMPT_TOOLS]
+        if exclude_send_reply else current_tools
+    )
+    return tool_choice, force_grounded, iteration_tools
+
+
+def _llm_connection_error_message(exc: Exception) -> str:
+    err = str(exc).lower()
+    return (
+        "The request timed out reaching the AI service. Please try again."
+        if "timeout" in err or "connecttimeout" in err
+        else "Something went wrong connecting to the AI service. Please try again."
+    )
+
+
+def _solo_send_reply_message(tool_call, pipeline) -> str:
+    """Final reply text for a solo send_reply call -- same source-tag
+    enforcement as chat_pipeline.py's _handle_send_reply."""
+    try:
+        args = json.loads(tool_call.function.arguments)
+        source = None if (pipeline and pipeline.write_succeeded_this_turn) else args.get("source")
+        return _attach_source(args.get("message", ""), source)
+    except Exception:
+        return "Something went wrong. Please try again."
+
+
+def _next_force_ground(tool_results: list) -> tuple[bool, str]:
+    """Whether the *next* iteration must be grounded, and why (for logging):
+    send_intro without its promised follow-up, or a real tool failure."""
+    if len(tool_results) == 1 and tool_results[0]["name"] == "send_intro":
+        return True, "send_intro without its promised follow-up call"
+    failed = [r["name"] for r in tool_results if r.get("failed")]
+    if failed:
+        return True, f"a real tool failure ({failed})"
+    return False, ""
+
+
+def _honest_exhaustion_fallback(all_tool_results: list) -> str:
+    """Absolute last resort, only reached if even the forced wrap-up call
+    (see run_pipeline) fails outright. Must not claim generic failure when a
+    real action actually succeeded this turn -- that was the whole bug."""
+    if any(r["name"] in WRITE_TOOLS and not r.get("failed") for r in all_tool_results):
+        return (
+            "I made real progress on this before running out of steps to summarize it "
+            "clearly — please check the dashboard, or ask me for the current status."
+        )
+    return "I wasn't able to complete this step. Please try again."
+
+
 def filter_tools_for_state(all_tools: list, state) -> list:
     """Return tools valid for the current step; fails open on None state or exceptions."""
     if state is None:
@@ -286,7 +348,61 @@ def _msight_calibration_hint() -> str:
     return calibration_state_label(_calibration_status(msight_path)["state"], prefixed=True)
 
 
-def _msight_pipeline_state_hint(mp) -> str:
+#: Fixed names start_msight_pipeline always uses (see mcptools/msight_docker.py).
+_DEMO_PIPELINE_NODE_NAMES = ("video_source", "rfdetr_detector", "detection_viewer")
+
+# tool_choice="required" only guarantees *a* tool call, not the right one --
+# send_reply is a valid, zero-effect "just talk" tool the model could use to
+# narrate a result instead of producing it. Excluded whenever a turn is
+# grounded (iteration 0, and right after a real failure) so send_reply can't
+# become an escape hatch. Named/documented so a future text-only tool doesn't
+# quietly become a new one.
+_GROUNDING_EXEMPT_TOOLS = frozenset({"send_reply"})
+
+# Default workflow entry (see chat_stream): auto_labeling is the only other
+# top-level-reachable workflow, so a plain keyword check is enough to decide
+# the default without asking the model to remember to do it every session.
+_AUTO_LABELING_TRIGGERS = (
+    "auto labeling", "auto-labeling", "auto labelling", "auto-labelling", "autolabeling",
+)
+
+
+async def _msight_any_alive(names: tuple[str, ...]) -> bool:
+    """Live check (is_alive, not is_tracked -- presence in memory can be
+    stale) -- pipeline_running/recording_active/archiving_active are only
+    updated by this chat's own handlers, so they drift if the underlying
+    thing is stopped/started any other way (dashboard, direct API, crash)."""
+    msight_path, err = _get_msight_path()
+    if err:
+        return False
+    try:
+        cp = _control_plane()
+        for name in names:
+            if await cp.is_alive(name):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+async def _msight_pipeline_running_live() -> bool:
+    return await _msight_any_alive(_DEMO_PIPELINE_NODE_NAMES)
+
+
+async def _msight_pipeline_node_status() -> dict[str, bool]:
+    """Per-node liveness for the fixed 3-node pipeline. Unlike
+    _msight_any_alive (which short-circuits on the first alive node --
+    fine for a plain running/not-running check), this always checks all
+    three, so a *partial* pipeline (one node dead, the others fine) is
+    detectable at all."""
+    cp = _control_plane()
+    try:
+        return {name: await cp.is_alive(name) for name in _DEMO_PIPELINE_NODE_NAMES}
+    except Exception:
+        return {name: False for name in _DEMO_PIPELINE_NODE_NAMES}
+
+
+async def _msight_pipeline_state_hint(mp, state=None) -> str:
     """Status for msight_pipeline's customize checklist, reported every turn
     so the LLM never has to infer checklist progress from conversation memory."""
     if mp is None:
@@ -304,19 +420,62 @@ def _msight_pipeline_state_hint(mp) -> str:
     parts = [f"mode={mp.mode or 'not set'}", source, _msight_calibration_hint()]
     if mp.sensor_name:
         parts.append(f"sensor_name={mp.sensor_name}")
-    parts.append(f"recording={'active' if mp.recording_active else 'pending (will auto-start when pipeline starts)' if mp.recording_pending else 'not active'}")
-    parts.append(f"archiving={'active' if mp.archiving_active else 'pending (will auto-start when pipeline starts)' if mp.archiving_pending else 'not active'}")
-    parts.append(f"pipeline_running={mp.pipeline_running}")
+    recording_active = await _msight_any_alive((MSIGHT_DUMPER_NODE,))
+    archiving_active = await _msight_any_alive((MSIGHT_PUSHER_NODE,))
+    node_status = await _msight_pipeline_node_status()
+    pipeline_running = any(node_status.values())
+    parts.append(f"recording={'active' if recording_active else 'pending (will auto-start when pipeline starts)' if mp.recording_pending else 'not active'}")
+    parts.append(f"archiving={'active' if archiving_active else 'pending (will auto-start when pipeline starts)' if mp.archiving_pending else 'not active'}")
+    parts.append(f"pipeline_running={pipeline_running}")
+
+    # Every persisted flag above is a display cache, not ground truth -- resync
+    # any that drifted (stopped/started via a non-chat route) in one save, so
+    # they don't keep re-diverging and re-checking every single turn.
+    dirty = False
+    for attr, live in (
+        ("recording_active", recording_active),
+        ("archiving_active", archiving_active),
+        ("pipeline_running", pipeline_running),
+    ):
+        if getattr(mp, attr) != live:
+            setattr(mp, attr, live)
+            dirty = True
+    if dirty and state is not None:
+        try:
+            state.save()
+        except Exception:
+            pass
+
     checklist = "msight_checklist(" + ", ".join(parts) + ")"
+
+    # Handed to the model as a blunt, precomputed fact rather than left for
+    # it to notice on its own -- asking it to spot a node missing from a
+    # status list (rather than checking heartbeats on the ones that ARE
+    # listed) has repeatedly not worked in practice, including after the
+    # prompt was updated to ask for exactly that. This can't be silently
+    # missed: it's injected into SESSION_STATE every turn, not only when
+    # get_msight_status is actually called.
+    missing = [name for name, alive in node_status.items() if not alive]
+    partial_warning = ""
+    if missing and len(missing) < len(node_status):
+        plural = "s are" if len(missing) > 1 else " is"
+        partial_warning = (
+            f" | PARTIAL_PIPELINE: {', '.join(missing)} node{plural} NOT running, "
+            "even though the pipeline was started and other nodes in it are still "
+            "up. This is very likely the cause of any 'frozen'/'not working'/'no "
+            "detections' symptom -- lead with this, don't just report the nodes "
+            "that ARE running as if that means everything's fine."
+        )
+
     if mp.run_awaiting_confirmation and not mp.run_confirmed:
-        return checklist + " | " + STATE_HINTS["msight_run_awaiting_confirm"]
-    if mp.pipeline_running:
+        return checklist + " | " + STATE_HINTS["msight_run_awaiting_confirm"] + partial_warning
+    if pipeline_running:
         source_label = f"rtsp_url:{mp.rtsp_url}" if mp.rtsp_url else f"video_input:{mp.video_input}"
-        return checklist + " | " + STATE_HINTS["msight_pipeline_running"].format(source=source_label)
-    return checklist
+        return checklist + " | " + STATE_HINTS["msight_pipeline_running"].format(source=source_label) + partial_warning
+    return checklist + partial_warning
 
 
-def _build_state_hint(state=None) -> str:
+async def _build_state_hint(state=None) -> str:
     """Return SESSION_STATE string injected before each user message."""
     try:
         if state is None:
@@ -327,7 +486,7 @@ def _build_state_hint(state=None) -> str:
         spec = WORKFLOW_SPECS.get(state.workflow_name)
         if spec and not spec.requires_dataset:
             if state.workflow_name == "msight_pipeline":
-                parts.append(_msight_pipeline_state_hint(state.msight_pipeline))
+                parts.append(await _msight_pipeline_state_hint(state.msight_pipeline, state))
             return "SESSION_STATE: " + " | ".join(parts)
         if state.dataset_confirmed and state.dataset_name:
             parts.append(f"dataset={state.dataset_name}")
@@ -611,6 +770,35 @@ async def msight_record_status():
     })
 
 
+async def _select_default_workflow(
+    _state: "WorkflowState | None", message: str, llm_client, request: Request
+) -> tuple["WorkflowState | None", "ChatPipeline | None"]:
+    """Deterministic default workflow entry -- see _AUTO_LABELING_TRIGGERS
+    above. Reuses ChatPipeline's own select_workflow handler (not a
+    re-implementation) so this stays in sync with what an LLM-driven
+    select_workflow call would do. No-op (returns _state unchanged, no
+    pipeline) unless a workflow still needs to be picked this session."""
+    if _state is None or _state.workflow_name:
+        return _state, None
+
+    default_workflow = (
+        "auto_labeling"
+        if any(t in message.lower() for t in _AUTO_LABELING_TRIGGERS)
+        else "msight_pipeline"
+    )
+    try:
+        pipeline = ChatPipeline(mcp_client=request.app.state.mcp_client, llm=llm_client)
+        pipeline.state = _state
+        await pipeline._handle_select_or_switch_workflow(
+            "select_workflow", {"workflow_name": default_workflow}, request.app.state.mcp_client
+        )
+        logging.warning(f"[STREAM] Defaulted to workflow={default_workflow!r} in code (no LLM call)")
+        return pipeline.state, pipeline
+    except Exception as e:
+        logging.warning(f"[STREAM] Default workflow selection failed, leaving to the model's own rule: {e}")
+        return _state, None
+
+
 @app.post("/chat/stream")
 async def chat_stream(request: Request):
     """SSE endpoint. Events: status, log, progress, reply (terminal), error."""
@@ -627,6 +815,8 @@ async def chat_stream(request: Request):
         _state = WorkflowState.load()
     except Exception:
         _state = None
+
+    _state, early_pipeline = await _select_default_workflow(_state, message, llm_client, request)
 
     messages = [{"role": "system", "content": _build_system_prompt(_state)}]
     for user_msg, assistant_msg in history:
@@ -654,7 +844,7 @@ async def chat_stream(request: Request):
         _state.workflow_just_reset = False
         _state.save()
 
-    state_hint = _build_state_hint(_state)
+    state_hint = await _build_state_hint(_state)
     if state_hint:
         messages.append({"role": "system", "content": state_hint})
         logging.warning(f"[STREAM HINT] {state_hint}")
@@ -674,27 +864,52 @@ async def chat_stream(request: Request):
     async def run_pipeline() -> None:
         try:
             current_tools = active_tools
-            pipeline = None
-            MAX_AGENTIC_ITERATIONS = 5
+            # Reuse the pipeline the default-workflow-selection step already
+            # built, if any, instead of losing its state/write-tracking.
+            pipeline = early_pipeline
+            # 8, not the usual ReAct-loop 10-25 -- these tools are coarse
+            # (one call does a lot), but a real action plus a few verification
+            # calls (status, logs, reference) can still legitimately use 5+.
+            MAX_AGENTIC_ITERATIONS = 8
+            # Accumulated across every iteration so the budget-exhausted path
+            # can tell "real progress happened" from "nothing happened" --
+            # never claim generic failure when a write tool actually succeeded.
+            all_tool_results: list[dict] = []
+            # Set after a real tool call fails -- forces the *next* iteration
+            # grounded too (tool_choice reverts to "auto" otherwise, and
+            # send_reply could narrate success over an actual failure).
+            force_ground_next = False
+            # A fresh session's first LLM call still requires *some* tool
+            # call, but send_reply stays allowed here specifically so the
+            # model can ask STEP 1's question instead of guessing a mode.
+            # Not relaxed for later turns -- that's exactly the escape hatch
+            # the exclusion otherwise prevents.
+            allow_send_reply_on_iteration_0 = early_pipeline is not None
 
             for iteration in range(MAX_AGENTIC_ITERATIONS):
-                tool_choice = "required" if iteration == 0 else "auto"
+                tool_choice, force_grounded, iteration_tools = _iteration_tool_choice(
+                    iteration, force_ground_next, allow_send_reply_on_iteration_0, current_tools
+                )
 
                 try:
                     assistant_message = await llm_client.chat(
-                        messages, tools=current_tools, tool_choice=tool_choice
+                        messages, tools=iteration_tools, tool_choice=tool_choice
                     )
                 except Exception as e:
-                    err = str(e).lower()
-                    msg = (
-                        "The request timed out reaching the AI service. Please try again."
-                        if "timeout" in err or "connecttimeout" in err
-                        else "Something went wrong connecting to the AI service. Please try again."
-                    )
-                    await event_queue.put(("error", {"message": msg}))
+                    await event_queue.put(("error", {"message": _llm_connection_error_message(e)}))
                     return
 
                 if not (hasattr(assistant_message, "tool_calls") and assistant_message.tool_calls):
+                    if force_grounded:
+                        # tool_choice="required" should never produce a plain
+                        # no-tool-call reply -- if a provider ignores that
+                        # anyway, retry grounded rather than accept it.
+                        logging.warning(
+                            f"[STREAM DECISION] iter={iteration} → provider ignored "
+                            "tool_choice='required' (no tool call on a grounded "
+                            "iteration) -- retrying grounded, not accepting this reply"
+                        )
+                        continue
                     reply = assistant_message.content or ""
                     logging.warning(f"[STREAM DECISION] iter={iteration} → end_turn (no tool call)")
                     await event_queue.put(("reply", {"message": reply}))
@@ -707,11 +922,7 @@ async def chat_stream(request: Request):
                 )
 
                 if len(tool_calls) == 1 and tool_calls[0].function.name == "send_reply":
-                    try:
-                        args  = json.loads(tool_calls[0].function.arguments)
-                        reply = _attach_source(args.get("message", ""), args.get("source"))
-                    except Exception:
-                        reply = "Something went wrong. Please try again."
+                    reply = _solo_send_reply_message(tool_calls[0], pipeline)
                     await event_queue.put(("reply", {"message": reply}))
                     return
 
@@ -734,10 +945,15 @@ async def chat_stream(request: Request):
                 tool_results, early_reply = await pipeline.run(
                     tool_calls, messages, progress_cb=progress_cb
                 )
+                all_tool_results.extend(tool_results)
 
                 if early_reply is not None:
                     await event_queue.put(("reply", {"message": early_reply}))
                     return
+
+                force_ground_next, reason = _next_force_ground(tool_results)
+                if force_ground_next:
+                    logging.warning(f"[STREAM] iter={iteration} had {reason} -- forcing next iteration grounded")
 
                 if iteration > 0:
                     logging.warning(
@@ -771,7 +987,28 @@ async def chat_stream(request: Request):
                     })
 
             logging.warning(f"[STREAM] Exceeded {MAX_AGENTIC_ITERATIONS} agentic iterations")
-            await event_queue.put(("reply", {"message": "I wasn't able to complete this step. Please try again."}))
+            # Don't just claim generic failure -- force one guaranteed final
+            # call, restricted to send_reply only, so the model must honestly
+            # summarize what the tool results already in this conversation
+            # actually showed, rather than the loop silently misreporting a
+            # real success as a failure just because it ran out of turns.
+            send_reply_only = [t for t in current_tools if t["function"]["name"] == "send_reply"]
+            if send_reply_only:
+                messages.append({"role": "system", "content": (
+                    "ITERATION_BUDGET_EXHAUSTED: You've reached the step limit for this "
+                    "turn. Call send_reply now, in plain language, describing only what "
+                    "the tool results already shown above actually confirmed -- do not "
+                    "claim anything succeeded or failed that isn't already shown there."
+                )})
+                try:
+                    wrap_up = await llm_client.chat(messages, tools=send_reply_only, tool_choice="required")
+                    if wrap_up.tool_calls and wrap_up.tool_calls[0].function.name == "send_reply":
+                        reply = _solo_send_reply_message(wrap_up.tool_calls[0], pipeline)
+                        await event_queue.put(("reply", {"message": reply}))
+                        return
+                except Exception as e:
+                    logging.warning(f"[STREAM] Forced wrap-up call failed: {e}")
+            await event_queue.put(("reply", {"message": _honest_exhaustion_fallback(all_tool_results)}))
 
         except Exception as e:
             logging.warning(f"[STREAM] run_pipeline exception: {e}")

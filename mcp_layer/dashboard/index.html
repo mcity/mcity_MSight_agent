@@ -1,0 +1,53 @@
+<!doctype html>
+<html>
+  <head>
+    <title><%= productName %></title>
+
+    <meta charset="utf-8" />
+    <meta name="description" content="<%= productDescription %>" />
+    <meta name="format-detection" content="telephone=no" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1<% if (ctx.mode.cordova || ctx.mode.capacitor) { %>, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover<% } %>"
+    />
+    <!-- connect-src's :8003 allowance is for msight_api.py's REST API -- the
+         dashboard talks to it on a different port via window.location.hostname,
+         same convention mcp_layer/ui/index.html already uses for its own
+         backends. Only needed in dev (quasar dev on its own port); in
+         production this is mounted directly on msight_api.py itself, so the
+         same-origin default-src 'self' already covers it with no exception. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';<% if (ctx.dev) { %> connect-src 'self' http://*:8003 https://*:8003 ws://localhost:*; worker-src 'self' blob:;<% } %>"
+    />
+
+    <link
+      rel="icon"
+      type="image/png"
+      sizes="128x128"
+      href="icons/favicon-128x128.png"
+    />
+    <link
+      rel="icon"
+      type="image/png"
+      sizes="96x96"
+      href="icons/favicon-96x96.png"
+    />
+    <link
+      rel="icon"
+      type="image/png"
+      sizes="32x32"
+      href="icons/favicon-32x32.png"
+    />
+    <link
+      rel="icon"
+      type="image/png"
+      sizes="16x16"
+      href="icons/favicon-16x16.png"
+    />
+    <link rel="icon" type="image/ico" href="favicon.ico" />
+  </head>
+  <body>
+    <!-- quasar:entry-point -->
+  </body>
+</html>

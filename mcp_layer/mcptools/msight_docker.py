@@ -1,12 +1,11 @@
 import os
 import re
-import json
-import socket
-import shutil
+import time
 import hashlib
 import asyncio
 import tempfile
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -14,12 +13,16 @@ from dotenv import load_dotenv
 from fastmcp import Context
 
 from mcptools import mcp
+from mcptools.mcp_json import error_json, ok_json
+from mcptools.msight_control_plane import MSightControlPlane
+from mcptools.msight_executors import has_gpu
 from host_utils import resolve_host
 
 load_dotenv()
 
 VIEWER_PORT = 9010
 COMPOSE_TIMEOUT_UP, COMPOSE_TIMEOUT_SHORT = 600, 60  # build ~206s measured locally; ps/logs/down are fast
+FIXED_PIPELINE_NODES = ("video_source", "rfdetr_detector", "detection_viewer")
 
 # Fixed calibration file locations, matching what rfdetr_config.yaml points at.
 CALIBRATION_INTRINSICS_REL = Path("examples/rfdetr/calibration/intrinsics.json")
@@ -169,20 +172,6 @@ def _check_msight_env(msight_path: Path, overriding_source: bool = False) -> Opt
     return None
 
 
-def _check_redis_port_free() -> Optional[str]:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        in_use = sock.connect_ex(("127.0.0.1", 6379)) == 0
-    finally:
-        sock.close()
-    if in_use:
-        return (
-            "Port 6379 is already in use on this host (likely a host redis-server). "
-            "Stop it first (e.g. `sudo systemctl stop redis-server`) and retry."
-        )
-    return None
-
-
 def _friendly_error_from_output(stdout: str, stderr: str) -> Optional[str]:
     combined = f"{stdout}\n{stderr}"
     if _UNDEFINED_VOL_RE.search(combined):
@@ -205,28 +194,6 @@ def _friendly_error_from_output(stdout: str, stderr: str) -> Optional[str]:
             "process on this host. Stop it and retry."
         )
     return None
-
-
-_gpu_available: Optional[bool] = None
-
-
-async def _has_gpu() -> bool:
-    """True if nvidia-smi reports a working GPU -- decides whether to layer in docker-compose.cpu.yml. Cached for the process lifetime."""
-    global _gpu_available
-    if _gpu_available is not None:
-        return _gpu_available
-    nvidia_smi = shutil.which("nvidia-smi")
-    if nvidia_smi is None:
-        _gpu_available = False
-        return False
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            nvidia_smi, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        )
-        _gpu_available = await asyncio.wait_for(proc.wait(), timeout=5) == 0
-    except Exception:
-        _gpu_available = False
-    return _gpu_available
 
 
 _rendered_cpu_override: Optional[Path] = None
@@ -266,7 +233,7 @@ async def _run_compose(
     # BASE_IMAGE build arg is a no-op too (Dockerfile-local hardcodes FROM with no
     # ARG). Kept here rather than fixed in MSight_Vision's checkout, which is
     # never modified.
-    if not await _has_gpu():
+    if not await has_gpu():
         compose_files += ["-f", str(_render_cpu_override())]
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -308,6 +275,40 @@ async def _run_compose(
     return proc.returncode, "\n".join(stdout_lines), "\n".join(stderr_lines)
 
 
+_control_plane_singleton: Optional[MSightControlPlane] = None
+
+
+def _control_plane() -> MSightControlPlane:
+    global _control_plane_singleton
+    if _control_plane_singleton is None:
+        _control_plane_singleton = MSightControlPlane()
+    return _control_plane_singleton
+
+
+def _default_source_from_env(msight_path: Path) -> tuple[Optional[str], Optional[str]]:
+    """Neither video_input nor rtsp_url given -- the old docker-compose flow
+    fell back to MSight_Vision's own .env values via --env-file interpolation;
+    replicate that by reading them directly. Returns (video_input, rtsp_url)."""
+    from dotenv import dotenv_values
+    values = dotenv_values(msight_path / ".env")
+    return (values.get("VIDEO_INPUT") or None), (values.get("RTSP_URL") or None)
+
+
+def _resolve_video_source(video_input: Optional[str], rtsp_url: Optional[str], sensor: str) -> tuple[str, dict]:
+    """(node_type, config) for the video_source node -- mirrors the branching
+    docker-compose.yml's own video_source entrypoint script does at runtime."""
+    base = {"publish_topic": f"camera/{sensor}", "sensor_name": sensor}
+    if rtsp_url:
+        return "video_source_rtsp", {**base, "rtsp_url": rtsp_url}
+    # A directory plays sequentially via mp4_folder; a single file path is
+    # accepted by msight_launch_rtsp itself (its --url also takes a local path).
+    return (
+        ("video_source_mp4_folder", {**base, "folder": video_input})
+        if Path(video_input).is_dir()
+        else ("video_source_rtsp", {**base, "rtsp_url": video_input})
+    )
+
+
 @mcp.tool()
 async def start_msight_pipeline(
     video_input: Optional[str] = None,
@@ -318,144 +319,179 @@ async def start_msight_pipeline(
 ) -> str:
     msight_path, err = _get_msight_path()
     if err:
-        return json.dumps({"status": "error", "message": err})
+        return error_json(err)
 
     if video_input and rtsp_url:
-        return json.dumps({
-            "status": "error",
-            "message": "Provide exactly one of video_input or rtsp_url, not both.",
-        })
+        return error_json("Provide exactly one of video_input or rtsp_url, not both.")
 
     if video_input and not Path(video_input).exists():
-        return json.dumps({
-            "status": "error",
-            "message": f"video_input path '{video_input}' does not exist on this host.",
-        })
+        return error_json(f"video_input path '{video_input}' does not exist on this host.")
+
+    if not video_input and not rtsp_url:
+        video_input, rtsp_url = _default_source_from_env(msight_path)
 
     env_err = _check_msight_env(msight_path, overriding_source=bool(video_input or rtsp_url))
     if env_err:
-        return json.dumps({"status": "error", "message": env_err})
+        return error_json(env_err)
 
-    redis_err = _check_redis_port_free()
-    if redis_err:
-        return json.dumps({"status": "error", "message": redis_err})
+    if build:
+        # Building the image is the one thing DockerExecutor deliberately
+        # doesn't do -- still supported here as an explicit, occasional step,
+        # reusing the same compose+CPU-override selection as before.
+        returncode, stdout, stderr = await _run_compose(msight_path, ["build"], COMPOSE_TIMEOUT_UP, ctx=ctx)
+        if returncode != 0:
+            friendly = _friendly_error_from_output(stdout, stderr)
+            tail = (stdout + stderr)[-2000:]
+            return error_json(friendly or f"docker compose build failed:\n{tail}")
 
-    compose_env = os.environ.copy()
-    if video_input:
-        compose_env["VIDEO_INPUT"] = video_input
-        compose_env["RTSP_URL"] = ""
-    elif rtsp_url:
-        compose_env["RTSP_URL"] = rtsp_url
-        compose_env["VIDEO_INPUT"] = ""
-    if sensor_name:
-        compose_env["SENSOR_NAME"] = sensor_name
+    sensor = sensor_name or "gs_mcity_1"
+    video_node_type, video_config = _resolve_video_source(video_input, rtsp_url, sensor)
 
-    args = ["up", "-d"] + (["--build"] if build else [])
-    returncode, stdout, stderr = await _run_compose(
-        msight_path, args, COMPOSE_TIMEOUT_UP, env=compose_env, ctx=ctx
-    )
+    desired = [
+        {"node_type": video_node_type, "name": "video_source", "config": video_config},
+        {"node_type": "rfdetr_detector", "name": "rfdetr_detector", "config": {
+            "publish_topic": f"detection/{sensor}",
+            "subscribe_topic": f"camera/{sensor}",
+            "det_configs": "/configs/rfdetr_config.yaml",
+            "sensor_name": sensor,
+        }},
+        {"node_type": "detection_viewer", "name": "detection_viewer", "config": {
+            "subscribe_topic": f"detection/{sensor}",
+            "port": VIEWER_PORT,
+        }},
+    ]
 
-    if returncode != 0:
-        friendly = _friendly_error_from_output(stdout, stderr)
-        if friendly:
-            return json.dumps({"status": "error", "message": friendly})
-        tail = (stdout + stderr)[-2000:]
-        return json.dumps({"status": "error", "message": f"docker compose up failed:\n{tail}"})
+    try:
+        await _control_plane().recompose(desired)
+    except Exception as e:
+        msg = str(e)
+        friendly = _friendly_error_from_output(msg, "")
+        return error_json(friendly or f"Failed to start MSight_Vision pipeline: {msg}")
 
-    return json.dumps({
-        "status": "ok",
-        "message": "MSight_Vision pipeline started.",
-        "viewer_url": f"http://{resolve_host()}:{VIEWER_PORT}",
-    })
+    return ok_json("MSight_Vision pipeline started.", viewer_url=f"http://{resolve_host()}:{VIEWER_PORT}")
 
 
 @mcp.tool()
 async def stop_msight_pipeline(remove_volumes: bool = False, ctx: Context = None) -> str:
+    # remove_volumes is now a no-op -- docker run here never creates named
+    # volumes to remove -- kept only so the signature/schema stay unchanged.
     msight_path, err = _get_msight_path()
     if err:
-        return json.dumps({"status": "error", "message": err})
+        return error_json(err)
 
-    args = ["down"] + (["-v"] if remove_volumes else [])
-    returncode, stdout, stderr = await _run_compose(msight_path, args, COMPOSE_TIMEOUT_SHORT, ctx=ctx)
+    try:
+        cp = _control_plane()
+        # Explicit names, not recompose([]) -- recompose only diffs against
+        # nodes tracked in *this process's* memory, so it silently does
+        # nothing (while still returning "ok") if the server restarted since
+        # start_msight_pipeline ran. delete_node() falls back to each node's
+        # deterministic container name, so this works either way.
+        for name in FIXED_PIPELINE_NODES:
+            await cp.delete_node(name)
+    except Exception as e:
+        return error_json(f"Failed to stop MSight_Vision pipeline: {e}")
 
-    if returncode != 0:
-        friendly = _friendly_error_from_output(stdout, stderr)
-        tail = (stdout + stderr)[-2000:]
-        return json.dumps({
-            "status": "error",
-            "message": friendly or f"docker compose down failed:\n{tail}",
-        })
+    return ok_json("MSight_Vision pipeline stopped.")
 
-    return json.dumps({"status": "ok", "message": "MSight_Vision pipeline stopped."})
+
+async def _enrich_node_status(cp, nodes: list[dict]) -> list[dict]:
+    """Adds a computed seconds_since_heartbeat, and a real "alive" field
+    (is_alive(), not Redis's self-reported status -- that never expires, so
+    a node that died hard without deregistering would report RUNNING forever)."""
+    now = time.time()
+    out = []
+    for n in nodes:
+        n = dict(n)
+        hb = n.get("last_heartbeat")
+        if isinstance(hb, (int, float)):
+            n["seconds_since_heartbeat"] = max(0, int(now - hb))
+        n["alive"] = await cp.is_alive(n["name"])
+        out.append(n)
+    return out
 
 
 @mcp.tool()
 async def get_msight_status(ctx: Context = None) -> str:
     msight_path, err = _get_msight_path()
     if err:
-        return json.dumps({"status": "error", "message": err})
+        return error_json(err)
 
-    # -a: without it, a crashed service (e.g. video_source on a bad RTSP URL)
-    # just disappears from the list instead of showing "exited" -- a broken
-    # pipeline would look healthy since the other containers stay up.
-    returncode, stdout, stderr = await _run_compose(
-        msight_path, ["ps", "-a", "--format", "json"], COMPOSE_TIMEOUT_SHORT, ctx=ctx
-    )
-    if returncode != 0:
-        friendly = _friendly_error_from_output(stdout, stderr)
-        tail = (stdout + stderr)[-2000:]
-        return json.dumps({
-            "status": "error",
-            "message": friendly or f"docker compose ps failed:\n{tail}",
-        })
+    try:
+        cp = _control_plane()
+        services = await _enrich_node_status(cp, cp.get_status())
+    except Exception as e:
+        return error_json(f"Could not read MSight_Vision status: {e}")
 
-    services = []
-    stripped = stdout.strip()
-    if stripped:
-        try:
-            parsed = json.loads(stripped)
-            services = parsed if isinstance(parsed, list) else [parsed]
-        except json.JSONDecodeError:
-            # Older compose versions emit JSON-lines instead of a JSON array.
-            for line in stripped.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    services.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+    extra = {"services": services}
+    # Only report a viewer_url when the viewer is actually alive -- a name
+    # match against Redis alone isn't enough (a stale ghost entry has the
+    # right name but a self-reported, never-expiring status).
+    if any(s.get("name") == "detection_viewer" and s.get("alive") for s in services):
+        extra["viewer_url"] = f"http://{resolve_host()}:{VIEWER_PORT}"
 
-    return json.dumps({
-        "status": "ok",
-        "services": services,
-        "viewer_url": f"http://{resolve_host()}:{VIEWER_PORT}",
-    })
+    # Explicit, precomputed fact rather than something the caller has to
+    # notice on its own -- a node missing entirely from `services` (deleted,
+    # or crashed without deregistering) produces the exact same symptom as a
+    # stalled one, but relying on the reader to spot an absence from a list
+    # of what IS present has repeatedly not worked in practice.
+    fixed_alive = {name: await cp.is_alive(name) for name in FIXED_PIPELINE_NODES}
+    missing = [name for name, alive in fixed_alive.items() if not alive]
+    if missing and len(missing) < len(FIXED_PIPELINE_NODES):
+        extra["missing_pipeline_nodes"] = missing
+        extra["diagnosis"] = (
+            f"{', '.join(missing)} {'is' if len(missing) == 1 else 'are'} NOT running, "
+            "even though other fixed-pipeline nodes are still up. This is very likely "
+            "the cause of any 'frozen'/'not working'/'no detections' symptom."
+        )
+    return ok_json(**extra)
+
+
+_LOG_TS_RE = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+')
+
+
+def _seconds_since_last_log_line(text: str) -> Optional[int]:
+    """msight_core nodes log with a leading `YYYY-MM-DD HH:MM:SS,ms` timestamp
+    (confirmed live: `2026-09-08 14:38:22,397 - ... - INFO :: ...`). Used to
+    tell a genuinely-stuck node (heartbeat green, but nothing logged in a
+    while) apart from one that's just idle between messages -- see
+    prompts/msight_reference/diagnosing_stalled_nodes.md for the heuristic."""
+    for line in reversed(text.splitlines()):
+        m = _LOG_TS_RE.match(line)
+        if m:
+            ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
+            return max(0, int(time.time() - ts))
+    return None
 
 
 @mcp.tool()
 async def get_msight_logs(service: Optional[str] = None, tail: int = 200, ctx: Context = None) -> str:
     msight_path, err = _get_msight_path()
     if err:
-        return json.dumps({"status": "error", "message": err})
+        return error_json(err)
 
     tail = max(1, min(tail, 2000))
-    args = ["logs", "--no-color", "--tail", str(tail)] + ([service] if service else [])
-    returncode, stdout, stderr = await _run_compose(msight_path, args, COMPOSE_TIMEOUT_SHORT, ctx=ctx)
+    cp = _control_plane()
+    try:
+        if service:
+            combined = await cp.get_logs(service, tail)
+            extra = {
+                "logs": combined[-8000:],
+                "seconds_since_last_line": _seconds_since_last_log_line(combined),
+            }
+        else:
+            names = [n["name"] for n in cp.get_status()]
+            per_node = {name: await cp.get_logs(name, tail) for name in names}
+            combined = "\n\n".join(f"==> {name} <==\n{text}" for name, text in per_node.items())
+            extra = {
+                "logs": combined[-8000:],
+                "log_freshness": {
+                    name: _seconds_since_last_log_line(text) for name, text in per_node.items()
+                },
+            }
+    except Exception as e:
+        return error_json(f"Could not fetch logs: {e}")
 
-    combined = stdout + stderr
-    friendly = _friendly_error_from_output(stdout, stderr)
-
-    if returncode != 0 and not combined.strip():
-        return json.dumps({
-            "status": "error",
-            "message": friendly or "docker compose logs failed with no output.",
-        })
-
-    result = {"status": "ok", "logs": combined[-8000:]}
-    if friendly:
-        result["warning"] = friendly
-    return json.dumps(result)
+    return ok_json(**extra)
 
 
 @mcp.tool()
@@ -464,7 +500,7 @@ def check_msight_calibration_status() -> str:
     _calibration_status for the checksum comparison this wraps."""
     msight_path, err = _get_msight_path()
     if err:
-        return json.dumps({"status": "error", "message": err})
+        return error_json(err)
 
     status = _calibration_status(msight_path)
     messages = {
@@ -473,4 +509,4 @@ def check_msight_calibration_status() -> str:
         "user_calibrated": "User-uploaded calibration is active.",
         "partial": "Inconsistent state: one calibration file has been replaced but not the other.",
     }
-    return json.dumps({"status": "ok", "message": messages[status["state"]], **status})
+    return ok_json(messages[status["state"]], **status)

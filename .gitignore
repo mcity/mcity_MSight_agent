@@ -175,6 +175,8 @@ cython_debug/
 
 # Secret
 .secret
+*.pem
+*.key
 
 # Claude Code settings
 .claude/

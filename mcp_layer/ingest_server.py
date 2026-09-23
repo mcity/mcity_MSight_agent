@@ -8,7 +8,6 @@ from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 import sys
-import os
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mcptools.data_ingest import _run_data_ingest_streaming_core
@@ -99,3 +98,8 @@ async def ingest_stream(job_id: str):
             yield f"event: log\ndata: {msg}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8002)

@@ -10,6 +10,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 from pipeline_common import (
     MAIN_PATH, Sentinels, HardStop, Injection, FallThrough, ToolRouting,
@@ -622,7 +623,16 @@ class AutoLabelingHandlers:
 
         result = unwrap_tool_output(await mcp_client.call_tool(tool_name, fn_args))
 
-        # CVAT-specific error sentinels checked first for CVAT exports.
+        error_routing = self._export_error_routing(result, is_ls)
+        if error_routing is not None:
+            return result, error_routing
+
+        return self._handle_export_success(result, fn_args, is_ls)
+
+    def _export_error_routing(self, result: str, is_ls: bool) -> Optional[list[ToolRouting]]:
+        """None if `result` isn't an error; otherwise the routing to end the
+        turn with the error message. CVAT sentinels checked first for CVAT
+        exports; the LS/generic set applies either way."""
         if not is_ls and any(s in result for s in [
             Sentinels.CVAT_TASK_LIMIT_REACHED, Sentinels.CVAT_STORAGE_LIMIT_REACHED,
             Sentinels.CVAT_FORBIDDEN, Sentinels.CVAT_AUTH_ERROR,
@@ -630,56 +640,67 @@ class AutoLabelingHandlers:
             "CVAT upload failed:",
         ]):
             err = result.split(":", 1)[1].strip() if ":" in result else result
-            return result, [HardStop(err)]
+            return [HardStop(err)]
 
         if any(s in result for s in [
             Sentinels.LS_AUTH_ERROR, Sentinels.LS_CONNECTION_ERROR,
             Sentinels.LS_BACKEND_ERROR, Sentinels.BACKEND_NOT_SET,
         ]):
             err = result.split(":", 1)[1].strip() if ":" in result else result
-            return result, [HardStop(err)]
+            return [HardStop(err)]
 
+        return None
+
+    def _handle_export_success(
+        self, result: str, fn_args: dict, is_ls: bool
+    ) -> tuple[str, list[ToolRouting]]:
+        """Backend-specific bookkeeping once an export call returned without
+        an error sentinel -- pull the new task id(s) out of the result and
+        move the workflow into the ANNOTATING phase."""
         al = self.state.auto_labeling
-        if al:
-            if is_ls and "Project ID" in result:
-                try:
-                    tasks_file = Path(__file__).resolve().parents[1] / "output" / "ls_tasks.json"
-                    if tasks_file.exists():
-                        registry = json.loads(tasks_file.read_text())
-                        dataset_name = fn_args.get("dataset_name", "")
-                        if dataset_name in registry:
-                            al.ls_task_ids = registry[dataset_name].get("task_ids", [])
-                except Exception:
-                    pass
-                if not al.ls_task_ids:
-                    return result, [HardStop(
-                        "The export may have succeeded on the Label Studio backend, but the "
-                        "task IDs could not be read from the task registry. Please check Label "
-                        "Studio directly for your project, or retry the export. If the problem "
-                        "persists, contact support."
-                    )]
+        if not al:
+            return result, [FallThrough()]
+
+        if is_ls and "Project ID" in result:
+            try:
+                tasks_file = Path(__file__).resolve().parents[1] / "output" / "ls_tasks.json"
+                if tasks_file.exists():
+                    registry = json.loads(tasks_file.read_text())
+                    dataset_name = fn_args.get("dataset_name", "")
+                    if dataset_name in registry:
+                        al.ls_task_ids = registry[dataset_name].get("task_ids", [])
+            except Exception:
+                pass
+            if not al.ls_task_ids:
+                return result, [HardStop(
+                    "The export may have succeeded on the Label Studio backend, but the "
+                    "task IDs could not be read from the task registry. Please check Label "
+                    "Studio directly for your project, or retry the export. If the problem "
+                    "persists, contact support."
+                )]
+            al.phase = AutoLabelingPhase.ANNOTATING
+            self.state.save()
+            return result, [HardStop(
+                f"{result.strip()}\n\n"
+                f"Let me know when you have finished annotating and I will import your labels."
+            )]
+
+        if not is_ls and "Task ID:" in result:
+            try:
+                task_id = int(result.split("Task ID:")[1].split()[0].strip())
+                al.cvat_task_id = task_id
                 al.phase = AutoLabelingPhase.ANNOTATING
                 self.state.save()
                 return result, [HardStop(
                     f"{result.strip()}\n\n"
                     f"Let me know when you have finished annotating and I will import your labels."
                 )]
-            if not is_ls and "Task ID:" in result:
-                try:
-                    task_id = int(result.split("Task ID:")[1].split()[0].strip())
-                    al.cvat_task_id = task_id
-                    al.phase = AutoLabelingPhase.ANNOTATING
-                    self.state.save()
-                    return result, [HardStop(
-                        f"{result.strip()}\n\n"
-                        f"Let me know when you have finished annotating and I will import your labels."
-                    )]
-                except Exception:
-                    return result, [HardStop(
-                        "The export may have succeeded on the CVAT backend, but the task ID "
-                        "could not be read from the response. Please check CVAT directly for "
-                        "your task, or retry the export. If the problem persists, contact support."
-                    )]
+            except Exception:
+                return result, [HardStop(
+                    "The export may have succeeded on the CVAT backend, but the task ID "
+                    "could not be read from the response. Please check CVAT directly for "
+                    "your task, or retry the export. If the problem persists, contact support."
+                )]
 
         return result, [FallThrough()]
 

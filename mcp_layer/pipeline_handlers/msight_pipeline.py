@@ -113,6 +113,41 @@ class MsightPipelineHandlers:
             f"{question}"
         )
 
+    def _deferred_record_archive_routings(self, mp: MsightPipelineState) -> list[ToolRouting]:
+        """Fires any recording/archiving request deferred while the pipeline
+        was still starting, once it's actually running."""
+        routings: list[ToolRouting] = [FallThrough()]
+        if not mp.pipeline_running:
+            return routings
+        if mp.recording_pending:
+            sensor_arg = repr(mp.sensor_name) if mp.sensor_name else "None"
+            routings.append(Injection(
+                "RECORDING_WAS_PENDING: The user asked to start recording before "
+                "the pipeline was running. It's running now — call "
+                f"start_msight_recording(sensor_name={sensor_arg}) immediately, in "
+                "this same reply, before telling the user the pipeline has started."
+            ))
+        if mp.archiving_pending:
+            bucket_arg = repr(mp.archiving_pending_bucket)
+            prefix_arg = repr(mp.archiving_pending_prefix) if mp.archiving_pending_prefix else "None"
+            routings.append(Injection(
+                "ARCHIVING_WAS_PENDING: The user asked to start archiving before "
+                "the pipeline was running. It's running now — call "
+                f"start_msight_archiving(s3_bucket={bucket_arg}, s3_prefix={prefix_arg}) "
+                "immediately, in this same reply, before telling the user the pipeline has started."
+            ))
+        return routings
+
+    def _require_run_consent(
+        self, mp: MsightPipelineState, replacing_running: bool
+    ) -> tuple[str, list[ToolRouting]]:
+        """The not-yet-confirmed half of the consent gate -- returns the
+        sentinel + HardStop that ends the turn with the confirmation prompt."""
+        sentinel = self._build_msight_run_needs_confirmation_sentinel(mp)
+        return sentinel, [HardStop(
+            self._format_msight_run_confirmation_prompt(mp, replacing_running=replacing_running)
+        )]
+
     async def _handle_select_msight_mode(self, fn_args: dict) -> tuple[str, list[ToolRouting]]:
         """Records Demo vs 'run your own pipeline' as real state (see MsightPipelineState.mode)."""
         mode = fn_args.get("mode", "")
@@ -199,10 +234,7 @@ class MsightPipelineHandlers:
             mp.run_awaiting_confirmation = True
             mp.run_confirmation_requested_at = time.time()
             self.state.save()
-            sentinel = self._build_msight_run_needs_confirmation_sentinel(mp)
-            return sentinel, [HardStop(
-                self._format_msight_run_confirmation_prompt(mp, replacing_running=was_running and source_changed)
-            )]
+            return self._require_run_consent(mp, replacing_running=was_running and source_changed)
 
         # Safety net: the LLM is told to call send_intro before this, but that
         # instruction gets skipped often enough that we guarantee it here too.
@@ -233,26 +265,7 @@ class MsightPipelineHandlers:
         mp.run_awaiting_confirmation = False
         mp.run_confirmation_requested_at = 0.0
 
-        routings: list[ToolRouting] = [FallThrough()]
-        if mp.pipeline_running:
-            # Fire any recording/archiving request deferred while the pipeline was still starting.
-            if mp.recording_pending:
-                sensor_arg = repr(mp.sensor_name) if mp.sensor_name else "None"
-                routings.append(Injection(
-                    "RECORDING_WAS_PENDING: The user asked to start recording before "
-                    "the pipeline was running. It's running now — call "
-                    f"start_msight_recording(sensor_name={sensor_arg}) immediately, in "
-                    "this same reply, before telling the user the pipeline has started."
-                ))
-            if mp.archiving_pending:
-                bucket_arg = repr(mp.archiving_pending_bucket)
-                prefix_arg = repr(mp.archiving_pending_prefix) if mp.archiving_pending_prefix else "None"
-                routings.append(Injection(
-                    "ARCHIVING_WAS_PENDING: The user asked to start archiving before "
-                    "the pipeline was running. It's running now — call "
-                    f"start_msight_archiving(s3_bucket={bucket_arg}, s3_prefix={prefix_arg}) "
-                    "immediately, in this same reply, before telling the user the pipeline has started."
-                ))
+        routings = self._deferred_record_archive_routings(mp)
         self.state.save()
         return result, routings
 

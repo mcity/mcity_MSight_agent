@@ -6,6 +6,7 @@ chat_pipeline.py, which imports the mixins.
 import re
 from dataclasses import dataclass as _dc
 from pathlib import Path
+from typing import Optional
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "config.py"
 MAIN_PATH   = Path(__file__).resolve().parents[1] / "main.py"
@@ -36,6 +37,18 @@ TOOL_STATUS_MESSAGES: dict[str, str] = {
 
 # Strip ANSI escape codes and bare CR from subprocess output.
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]|\r')
+
+# Live-ops tools that actually change something -- used by chat_pipeline.py to
+# force send_reply's source tag off when one succeeds this turn (confirming an
+# action is operational, not informational), and by chat_server.py to tell
+# real progress apart from "nothing happened" when the agentic loop's
+# iteration budget runs out before a reply is produced.
+WRITE_TOOLS: frozenset[str] = frozenset({
+    "start_msight_pipeline", "stop_msight_pipeline",
+    "add_msight_node", "remove_msight_node",
+    "start_msight_recording", "stop_msight_recording",
+    "start_msight_archiving", "stop_msight_archiving",
+})
 
 
 def unwrap_tool_output(raw) -> str:
@@ -86,6 +99,47 @@ class FallThrough:
 
 
 ToolRouting = Injection | HardStop | FallThrough
+
+
+@_dc
+class ConfirmGateSpec:
+    """Describes one consent-gate's bookkeeping shape -- captures how
+    msight_pipeline's and auto_labeling's *already nearly-identical*
+    run-confirmation patterns diverge, as data, instead of two independently
+    hand-copied implementations. See ChatPipeline._check_confirm_gate /
+    _clear_confirm_gate (chat_pipeline.py) for the generic mechanism this
+    describes.
+
+    Not yet wired into either existing call site -- pipeline_handlers/
+    msight_pipeline.py and pipeline_handlers/auto_labeling.py keep their
+    current, already-verified inline logic. This exists so a *future* third
+    consent gate (e.g. around a destructive generic node operation, if that's
+    ever needed) doesn't grow a third hand-copied 40-line implementation.
+    """
+    state_path: str             # attribute name on WorkflowState, e.g. "msight_pipeline"
+    confirmed_attr: str         # e.g. "run_confirmed"
+    awaiting_attr: str          # e.g. "run_awaiting_confirmation"
+    requested_at_attr: Optional[str] = None  # per-field TTL timestamp attr, or None = defer to the global config.py-mtime TTL
+    ttl_seconds: int = 300
+
+
+# Documents the two existing patterns' actual shape (see
+# pipeline_handlers/msight_pipeline.py:_handle_start_msight_pipeline and
+# pipeline_handlers/auto_labeling.py's run-confirmation handlers) --
+# msight_pipeline has a dedicated 300s TTL field; auto_labeling has none and
+# relies on WorkflowState.load()'s separate global 3600s config.py-mtime TTL
+# block instead. Reference only until a gate actually migrates onto this.
+CONFIRM_GATES: dict[str, ConfirmGateSpec] = {
+    "msight_pipeline_run": ConfirmGateSpec(
+        state_path="msight_pipeline", confirmed_attr="run_confirmed",
+        awaiting_attr="run_awaiting_confirmation",
+        requested_at_attr="run_confirmation_requested_at", ttl_seconds=300,
+    ),
+    "auto_labeling_run": ConfirmGateSpec(
+        state_path="auto_labeling", confirmed_attr="run_confirmed",
+        awaiting_attr="run_awaiting_confirmation",
+    ),
+}
 
 
 class Sentinels:

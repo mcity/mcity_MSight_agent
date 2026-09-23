@@ -704,5 +704,104 @@ tools = [
                 "parameters": {"type": "object", "properties": {}}
             }
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_msight_node_types",
+                "description": (
+                    "List every node_type add_msight_node accepts, with its category "
+                    "(source/processing/sink), required config keys, whether it needs a GPU, "
+                    "and a one-line description. Call this before add_msight_node whenever "
+                    "you're not certain what node_type or config keys are valid — don't guess."
+                ),
+                "parameters": {"type": "object", "properties": {}}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "add_msight_node",
+                "description": (
+                    "Start one additional MSight node beyond the fixed pipeline/record/archive "
+                    "nodes — e.g. a second camera source, an alternate sink, or any other "
+                    "cataloged node_type. IMPORTANT: if `name` is omitted, it defaults to the "
+                    "catalog's default_name — the SAME name every other node of that node_type "
+                    "gets by default. Reusing a name that's already running is idempotent (a "
+                    "safe no-op — it does NOT start a second node, even with different config) "
+                    "and the response tells you via already_running: true. So whenever you're "
+                    "adding a node meant to run ALONGSIDE an existing one of the same type (e.g. "
+                    "a second detection_viewer), always pass an explicit, distinct `name` — don't "
+                    "rely on the default. Call list_msight_node_types first if unsure which "
+                    "node_type/config keys apply, or get_msight_reference(topic=\"node_catalog\") "
+                    "for worked examples."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "node_type": {
+                            "type": "string",
+                            "description": "One of list_msight_node_types()'s node_type values.",
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Unique node name. Optional — defaults to the node_type's catalog default name.",
+                        },
+                        "config": {
+                            "type": "object",
+                            "description": (
+                                "node_type-specific config keys (e.g. rtsp_url, publish_topic, "
+                                "subscribe_topic, sensor_name, det_configs). See "
+                                "list_msight_node_types() for which are required per node_type."
+                            ),
+                        },
+                    },
+                    "required": ["node_type"],
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "remove_msight_node",
+                "description": (
+                    "Stop and untrack one node by name. Cheap, fast, and reversible — no "
+                    "confirmation needed, same as stop_msight_pipeline/stop_msight_recording. "
+                    "If other still-running nodes were subscribed to this node's output, they "
+                    "simply receive no more data — nothing else crashes, but say so if you know "
+                    "of a downstream dependency."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"],
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_msight_reference",
+                "description": (
+                    "Fetch reference documentation not already in your instructions. Call this "
+                    "instead of guessing when you need: 'node_catalog' — full details per "
+                    "node_type plus worked add_msight_node examples; 'common_failure_modes' — "
+                    "known error patterns and fixes when a tool call fails with an unfamiliar "
+                    "error; 'diagnosing_stalled_nodes' — how to tell a silently-stuck node "
+                    "(status looks fine, but it isn't actually producing data) apart from a "
+                    "genuinely dead one, using get_msight_status/get_msight_logs. Don't call "
+                    "this speculatively for routine flows already covered by your instructions."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "topic": {
+                            "type": "string",
+                            "enum": ["node_catalog", "common_failure_modes", "diagnosing_stalled_nodes"],
+                        }
+                    },
+                    "required": ["topic"],
+                }
+            }
+        },
 
 ]

@@ -88,9 +88,10 @@ Resources:
           FromPort: 5225
           ToPort: 5225
           CidrIp: 0.0.0.0/0
+        # 8000 mcp_server, 8001 chat_server, 8002 ingest_server, 8003 msight_api.
         - IpProtocol: tcp
           FromPort: 8000
-          ToPort: 8002
+          ToPort: 8003
           CidrIp: 0.0.0.0/0
         - IpProtocol: tcp
           FromPort: 22

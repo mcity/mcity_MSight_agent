@@ -291,8 +291,6 @@ def list_model_sources_and_models() -> dict:
 @mcp.tool()
 async def run_auto_labeling() -> str:
     """Run auto_labeling workflow and return training or inference summary."""
-    import os as _os
-
     try:
         process = await asyncio.create_subprocess_exec(
             sys.executable, "-u", str(MAIN_PATH),

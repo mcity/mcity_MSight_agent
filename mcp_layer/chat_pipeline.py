@@ -1,17 +1,30 @@
 import json
 import logging
+import time
+from typing import Optional
 
 from fastmcp import Client
 
 from pipeline_common import (
-    Sentinels, HardStop, Injection, FallThrough, ToolRouting,
-    unwrap_tool_output, TOOL_STATUS_MESSAGES,
+    Sentinels, HardStop, Injection, FallThrough, ToolRouting, WRITE_TOOLS,
+    unwrap_tool_output, TOOL_STATUS_MESSAGES, CONFIRM_GATES,
 )
 from pipeline_handlers.auto_labeling import AutoLabelingHandlers
 from pipeline_handlers.msight_pipeline import MsightPipelineHandlers
 from validate_workflow_state import (
     WorkflowState, AutoLabelingPhase, WORKFLOW_SPECS, validate_tool_input,
 )
+
+
+def _tool_result_reports_error(result: str) -> bool:
+    """True for a well-formed {"status": "error", ...} tool response -- a
+    handled failure, distinct from _dispatch's exception flag. A plain-text
+    sentinel isn't JSON, so this correctly leaves those alone."""
+    try:
+        parsed = json.loads(result)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(parsed, dict) and parsed.get("status") == "error"
 
 
 class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
@@ -49,6 +62,9 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
         # Set by _handle_send_intro; lets _handle_start_msight_pipeline's Demo path
         # inject a fallback intro if the LLM skipped calling send_intro itself.
         self._intro_sent_this_turn = False
+        # Set once any WRITE_TOOLS call succeeds this turn -- forces
+        # send_reply to omit its source tag (see _handle_send_reply).
+        self.write_succeeded_this_turn = False
 
     def _set_flag_if_ok(
         self,
@@ -133,21 +149,26 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
                     "name": fn_name,
                     "fn_args": fn_args,
                     "result": err,
+                    "failed": True,
                 })
                 all_routings.append([FallThrough()])
                 logging.warning(f"[PIPELINE] Tool input validation failed for {fn_name}: {err}")
                 continue
 
-            result, routings = await self._dispatch(
+            result, routings, failed = await self._dispatch(
                 fn_name, fn_args, call, mcp_client, messages, progress_cb
             )
             if fn_name == "get_msight_logs" and progress_cb:
                 await self._emit_raw_logs(result, fn_args, progress_cb)
+            call_failed = failed or _tool_result_reports_error(result)
+            if fn_name in WRITE_TOOLS and not call_failed:
+                self.write_succeeded_this_turn = True
             tool_results.append({
                 "tool_call_id": call.id,
                 "name": fn_name,
                 "fn_args": fn_args,
                 "result": result,
+                "failed": call_failed,
             })
             all_routings.append(routings)
 
@@ -181,12 +202,17 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
 
     async def _dispatch(
         self, fn_name, fn_args, call, mcp_client, messages, progress_cb=None
-    ) -> tuple[str, list[ToolRouting]]:
-        """Execute one tool call; always appends result to messages before returning."""
+    ) -> tuple[str, list[ToolRouting], bool]:
+        """Execute one tool call; always appends result to messages before returning.
+        The bool return is whether this call failed -- run() uses it to force the
+        model back into a real tool call next iteration rather than narrating an
+        unverified "it worked". Only the silent exception path is flagged here;
+        the state-save failure already surfaces to the user via HardStop."""
         if progress_cb and fn_name not in ("send_reply", "send_intro"):
             status = TOOL_STATUS_MESSAGES.get(fn_name, f"Running {fn_name.replace('_', ' ')}...")
             await progress_cb("status", {"message": status})
 
+        failed = False
         try:
             handlers = self._build_dispatch_table(fn_name, fn_args, mcp_client, messages, progress_cb)
             handler = handlers.get(fn_name)
@@ -210,6 +236,7 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
                 logging.warning(f"[PIPELINE] Exception in {fn_name}: {e}")
                 result   = err_str
                 routings = [FallThrough()]
+                failed   = True
 
         messages.append({
             "role": "tool",
@@ -217,7 +244,7 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
             "name": fn_name,
             "content": result,
         })
-        return result, routings
+        return result, routings, failed
 
     def _build_dispatch_table(self, fn_name, fn_args, mcp_client, messages, progress_cb):
         """Maps tool name -> zero-arg async handler, closing over this call's
@@ -271,7 +298,7 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
 
     async def _handle_send_reply(self, fn_args: dict) -> tuple[str, list[ToolRouting]]:
         msg = fn_args.get("message", "")
-        src = fn_args.get("source", "")
+        src = "" if self.write_succeeded_this_turn else fn_args.get("source", "")
         content = f"{msg.strip()}\n[source: {src.strip()}]" if src and src.strip() else msg
         return content, [FallThrough()]
 
@@ -394,6 +421,37 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
         if self.state.workflow_name == "msight_pipeline":
             return await self._handle_confirm_msight_run()
         return await self._handle_confirm_auto_labeling_run()
+
+    def _check_confirm_gate(self, gate_name: str, *, bypass: bool, summary: str) -> Optional[HardStop]:
+        """Generic consent-gate check, matching the shape both
+        _handle_start_msight_pipeline and auto_labeling's run-confirmation
+        handlers already hand-implement (see CONFIRM_GATES in
+        pipeline_common.py for why this is data-driven rather than one
+        `if` block per workflow). Not yet called by either existing site --
+        scaffolding for a future third gate; see ConfirmGateSpec's docstring.
+        Returns a HardStop to return immediately if confirmation is needed,
+        or None if the caller should proceed."""
+        spec = CONFIRM_GATES[gate_name]
+        substate = getattr(self.state, spec.state_path)
+        if bypass or getattr(substate, spec.confirmed_attr):
+            return None
+        setattr(substate, spec.awaiting_attr, True)
+        if spec.requested_at_attr:
+            setattr(substate, spec.requested_at_attr, time.time())
+        self.state.save()
+        return HardStop(summary)
+
+    def _clear_confirm_gate(self, gate_name: str) -> None:
+        """Reset a gate's confirmed/awaiting/TTL bookkeeping after the gated
+        action has been attempted (success or failure) -- pairs with
+        _check_confirm_gate. See that method's docstring."""
+        spec = CONFIRM_GATES[gate_name]
+        substate = getattr(self.state, spec.state_path)
+        setattr(substate, spec.confirmed_attr, False)
+        setattr(substate, spec.awaiting_attr, False)
+        if spec.requested_at_attr:
+            setattr(substate, spec.requested_at_attr, 0.0)
+        self.state.save()
 
     async def _handle_reset_workflow_state(self, mcp_client) -> tuple[str, list[ToolRouting]]:
         result = unwrap_tool_output(await mcp_client.call_tool("reset_workflow_state", {}))
