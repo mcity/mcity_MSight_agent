@@ -68,6 +68,6 @@ error — that's a remote broker being down, not something this system can
 self-heal.
 
 ## Status looks fine but nothing seems to be happening
-This is a *symptom*, not a specific error — see
-`get_msight_reference(topic="diagnosing_stalled_nodes")` rather than
-treating "no error" as "working."
+This is a *symptom*, not a specific error — call `diagnose_msight_pipeline`
+rather than treating "no error" as "working"; see
+`get_msight_reference(topic="diagnosing_stalled_nodes")` for how to read it.

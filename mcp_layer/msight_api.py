@@ -126,6 +126,11 @@ async def get_status(request: Request):
     return await _call_tool(request, "get_msight_status", {})
 
 
+@app.get("/diagnose")
+async def diagnose(request: Request):
+    return await _call_tool(request, "diagnose_msight_pipeline", {})
+
+
 @app.get("/logs")
 async def get_logs(request: Request, service: Optional[str] = None, tail: int = 200):
     args = {"tail": tail}

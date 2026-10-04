@@ -578,7 +578,24 @@ tools = [
             "type": "function",
             "function": {
                 "name": "get_msight_status",
-                "description": "Report the current state (running/exited/etc.) of each MSight_Vision pipeline container, plus the web viewer URL if reachable.",
+                "description": "Report the current state (running/exited/etc.) of each MSight_Vision pipeline container, plus the web viewer URL if reachable. Includes a `problems` list when nodes are dead or a node's input topic has no publisher. Only says which processes are up, NOT whether data is flowing -- for 'is it working / healthy / actually running' questions, call diagnose_msight_pipeline instead.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "diagnose_msight_pipeline",
+                "description": (
+                    "Find out WHY the pipeline isn't working -- call this first for any 'frozen', "
+                    "'not working', 'no detections', or 'is it actually running' question, before "
+                    "reading logs. Measures live data flow on every topic (takes ~5-10s) and walks "
+                    "the node graph, returning `root_causes` (ranked, upstream-most first, each with "
+                    "evidence and a suggested_fix), `affected` (downstream nodes that are only "
+                    "broken as a consequence -- don't present these as causes), and a one-line "
+                    "`summary`. Works for any topology, including nodes added with add_msight_node. "
+                    "Lead your answer with root_causes[0]; quote its evidence."
+                ),
                 "parameters": {"type": "object", "properties": {}}
             }
         },

@@ -1,57 +1,60 @@
-# Diagnosing a silently-stalled node
+# Diagnosing a pipeline that isn't working
 
-A node can report `status: "RUNNING"` in `get_msight_status` while producing
-nothing at all — the process is alive and heartbeating, but no data is
-actually flowing through it. There is no topic-level "is data flowing" signal
-in this system (MSight_Vision's own topic registry only records that a topic
-exists, never when it was last used) — heartbeat and log recency are the only
-ground truth available, so use both together:
+Start with `diagnose_msight_pipeline`. It measures live data flow on every
+topic (subscribing for up to ~10s) and walks the node graph — publisher →
+topic → subscriber — so it works for any topology, including nodes added with
+`add_msight_node`, not just the fixed demo pipeline.
 
-0. **Before checking any node's health, confirm every stage the symptom
-   depends on is actually present in `get_msight_status`'s `services` list
-   at all.** A missing stage produces the exact same symptom as a stalled
-   one (e.g. "the viewer looks frozen") but with a completely different
-   cause and fix — `remove_msight_node` (called directly, or via the
-   dashboard, which calls the same tool) leaves no error anywhere; the node
-   just silently stops appearing. The nodes upstream and downstream of the
-   gap will keep reporting `RUNNING` with perfectly fresh heartbeats, since
-   they themselves are fine — only checking their status can make a missing
-   middle stage look like a false "everything's healthy" reading. For the
-   demo pipeline specifically, `services` should list all three of
-   `video_source`, `rfdetr_detector`, and `detection_viewer`; if any one of
-   them is absent, that's the entire answer -- `add_msight_node` it back
-   rather than investigating heartbeats on the two that are still there.
+## Reading its output
 
-1. **Check `seconds_since_heartbeat`** (from `get_msight_status`). If this is
-   large relative to what it should be, the process itself is dead or
-   unresponsive — that's not a "stalled" node, that's a crashed one. Check
-   its logs for a crash, then `remove_msight_node` + `add_msight_node` to
-   restart it.
+- `root_causes` — ranked, upstream-most first. Lead with `root_causes[0]`,
+  quote its `evidence`, offer its `suggested_fix`.
+- `affected` — nodes that are broken *only as a consequence* of a root cause.
+  Mention them, but never as causes.
+- `nodes` — per-node `health`, with measured `in_rate_hz` / `out_rate_hz`.
 
-2. **If the heartbeat is fresh, check `seconds_since_last_line`**
-   (per-service) or `log_freshness` (all-services) from `get_msight_logs`.
-   A healthy, actively-processing node logs continuously — RF-DETR detection
-   nodes, for example, log one line per frame processed. If the heartbeat is
-   fresh but the last log line is old and getting older each time you check,
-   the node is alive but stuck — genuinely "alive but not doing its job."
+Per-node `health`:
 
-3. **The single most common real cause of an alive-but-stuck node: a
-   `publish_topic`/`subscribe_topic` mismatch between two nodes that are
-   supposed to be connected.** Pull the full topology with `get_msight_status`
-   and check, for the suspect node and whatever should be feeding it, that
-   the upstream node's `publish_topic` string is byte-for-byte identical to
-   the downstream node's `subscribe_topic` string (a stray sensor-name
-   typo, or a sensor_name that changed on one node but not the other, is
-   enough — Redis pub/sub doesn't error on a topic nobody's publishing to,
-   it just silently delivers nothing).
+| health | meaning |
+|---|---|
+| `DEAD` | process/container not running |
+| `UNREGISTERED` | running, but never appeared in the node registry |
+| `STARVED` | running, but nothing arrives on its input topic — an upstream problem |
+| `STALLED` | getting input (or it's a source), but publishing nothing — this node itself is broken |
+| `OK` | data flowing in and out |
 
-4. If topics genuinely match and the node is still stuck, check whether
-   its actual upstream source is producing anything at all — walk back to
-   the chain's source node (usually `video_source`) and apply the same
-   heartbeat/log-recency check there. A stalled source (e.g. an RTSP stream
-   that dropped) will silently stall everything downstream of it, each of
-   which will otherwise look individually healthy.
+Root-cause kinds also include `MISSING_PUBLISHER` (a node subscribes to a topic
+no registered node publishes — its upstream was removed, crashed and
+deregistered, or never started) and `TOPIC_MISMATCH` (same, but a published
+topic name is a near-match, e.g. a sensor-name typo).
 
-5. Once you've identified the actually-broken node, fix and restart it with
-   `remove_msight_node` + `add_msight_node` (corrected config) rather than
-   restarting the whole pipeline — the other nodes don't need to be touched.
+## Things that will mislead you if you reason from raw fields
+
+- **Heartbeat age is not evidence on its own.** msight_core nodes update their
+  heartbeat every N *messages processed*, not on a timer, so a node starved of
+  input goes stale exactly like a dead one.
+- **Failures cascade.** By default a node with no heartbeat for ~15s marks
+  itself ERROR and kills itself. Kill the detector and the viewer can die ~15–30s
+  later too. The upstream-most failure is the cause; the rest are effects —
+  which is why `root_causes` is ordered by graph position, not by which node
+  you noticed first.
+- **Slow is not stuck.** RF-DETR on some hosts emits one detection every few
+  seconds. The diagnosis waits long enough to see one; don't conclude a topic
+  is dead from a single quick look at logs.
+
+## What it can't see
+
+- A node that crashed *before* registering and was never started through the
+  control plane leaves no trace at all. If the user expected a node that isn't
+  in `nodes`, say so — "it isn't registered" is itself the finding.
+- A source legitimately publishing slower than about one message per 10s
+  (e.g. an idle LiDAR with nothing sending to it) reads as `STALLED`. Check
+  whether that source is actually expected to be producing right now.
+
+## After the root cause is known
+
+Use `get_msight_logs` on the root-cause node for the specific error (most
+useful for `STALLED`), and fix just that node with `remove_msight_node` +
+`add_msight_node` (corrected config) — the healthy nodes don't need touching.
+If the root cause is one of the fixed pipeline's nodes, restarting the
+pipeline is the simpler fix.

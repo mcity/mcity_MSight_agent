@@ -59,7 +59,7 @@ ALWAYS_TOOLS: frozenset[str] = frozenset({
     "send_reply", "send_intro", "switch_workflow", "reset_workflow_state",
     "select_msight_mode",
     "start_msight_pipeline", "stop_msight_pipeline",
-    "get_msight_status", "get_msight_logs",
+    "get_msight_status", "get_msight_logs", "diagnose_msight_pipeline",
     "check_msight_calibration_status",
     "start_msight_recording", "start_msight_archiving",
     "stop_msight_recording", "stop_msight_archiving",

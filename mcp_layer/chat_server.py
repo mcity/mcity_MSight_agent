@@ -282,6 +282,21 @@ def _iteration_tool_choice(
     return tool_choice, force_grounded, iteration_tools
 
 
+async def _chat_with_retry(llm_client, messages, **kwargs):
+    """One retry on a dropped connection/timeout -- matched by exception class
+    name so it works across the openai/anthropic/groq/httpx SDKs. Anything
+    else (bad request, auth) fails immediately."""
+    try:
+        return await llm_client.chat(messages, **kwargs)
+    except Exception as e:
+        name = type(e).__name__
+        if "Connection" not in name and "Timeout" not in name:
+            raise
+        logging.warning(f"[STREAM] LLM call hit {name}: {e} -- retrying once")
+        await asyncio.sleep(1)
+        return await llm_client.chat(messages, **kwargs)
+
+
 def _llm_connection_error_message(exc: Exception) -> str:
     err = str(exc).lower()
     return (
@@ -359,6 +374,24 @@ _DEMO_PIPELINE_NODE_NAMES = ("video_source", "rfdetr_detector", "detection_viewe
 # quietly become a new one.
 _GROUNDING_EXEMPT_TOOLS = frozenset({"send_reply"})
 
+# Diagnose-then-act consent gate: once a turn has run diagnose_msight_pipeline,
+# write tools stay off for the rest of it unless the user's message asked for
+# a change ("the viewer is frozen" reports a symptom; "...fix it" asks).
+_CHANGE_REQUEST_RE = re.compile(
+    r"\b(fix|repair|restart|restore|resolve|recover|relaunch|reset|start|stop|add|"
+    r"remove|delete|re-?add|bring (it )?back|go ahead|do it|yes|yeah|yep|sure|ok|okay)\b",
+    re.IGNORECASE,
+)
+_WRITES_BLOCKED_NOTE = (
+    "WRITES_DISABLED: you ran a diagnosis, but the user described a symptom without "
+    "asking for a change. Report the root cause and its evidence, offer the fix, and "
+    "ask before changing anything -- the pipeline-changing tools are unavailable this turn."
+)
+
+
+def _without_writes(tool_list: list) -> list:
+    return [t for t in tool_list if t["function"]["name"] not in WRITE_TOOLS]
+
 # Default workflow entry (see chat_stream): auto_labeling is the only other
 # top-level-reachable workflow, so a plain keyword check is enough to decide
 # the default without asking the model to remember to do it every session.
@@ -389,17 +422,26 @@ async def _msight_pipeline_running_live() -> bool:
     return await _msight_any_alive(_DEMO_PIPELINE_NODE_NAMES)
 
 
-async def _msight_pipeline_node_status() -> dict[str, bool]:
-    """Per-node liveness for the fixed 3-node pipeline. Unlike
-    _msight_any_alive (which short-circuits on the first alive node --
-    fine for a plain running/not-running check), this always checks all
-    three, so a *partial* pipeline (one node dead, the others fine) is
-    detectable at all."""
-    cp = _control_plane()
+async def _msight_problems_hint() -> str:
+    """Generic graph problems (dead nodes, inputs with no publisher) over every
+    registered node, injected every turn as a blunt fact -- asking the model to
+    spot a node missing from a status list has repeatedly not worked. Cheap:
+    no data-flow sampling (that's diagnose_msight_pipeline)."""
+    msight_path, err = _get_msight_path()
+    if err:
+        return ""
     try:
-        return {name: await cp.is_alive(name) for name in _DEMO_PIPELINE_NODE_NAMES}
+        problems = await _control_plane().structural_check()
     except Exception:
-        return {name: False for name in _DEMO_PIPELINE_NODE_NAMES}
+        return ""
+    if not problems:
+        return ""
+    return (
+        " | PIPELINE_PROBLEMS: " + " ".join(p["evidence"] for p in problems)
+        + " -- this is very likely the cause of any 'frozen'/'not working'/'no detections' "
+        "symptom. Call diagnose_msight_pipeline for the ranked root cause before answering; "
+        "don't report the nodes that ARE running as if everything's fine."
+    )
 
 
 async def _msight_pipeline_state_hint(mp, state=None) -> str:
@@ -422,8 +464,7 @@ async def _msight_pipeline_state_hint(mp, state=None) -> str:
         parts.append(f"sensor_name={mp.sensor_name}")
     recording_active = await _msight_any_alive((MSIGHT_DUMPER_NODE,))
     archiving_active = await _msight_any_alive((MSIGHT_PUSHER_NODE,))
-    node_status = await _msight_pipeline_node_status()
-    pipeline_running = any(node_status.values())
+    pipeline_running = await _msight_pipeline_running_live()
     parts.append(f"recording={'active' if recording_active else 'pending (will auto-start when pipeline starts)' if mp.recording_pending else 'not active'}")
     parts.append(f"archiving={'active' if archiving_active else 'pending (will auto-start when pipeline starts)' if mp.archiving_pending else 'not active'}")
     parts.append(f"pipeline_running={pipeline_running}")
@@ -448,24 +489,7 @@ async def _msight_pipeline_state_hint(mp, state=None) -> str:
 
     checklist = "msight_checklist(" + ", ".join(parts) + ")"
 
-    # Handed to the model as a blunt, precomputed fact rather than left for
-    # it to notice on its own -- asking it to spot a node missing from a
-    # status list (rather than checking heartbeats on the ones that ARE
-    # listed) has repeatedly not worked in practice, including after the
-    # prompt was updated to ask for exactly that. This can't be silently
-    # missed: it's injected into SESSION_STATE every turn, not only when
-    # get_msight_status is actually called.
-    missing = [name for name, alive in node_status.items() if not alive]
-    partial_warning = ""
-    if missing and len(missing) < len(node_status):
-        plural = "s are" if len(missing) > 1 else " is"
-        partial_warning = (
-            f" | PARTIAL_PIPELINE: {', '.join(missing)} node{plural} NOT running, "
-            "even though the pipeline was started and other nodes in it are still "
-            "up. This is very likely the cause of any 'frozen'/'not working'/'no "
-            "detections' symptom -- lead with this, don't just report the nodes "
-            "that ARE running as if that means everything's fine."
-        )
+    partial_warning = await _msight_problems_hint()
 
     if mp.run_awaiting_confirmation and not mp.run_confirmed:
         return checklist + " | " + STATE_HINTS["msight_run_awaiting_confirm"] + partial_warning
@@ -885,6 +909,8 @@ async def chat_stream(request: Request):
             # Not relaxed for later turns -- that's exactly the escape hatch
             # the exclusion otherwise prevents.
             allow_send_reply_on_iteration_0 = early_pipeline is not None
+            change_requested = bool(_CHANGE_REQUEST_RE.search(message))
+            writes_blocked_noted = False
 
             for iteration in range(MAX_AGENTIC_ITERATIONS):
                 tool_choice, force_grounded, iteration_tools = _iteration_tool_choice(
@@ -892,10 +918,11 @@ async def chat_stream(request: Request):
                 )
 
                 try:
-                    assistant_message = await llm_client.chat(
-                        messages, tools=iteration_tools, tool_choice=tool_choice
+                    assistant_message = await _chat_with_retry(
+                        llm_client, messages, tools=iteration_tools, tool_choice=tool_choice
                     )
                 except Exception as e:
+                    logging.warning(f"[STREAM] LLM call failed on iter={iteration}: {type(e).__name__}: {e}")
                     await event_queue.put(("error", {"message": _llm_connection_error_message(e)}))
                     return
 
@@ -962,6 +989,14 @@ async def chat_stream(request: Request):
                     )
 
                 current_tools = filter_tools_for_state(tools, pipeline.state)
+                if not change_requested and any(
+                    r["name"] == "diagnose_msight_pipeline" for r in all_tool_results
+                ):
+                    current_tools = _without_writes(current_tools)
+                    if not writes_blocked_noted:
+                        messages.append({"role": "system", "content": _WRITES_BLOCKED_NOTE})
+                        writes_blocked_noted = True
+                        logging.warning("[STREAM] Diagnosis without a change request -- write tools off for this turn")
 
                 # Rebuild so a workflow change earlier this iteration (e.g.
                 # select_workflow) is reflected for the rest of the turn --

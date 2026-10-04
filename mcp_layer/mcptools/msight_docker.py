@@ -429,21 +429,38 @@ async def get_msight_status(ctx: Context = None) -> str:
     if any(s.get("name") == "detection_viewer" and s.get("alive") for s in services):
         extra["viewer_url"] = f"http://{resolve_host()}:{VIEWER_PORT}"
 
-    # Explicit, precomputed fact rather than something the caller has to
-    # notice on its own -- a node missing entirely from `services` (deleted,
-    # or crashed without deregistering) produces the exact same symptom as a
-    # stalled one, but relying on the reader to spot an absence from a list
-    # of what IS present has repeatedly not worked in practice.
-    fixed_alive = {name: await cp.is_alive(name) for name in FIXED_PIPELINE_NODES}
-    missing = [name for name, alive in fixed_alive.items() if not alive]
-    if missing and len(missing) < len(FIXED_PIPELINE_NODES):
-        extra["missing_pipeline_nodes"] = missing
-        extra["diagnosis"] = (
-            f"{', '.join(missing)} {'is' if len(missing) == 1 else 'are'} NOT running, "
-            "even though other fixed-pipeline nodes are still up. This is very likely "
-            "the cause of any 'frozen'/'not working'/'no detections' symptom."
+    # Explicit, precomputed facts rather than something the caller has to
+    # notice on its own (spotting an absence from a list of what IS present has
+    # repeatedly not worked). Generic graph checks over whatever is registered,
+    # not a fixed list of node names -- cheap, no data-flow sampling; that's
+    # diagnose_msight_pipeline's job.
+    problems = await cp.structural_check()
+    if problems:
+        extra["problems"] = problems
+        extra["next_step"] = (
+            "Call diagnose_msight_pipeline for the ranked root cause -- it also measures "
+            "live data flow, which catches nodes that are running but stuck."
+        )
+    elif any(s.get("alive") for s in services):
+        # "Up" is not "working" -- without this the caller reports a healthy
+        # pipeline off process state alone.
+        extra["data_flow"] = (
+            "NOT MEASURED -- this only shows processes are up. If the user asked whether "
+            "the pipeline is working or healthy, call diagnose_msight_pipeline before answering."
         )
     return ok_json(**extra)
+
+
+@mcp.tool()
+async def diagnose_msight_pipeline(ctx: Context = None) -> str:
+    msight_path, err = _get_msight_path()
+    if err:
+        return error_json(err)
+    try:
+        result = await _control_plane().diagnose()
+    except Exception as e:
+        return error_json(f"Could not diagnose MSight_Vision pipeline: {e}")
+    return ok_json(**result)
 
 
 _LOG_TS_RE = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+')
@@ -451,10 +468,9 @@ _LOG_TS_RE = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+')
 
 def _seconds_since_last_log_line(text: str) -> Optional[int]:
     """msight_core nodes log with a leading `YYYY-MM-DD HH:MM:SS,ms` timestamp
-    (confirmed live: `2026-09-08 14:38:22,397 - ... - INFO :: ...`). Used to
-    tell a genuinely-stuck node (heartbeat green, but nothing logged in a
-    while) apart from one that's just idle between messages -- see
-    prompts/msight_reference/diagnosing_stalled_nodes.md for the heuristic."""
+    (confirmed live: `2026-09-08 14:38:22,397 - ... - INFO :: ...`). Reported
+    alongside logs as a hint only -- diagnose_msight_pipeline's measured topic
+    rates are the authoritative stuck/idle signal."""
     for line in reversed(text.splitlines()):
         m = _LOG_TS_RE.match(line)
         if m:

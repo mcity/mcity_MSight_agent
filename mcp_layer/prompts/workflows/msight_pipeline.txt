@@ -35,7 +35,7 @@ whether they want:
     check what's currently running, read logs, browse what node types exist,
     or diagnose a problem — without starting or restarting anything first.
     list_msight_node_types, add_msight_node, remove_msight_node,
-    get_msight_status, get_msight_logs, and get_msight_reference all work
+    get_msight_status, diagnose_msight_pipeline, get_msight_logs, and get_msight_reference all work
     right now, before any pipeline exists — they are not locked behind
     Demo/custom mode or a running pipeline (full guidance on these tools is
     further below in this file).
@@ -461,33 +461,21 @@ apply — for status/recording/restart requests in Demo, say plainly that's
 only available in "run your own pipeline" and offer the mode switch, same as
 an unprompted source mention):
   - Check status (mode=custom) → call get_msight_status and summarize which
-    containers are running. This now includes non-running ones too
-    (exited/restarting) — if ANY service isn't running, say so plainly as a
-    problem (e.g. "video_source has exited — the pipeline isn't actually
-    receiving frames") rather than just listing it neutrally alongside the
-    healthy ones; the other containers staying up gives no indication
-    anything's wrong, so don't let a partial failure read as "all good."
-    Suggest checking that service's logs (get_msight_logs) next. Before
-    troubleshooting any specific service, first check that the full expected
-    set is even present in `services` at all (video_source, rfdetr_detector,
-    detection_viewer for the fixed pipeline) — a node removed via
-    remove_msight_node (directly, or via the dashboard, which calls the same
-    tool) produces no error anywhere, it just silently stops appearing in
-    this list. The remaining nodes keep reporting RUNNING with fresh
-    heartbeats since they're genuinely fine, so a user-reported symptom like
-    "the viewer is frozen" can look like a healthy status if you only check
-    the services that are still there. A missing stage IS the diagnosis --
-    say so and offer to add it back, don't speculate about rendering/network
-    issues on the nodes that remain.
-  - Check logs / diagnose why detections aren't showing up → call
-    get_msight_logs (optionally with a specific service name: redis,
-    video_source, rfdetr_detector, or detection_viewer). Available in both
-    modes. get_msight_status and get_msight_logs both now include a
-    freshness signal (seconds_since_heartbeat / seconds_since_last_line) —
-    a node can look RUNNING while silently producing nothing. If status and
-    logs alone don't explain what's wrong, call
-    get_msight_reference(topic="diagnosing_stalled_nodes") before guessing,
-    and get_msight_reference(topic="common_failure_modes") for an unfamiliar
+    nodes are running. If it returns a `problems` list, lead with those --
+    don't let the nodes that are still up read as "all good."
+  - Anything is frozen / not working / showing no detections / "is it
+    actually running?" (both modes) → call diagnose_msight_pipeline FIRST,
+    before logs or guesses. It measures live data flow and walks the node
+    graph, so it works for any topology, including added nodes. Lead your
+    reply with root_causes[0] (quote its evidence, offer its suggested_fix);
+    mention `affected` nodes only as consequences, never as causes. Heartbeat
+    age alone is not evidence of anything here -- msight_core nodes only
+    heartbeat when messages flow, so a starved node looks exactly like a dead
+    one; trust the diagnosis instead.
+  - Check logs → call get_msight_logs (optionally with a specific service
+    name). Use it to dig into a root cause diagnose_msight_pipeline already
+    identified (e.g. why a STALLED node isn't publishing), and
+    get_msight_reference(topic="common_failure_modes") for an unfamiliar
     error message.
   - Add or reconfigure a node beyond the fixed pipeline/record/archive set
     (a second camera, an alternate sink, swapping a sensor without

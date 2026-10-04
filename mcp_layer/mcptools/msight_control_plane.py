@@ -60,6 +60,217 @@ class _TrackedNode:
     invocation: str
 
 
+def _topic_list(value) -> list[str]:
+    """msight_core registers publish_topic as a string, a list, or null."""
+    if not value:
+        return []
+    return [value] if isinstance(value, str) else [t for t in value if t]
+
+
+_BROKEN = {"DEAD", "STALLED", "UNREGISTERED"}
+
+
+def _publishers(rows: list[dict]) -> dict[str, list[dict]]:
+    by_topic: dict[str, list[dict]] = {}
+    for r in rows:
+        for t in r.get("publish_topics", []):
+            by_topic.setdefault(t, []).append(r)
+    return by_topic
+
+
+def structural_findings(rows: list[dict]) -> list[dict]:
+    """Cheap graph checks -- registry topics + liveness only, no rate probe,
+    so safe to run on every status call. rows need name, alive,
+    publish_topics, subscribe_topics.
+
+    DEAD               a registered/tracked node isn't running
+    MISSING_PUBLISHER  a running node subscribes to a topic no registered node
+                       publishes (upstream removed, crashed and deregistered,
+                       or never started) -- this is how a node deleted from the
+                       middle of a pipeline shows up, without knowing its name
+    TOPIC_MISMATCH     same, but a published topic name is a near-match
+    """
+    import difflib
+    pubs = _publishers(rows)
+    findings = []
+    for r in rows:
+        if not r["alive"]:
+            findings.append({
+                "kind": "DEAD", "node": r["name"],
+                "evidence": f"'{r['name']}' is registered/tracked but its process/container is not running.",
+            })
+    for r in rows:
+        if not r["alive"]:
+            continue
+        for t in r.get("subscribe_topics", []):
+            if pubs.get(t):
+                continue  # has a publisher (alive or dead -- a dead one is its own finding)
+            close = difflib.get_close_matches(t, list(pubs), n=1, cutoff=0.75)
+            if close:
+                findings.append({
+                    "kind": "TOPIC_MISMATCH", "node": r["name"], "topic": t,
+                    "evidence": (f"'{r['name']}' subscribes to '{t}', which nothing publishes; "
+                                 f"the closest published topic is '{close[0]}'."),
+                })
+            else:
+                findings.append({
+                    "kind": "MISSING_PUBLISHER", "node": r["name"], "topic": t,
+                    "evidence": (f"'{r['name']}' subscribes to '{t}', but no registered node publishes "
+                                 "it -- its upstream node was removed, crashed and deregistered, "
+                                 "or was never started."),
+                })
+    return findings
+
+
+# User-facing wording -- no tool names (base_prompt.txt forbids showing them);
+# the model maps these to the right tool calls itself.
+_FIXES = {
+    "DEAD": "Restart that node with the same settings (or restart the whole pipeline "
+            "if it's one of the standard pipeline's nodes).",
+    "STALLED": "It's receiving input but producing nothing -- check its logs for an error, "
+               "then restart it.",
+    "UNREGISTERED": "It's running but never finished registering -- check its logs, and "
+                    "restart it if it's stuck starting up.",
+    "MISSING_PUBLISHER": "Add back the node that should publish this topic, or restart the "
+                         "pipeline if it was one of the standard pipeline's nodes.",
+    "TOPIC_MISMATCH": "Remove that node and add it back with the corrected input topic.",
+}
+
+
+def diagnose_from_health(rows: list[dict]) -> dict:
+    """Ranked root causes vs downstream effects, from node_health() rows.
+
+    A broken node only counts as a root cause if nothing upstream of it is
+    also broken -- msight_core nodes kill themselves after ~15s without input,
+    so one failure cascades, and the downstream deaths are effects, not causes.
+    STARVED nodes are always effects; each is attributed to the first broken
+    node found walking upstream from it (or to its missing publisher)."""
+    if not rows:
+        return {"verdict": "empty", "summary": "No MSight nodes are registered or tracked.",
+                "root_causes": [], "affected": [], "nodes": []}
+
+    by_name = {r["name"]: r for r in rows}
+    pubs = _publishers(rows)
+
+    def upstream_broken(r: dict, seen: set) -> Optional[str]:
+        for t in r.get("subscribe_topics", []):
+            for p in pubs.get(t, []):
+                if p["name"] in seen:
+                    continue
+                seen.add(p["name"])
+                deeper = upstream_broken(p, seen)
+                if deeper:
+                    return deeper
+                if p["health"] in _BROKEN:
+                    return p["name"]
+        return None
+
+    def depth(r: dict, seen: set) -> int:
+        ups = [p for t in r.get("subscribe_topics", []) for p in pubs.get(t, []) if p["name"] not in seen]
+        return 0 if not ups else 1 + max(depth(p, seen | {p["name"]}) for p in ups)
+
+    root_causes, affected = [], []
+    for r in rows:
+        if r["health"] in _BROKEN:
+            culprit = upstream_broken(r, {r["name"]})
+            if culprit:
+                affected.append({"node": r["name"], "health": r["health"], "caused_by": culprit})
+            else:
+                evidence = {
+                    "DEAD": f"'{r['name']}' is not running.",
+                    "UNREGISTERED": f"'{r['name']}' is running but missing from the node registry.",
+                    "STALLED": (f"'{r['name']}' is running and receiving "
+                                f"{r['in_rate_hz'] if r['in_rate_hz'] is not None else 'n/a (source)'} msg/s, "
+                                "but published nothing during the sample."),
+                }[r["health"]]
+                root_causes.append({"kind": r["health"], "node": r["name"], "evidence": evidence,
+                                    "_depth": depth(r, {r["name"]})})
+
+    for f in structural_findings(rows):
+        if f["kind"] in ("MISSING_PUBLISHER", "TOPIC_MISMATCH"):
+            root_causes.append({**f, "_depth": depth(by_name[f["node"]], {f["node"]})})
+
+    for r in rows:
+        if r["health"] != "STARVED":
+            continue
+        culprit = upstream_broken(r, {r["name"]})
+        if not culprit:
+            if any(c["node"] == r["name"] for c in root_causes):
+                continue  # its own missing/mismatched publisher is already the root cause
+            culprit = "unknown -- see nodes"
+        affected.append({"node": r["name"], "health": "STARVED", "caused_by": culprit})
+
+    root_causes.sort(key=lambda c: c.pop("_depth"))
+    for c in root_causes:
+        c["suggested_fix"] = _FIXES[c["kind"]]
+
+    if not root_causes and not affected:
+        summary = f"All {len(rows)} nodes are running and data is flowing."
+    elif root_causes:
+        top = root_causes[0]
+        summary = f"Most likely root cause: {top['evidence']}"
+        if affected:
+            summary += (f" {len(affected)} downstream node(s) are affected as a consequence: "
+                        f"{', '.join(a['node'] for a in affected)}.")
+    else:
+        summary = "Some nodes are starved of input but no root cause was identified -- see nodes."
+
+    return {
+        "verdict": "healthy" if not root_causes and not affected else "degraded",
+        "summary": summary,
+        "root_causes": root_causes,
+        "affected": affected,
+        "nodes": rows,
+    }
+
+
+def _sample_topic_rates(topics: list[str], max_window: float) -> dict[str, dict]:
+    """Per-topic message count and rate, measured by subscribing (the
+    `ros2 topic hz` approach). msight_core's Redis backend publishes on a
+    channel named exactly the topic string. Own client, decode_responses=False:
+    payloads are binary frames/detections, not text.
+
+    Adaptive window: stops as soon as every topic has delivered a message, else
+    at max_window. A fixed short window misreads slow-but-healthy topics as
+    silent -- RF-DETR on this host emits one detection every ~4.5s, so a 2s
+    window flapped between 0 and 1 messages (confirmed live). max_window must
+    exceed the slowest healthy interval."""
+    import time
+    import redis
+    if not topics:
+        return {}
+    client = redis.Redis(
+        host=os.environ.get("MSIGHT_REDIS_MESSAGE_BROKER_HOST", "localhost"),
+        port=int(os.environ.get("MSIGHT_REDIS_MESSAGE_BROKER_PORT", 6379)),
+        db=int(os.environ.get("MSIGHT_REDIS_MESSAGE_BROKER_DB", 0)),
+    )
+    pubsub = client.pubsub(ignore_subscribe_messages=True)
+    counts = dict.fromkeys(topics, 0)
+    start = time.monotonic()
+    try:
+        pubsub.subscribe(*topics)
+        deadline = start + max_window
+        while (remaining := deadline - time.monotonic()) > 0:
+            msg = pubsub.get_message(timeout=remaining)
+            if msg and msg["type"] == "message":
+                channel = msg["channel"].decode(errors="replace")
+                if channel in counts:
+                    counts[channel] += 1
+                    if all(counts.values()):
+                        # Keep listening to at least 1s so an early lucky
+                        # message doesn't yield a wildly inflated rate (saw
+                        # 11 Hz from 0.1s for a 0.2 Hz topic).
+                        deadline = min(deadline, max(start + 1.0, time.monotonic()))
+    finally:
+        pubsub.close()
+        client.close()
+    elapsed = max(time.monotonic() - start, 1e-6)
+    return {
+        t: {"messages": c, "rate_hz": round(c / elapsed, 2), "window_s": round(elapsed, 1)}
+        for t, c in counts.items()
+    }
+
+
 class MSightControlPlane:
     def __init__(self):
         self._nodes: dict[str, _TrackedNode] = {}
@@ -249,6 +460,85 @@ class MSightControlPlane:
                 parsed = {"raw": value}
             nodes.append({"name": name, **parsed})
         return sorted(nodes, key=lambda n: n["name"])
+
+    async def node_health(self, max_window: float = 10.0) -> list[dict]:
+        """One health verdict per node, from real liveness plus measured topic
+        rates rather than heartbeats alone. msight_core only heartbeats every N
+        *messages*, so a starved downstream node goes stale exactly like a dead
+        one -- and with its default action_on_error="stop" it then kills itself,
+        cascading one failure down the pipeline. Rates tell the two apart:
+
+          DEAD          process/container not running
+          UNREGISTERED  running, but missing from the Redis registry
+          STARVED       running, but nothing arrives on its input topic
+                        (an upstream problem -- a symptom, not the cause)
+          STALLED       input arriving (or it's a source), but it publishes nothing
+                        (this node itself is broken)
+          OK            otherwise
+        """
+        import time
+        registry = {n["name"]: n for n in self.get_status()}
+        names = sorted(set(registry) | set(self._nodes))
+
+        topics: set[str] = set()
+        for info in registry.values():
+            topics.update(_topic_list(info.get("publish_topic")))
+            topics.update(_topic_list(info.get("subscribe_topic")))
+        samples = await asyncio.to_thread(_sample_topic_rates, sorted(topics), max_window)
+
+        def _sum(topic_names: list[str], key: str):
+            if not topic_names:
+                return None
+            return round(sum(samples.get(t, {}).get(key, 0) for t in topic_names), 2)
+
+        now = time.time()
+        out = []
+        for name in names:
+            info = registry.get(name)
+            alive = await self.is_alive(name)
+            pub = _topic_list(info.get("publish_topic")) if info else []
+            sub = _topic_list(info.get("subscribe_topic")) if info else []
+            in_msgs, out_msgs = _sum(sub, "messages"), _sum(pub, "messages")
+
+            if not alive:
+                health = "DEAD"
+            elif info is None:
+                health = "UNREGISTERED"
+            elif sub and in_msgs == 0:
+                health = "STARVED"
+            elif pub and out_msgs == 0:
+                health = "STALLED"
+            else:
+                health = "OK"
+
+            hb = info.get("last_heartbeat") if info else None
+            out.append({
+                "name": name,
+                "health": health,
+                "alive": alive,
+                "self_reported_status": info.get("status") if info else None,
+                "publish_topics": pub,
+                "subscribe_topics": sub,
+                "in_rate_hz": _sum(sub, "rate_hz"),
+                "out_rate_hz": _sum(pub, "rate_hz"),
+                "seconds_since_heartbeat": max(0, int(now - hb)) if isinstance(hb, (int, float)) else None,
+            })
+        return out
+
+    async def diagnose(self, max_window: float = 10.0) -> dict:
+        return diagnose_from_health(await self.node_health(max_window))
+
+    async def structural_check(self) -> list[dict]:
+        """Cheap (no rate probe) -- registry topics + real liveness only."""
+        rows = []
+        for info in self.get_status():
+            rows.append({
+                "name": info["name"],
+                "alive": await self.is_alive(info["name"]),
+                "publish_topics": _topic_list(info.get("publish_topic")),
+                "subscribe_topics": _topic_list(info.get("subscribe_topic")),
+            })
+        return structural_findings(rows)
 
     async def get_logs(self, name: str, tail: int = 200) -> str:
         tracked = self._nodes.get(name)
