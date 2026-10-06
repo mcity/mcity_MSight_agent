@@ -1,4 +1,3 @@
-import os
 import re
 import time
 import hashlib
@@ -14,6 +13,7 @@ from fastmcp import Context
 
 from mcp_layer.mcptools import mcp
 from mcp_layer.mcptools.mcp_json import error_json, ok_json
+from mcp_layer.mcptools.msight.paths import get_msight_path
 from mcp_layer.mcptools.msight.control_plane import MSightControlPlane
 from mcp_layer.mcptools.msight.executors import has_gpu
 from mcp_layer.host_utils import resolve_host
@@ -39,16 +39,7 @@ _REDIS_PORT_ERR_RE = re.compile(r'Failed listening on port 6379|dependency redis
 
 
 def _get_msight_path() -> tuple[Optional[Path], Optional[str]]:
-    load_dotenv(override=True)
-    raw = os.environ.get("MSIGHT_VISION_PATH")
-    if not raw:
-        return None, "MSIGHT_VISION_PATH is not set in .env."
-    path = Path(raw)
-    if not path.is_dir():
-        return None, f"MSIGHT_VISION_PATH ('{path}') does not exist or is not a directory."
-    if not (path / "docker-compose.yml").is_file():
-        return None, f"MSIGHT_VISION_PATH ('{path}') does not contain a docker-compose.yml."
-    return path, None
+    return get_msight_path()
 
 
 def _sha256(path: Path) -> Optional[str]:

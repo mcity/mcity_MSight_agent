@@ -371,6 +371,7 @@ git add .gitmodules $(git submodule foreach --quiet 'echo $name')
 │  │   │   ├── label_studio_export.py
 │  │   │   └── v51.py           # Voxel51 integration
 │  │   └── msight/              # MSight pipeline workflow
+│  │       ├── paths.py         # The single MSIGHT_VISION_PATH lookup
 │  │       ├── control_plane.py # Owns tracked nodes; status from Redis MSIGHT:NODES
 │  │       ├── executors.py     # Docker / supervisor execution backends
 │  │       ├── node_catalog.py  # Data-driven msight_core node specs

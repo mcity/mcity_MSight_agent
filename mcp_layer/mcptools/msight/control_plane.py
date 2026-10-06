@@ -11,8 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from dotenv import load_dotenv
 
+from mcp_layer.mcptools.msight.paths import get_msight_path
 from mcp_layer.mcptools.msight.node_catalog import NODE_CATALOG, resolve_cmd
 from mcp_layer.mcptools.msight.executors import (
     DockerHandle, Executor, ExecutorHandle, recover_supervisor_handle, resolve_executor,
@@ -23,13 +23,9 @@ _URL_SCHEMES = ("rtsp://", "rtsps://", "http://", "https://", "rtmp://")
 
 
 def _resolve_msight_path() -> Path:
-    load_dotenv(override=True)
-    raw = os.environ.get("MSIGHT_VISION_PATH")
-    if not raw:
-        raise RuntimeError("MSIGHT_VISION_PATH is not set in .env.")
-    path = Path(raw)
-    if not path.is_dir():
-        raise RuntimeError(f"MSIGHT_VISION_PATH ('{path}') does not exist or is not a directory.")
+    path, err = get_msight_path(require_compose=False)
+    if err:
+        raise RuntimeError(err)
     return path
 
 
