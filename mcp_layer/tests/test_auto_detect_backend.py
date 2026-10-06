@@ -2,8 +2,8 @@
 import asyncio
 from unittest.mock import MagicMock, patch
 
-from chat_pipeline import ChatPipeline
-from validate_workflow_state import (
+from mcp_layer.chat_pipeline import ChatPipeline
+from mcp_layer.validate_workflow_state import (
     AutoLabelingState, LabelingBackend, WorkflowState,
 )
 
@@ -21,7 +21,7 @@ def detect(cvat_token: str = "", ls_token: str = "") -> dict | None:
     """Run _auto_detect_backend with controlled env vars, return the result."""
     pipeline = make_pipeline()
     env = {"CVAT_ACCESS_TOKEN": cvat_token, "LS_TOKEN": ls_token}
-    with patch("pipeline_handlers.auto_labeling.os.getenv", side_effect=lambda key, default="": env.get(key, default)):
+    with patch("mcp_layer.pipeline_handlers.auto_labeling.os.getenv", side_effect=lambda key, default="": env.get(key, default)):
         with patch.object(WorkflowState, "save"):
             return pipeline, asyncio.run(pipeline._auto_detect_backend(mcp_client=MagicMock()))
 
@@ -88,7 +88,7 @@ def test_auto_detect_backend_both():
 def test_auto_detect_backend_writes_state_for_ls():
     pipeline = make_pipeline()
     env = {"CVAT_ACCESS_TOKEN": "", "LS_TOKEN": "tok"}
-    with patch("pipeline_handlers.auto_labeling.os.getenv", side_effect=lambda key, default="": env.get(key, default)):
+    with patch("mcp_layer.pipeline_handlers.auto_labeling.os.getenv", side_effect=lambda key, default="": env.get(key, default)):
         with patch.object(WorkflowState, "save") as mock_save:
             asyncio.run(pipeline._auto_detect_backend(mcp_client=MagicMock()))
     assert pipeline.state.auto_labeling.labeling_backend == LabelingBackend.LABEL_STUDIO
@@ -98,7 +98,7 @@ def test_auto_detect_backend_writes_state_for_ls():
 def test_auto_detect_backend_does_not_write_state_for_none():
     pipeline = make_pipeline()
     env = {"CVAT_ACCESS_TOKEN": "", "LS_TOKEN": ""}
-    with patch("pipeline_handlers.auto_labeling.os.getenv", side_effect=lambda key, default="": env.get(key, default)):
+    with patch("mcp_layer.pipeline_handlers.auto_labeling.os.getenv", side_effect=lambda key, default="": env.get(key, default)):
         with patch.object(WorkflowState, "save") as mock_save:
             asyncio.run(pipeline._auto_detect_backend(mcp_client=MagicMock()))
     assert pipeline.state.auto_labeling.labeling_backend == ""

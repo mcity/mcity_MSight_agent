@@ -13,7 +13,7 @@ import fiftyone as fo
 import fiftyone.types as fot
 from cvat_sdk import make_client
 from cvat_sdk.api_client.model.data_request import DataRequest
-from mcptools import mcp
+from mcp_layer.mcptools import mcp
 
 load_dotenv()
 

@@ -3,14 +3,14 @@ import json
 import logging
 import time
 
-from host_utils import resolve_host
-from mcptools.msight.docker import (
+from mcp_layer.host_utils import resolve_host
+from mcp_layer.mcptools.msight.docker import (
     _calibration_status, _get_msight_path, _reset_calibration_to_default,
     calibration_state_label,
 )
-from pipeline_common import Sentinels, HardStop, Injection, FallThrough, ToolRouting, unwrap_tool_output
-from progress_relay import clear_active_progress_cb, set_active_progress_cb
-from validate_workflow_state import MsightPipelineState
+from mcp_layer.pipeline_common import Sentinels, HardStop, Injection, FallThrough, ToolRouting, unwrap_tool_output
+from mcp_layer.progress_relay import clear_active_progress_cb, set_active_progress_cb
+from mcp_layer.validate_workflow_state import MsightPipelineState
 
 
 class MsightPipelineHandlers:

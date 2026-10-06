@@ -4,8 +4,8 @@ WorkflowState.save is patched on the class (extra="forbid" blocks instance mocks
 """
 from unittest.mock import MagicMock, patch
 
-from chat_pipeline import ChatPipeline, HardStop
-from validate_workflow_state import WorkflowState, AutoLabelingState
+from mcp_layer.chat_pipeline import ChatPipeline, HardStop
+from mcp_layer.validate_workflow_state import WorkflowState, AutoLabelingState
 
 
 def make_pipeline():

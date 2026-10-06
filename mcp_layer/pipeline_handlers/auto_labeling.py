@@ -7,11 +7,11 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from pipeline_common import (
+from mcp_layer.pipeline_common import (
     MAIN_PATH, Sentinels, HardStop, Injection, FallThrough, ToolRouting,
     unwrap_tool_output, _ANSI_RE,
 )
-from validate_workflow_state import AutoLabelingState, LabelingBackend, AutoLabelingPhase, LabelingPath
+from mcp_layer.validate_workflow_state import AutoLabelingState, LabelingBackend, AutoLabelingPhase, LabelingPath
 
 
 class AutoLabelingHandlers:

@@ -1,8 +1,8 @@
 """ChatPipeline._orchestrate(): Injections appended in order, last HardStop wins."""
 from unittest.mock import MagicMock
 
-from chat_pipeline import ChatPipeline, Injection, HardStop, FallThrough
-from validate_workflow_state import WorkflowState
+from mcp_layer.chat_pipeline import ChatPipeline, Injection, HardStop, FallThrough
+from mcp_layer.validate_workflow_state import WorkflowState
 
 
 def make_pipeline(dataset_confirmed=False):

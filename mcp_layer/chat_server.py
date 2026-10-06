@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import re
-import sys
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -15,21 +14,19 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastmcp import Client
 from fastmcp.client.transports import SSETransport
 
-sys.path.append(os.path.dirname(__file__))
-
 logging.basicConfig(
     level=logging.WARNING,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
-from chat_pipeline import ChatPipeline
-from host_utils import is_cloud_deployment, resolve_host
-from llm_clients import ClaudeClient, GeminiClient, GroqClient, OpenAIClient
-from mcptools.msight.docker import (
+from mcp_layer.chat_pipeline import ChatPipeline
+from mcp_layer.host_utils import is_cloud_deployment, resolve_host
+from mcp_layer.llm_clients import ClaudeClient, GeminiClient, GroqClient, OpenAIClient
+from mcp_layer.mcptools.msight.docker import (
     CALIBRATION_INTRINSICS_REL, CALIBRATION_LOCMAP_REL,
     _calibration_status, _control_plane, _get_msight_path, calibration_state_label,
 )
-from mcptools.msight.record_archive import (
+from mcp_layer.mcptools.msight.record_archive import (
     DEFAULT_SENSOR_NAME as MSIGHT_DEFAULT_SENSOR_NAME,
     DOWNLOAD_DIR as MSIGHT_DOWNLOAD_DIR,
     DUMPER_NODE as MSIGHT_DUMPER_NODE,
@@ -37,10 +34,10 @@ from mcptools.msight.record_archive import (
     _active_sensor_name,
     recording_segment_status,
 )
-from pipeline_common import WRITE_TOOLS
-from progress_relay import get_active_progress_cb
-from tool_schema import tools
-from validate_workflow_state import (
+from mcp_layer.pipeline_common import WRITE_TOOLS
+from mcp_layer.progress_relay import get_active_progress_cb
+from mcp_layer.tool_schema import tools
+from mcp_layer.validate_workflow_state import (
     LabelingBackend, AutoLabelingPhase, LabelingPath, WorkflowState, WORKFLOW_SPECS,
 )
 
@@ -94,8 +91,7 @@ def get_llm_client(app: FastAPI, requested: str):
 def _reset_state_on_startup() -> None:
     """Reset persisted state on startup so each server launch begins clean."""
     try:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-        from validate_workflow_state import WorkflowState
+        from mcp_layer.validate_workflow_state import WorkflowState
         WorkflowState().save()
         logging.warning("[STARTUP] Reset WORKFLOW_STATE to defaults.")
     except Exception as e:

@@ -12,11 +12,11 @@ from typing import Optional
 from dotenv import load_dotenv
 from fastmcp import Context
 
-from mcptools import mcp
-from mcptools.mcp_json import error_json, ok_json
-from mcptools.msight.control_plane import MSightControlPlane
-from mcptools.msight.executors import has_gpu
-from host_utils import resolve_host
+from mcp_layer.mcptools import mcp
+from mcp_layer.mcptools.mcp_json import error_json, ok_json
+from mcp_layer.mcptools.msight.control_plane import MSightControlPlane
+from mcp_layer.mcptools.msight.executors import has_gpu
+from mcp_layer.host_utils import resolve_host
 
 load_dotenv()
 

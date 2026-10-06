@@ -3,7 +3,7 @@ import asyncio
 
 import pytest
 
-from chat_server import _CHANGE_REQUEST_RE, _chat_with_retry, _without_writes
+from mcp_layer.chat_server import _CHANGE_REQUEST_RE, _chat_with_retry, _without_writes
 
 
 @pytest.mark.parametrize("message", [

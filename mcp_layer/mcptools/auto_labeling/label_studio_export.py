@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 import fiftyone as fo
 from label_studio_sdk import LabelStudio
-from mcptools import mcp
+from mcp_layer.mcptools import mcp
 
 load_dotenv()
 

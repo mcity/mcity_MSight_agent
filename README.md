@@ -178,10 +178,11 @@ MSIGHT_DEMO_VIDEO_PATH=/path/to/a/demo/video/or/folder
 ```
 
 **Launch the Agentic Interface:**
-Start all four components one after the other in separate terminals:
+Start all five components one after the other in separate terminals:
 ```
+# Run from the repo root; mcp_layer is a package.
 # Terminal 1: MCP Tool Server (port 8000)
-python mcp_layer/mcp_server.py
+python -m mcp_layer.mcp_server
 
 # Terminal 2: Chat Server (port 8001)
 uvicorn mcp_layer.chat_server:app --port 8001 --reload
@@ -190,7 +191,10 @@ uvicorn mcp_layer.chat_server:app --port 8001 --reload
 uvicorn mcp_layer.ingest_server:app --host 0.0.0.0 --port 8002 --reload
 
 # Terminal 4: Launch Web UI (port 5225)
-python mcp_layer/client_chat.py --ui
+python -m mcp_layer.client_chat --ui
+
+# Terminal 5: MSight REST API + dashboard (port 8003)
+python -m mcp_layer.msight_api
 ```
 
 The web interface will open automatically at http://localhost:5225.

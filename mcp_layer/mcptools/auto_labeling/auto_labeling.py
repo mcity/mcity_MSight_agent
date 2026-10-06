@@ -1,4 +1,4 @@
-from mcptools import mcp  #shared instance from __init__.py
+from mcp_layer.mcptools import mcp  #shared instance from __init__.py
 import re
 import asyncio
 import sys

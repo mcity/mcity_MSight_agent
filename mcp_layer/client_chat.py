@@ -9,7 +9,7 @@ from socketserver import TCPServer
 import requests
 from dotenv import load_dotenv
 
-from host_utils import resolve_host
+from mcp_layer.host_utils import resolve_host
 
 load_dotenv()
 

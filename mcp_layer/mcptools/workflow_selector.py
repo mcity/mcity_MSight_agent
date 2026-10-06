@@ -1,7 +1,5 @@
 import logging
 import re
-import sys
-import os
 from pathlib import Path
 from typing import List
 
@@ -9,10 +7,8 @@ import fiftyone as fo
 import fiftyone.core.odm as _foodm
 from ruamel.yaml import YAML
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))  # project root
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))       # mcp_layer/
 from utils.dataset_loader import load_dataset
-from mcptools import mcp
+from mcp_layer.mcptools import mcp
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 CONFIG_PATH = ROOT_DIR / "config" / "config.py"
@@ -165,7 +161,7 @@ def reset_workflow_state() -> str:
     allowing the user to start a new workflow.
     """
     # Reset WORKFLOW_STATE via WorkflowState — typed, validated, correct schema
-    from validate_workflow_state import WorkflowState
+    from mcp_layer.validate_workflow_state import WorkflowState
     WorkflowState.reset()
 
     # Reset SELECTED_WORKFLOW and SELECTED_DATASET via line replacement

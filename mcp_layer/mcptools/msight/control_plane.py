@@ -13,8 +13,8 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-from mcptools.msight.node_catalog import NODE_CATALOG, resolve_cmd
-from mcptools.msight.executors import (
+from mcp_layer.mcptools.msight.node_catalog import NODE_CATALOG, resolve_cmd
+from mcp_layer.mcptools.msight.executors import (
     DockerHandle, Executor, ExecutorHandle, recover_supervisor_handle, resolve_executor,
 )
 

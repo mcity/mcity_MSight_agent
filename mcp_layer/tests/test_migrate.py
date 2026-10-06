@@ -1,5 +1,5 @@
 """WorkflowState._migrate(): old WORKFLOW_STATE shapes migrate without data loss."""
-from validate_workflow_state import WorkflowState
+from mcp_layer.validate_workflow_state import WorkflowState
 
 
 def migrate(raw: dict) -> dict:

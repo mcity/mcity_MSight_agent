@@ -1,8 +1,8 @@
 """filter_tools_for_state(): filters by valid_tool_names(), fails open otherwise."""
 from unittest.mock import MagicMock
 
-from chat_server import filter_tools_for_state
-from validate_workflow_state import WorkflowState
+from mcp_layer.chat_server import filter_tools_for_state
+from mcp_layer.validate_workflow_state import WorkflowState
 
 
 def _tool(name: str) -> dict:

@@ -1,6 +1,6 @@
 # mcptools/auto_labeling/data_ingest.py
-from mcptools import mcp
-from mcptools.mcp_json import error_json
+from mcp_layer.mcptools import mcp
+from mcp_layer.mcptools.mcp_json import error_json
 import asyncio
 import json
 import logging
@@ -29,7 +29,6 @@ async def _emit(maybe_emit: Optional[EmitFn], payload: dict):
         await mcp.yield_event(payload)
 
 # Paths
-sys.path.append(str(ROOT_DIR))
 CONFIG_PATH = ROOT_DIR / "config" / "config.py"
 MAIN_PATH = ROOT_DIR / "main.py"
 LOG_DIR = ROOT_DIR / "output" / "logs"
@@ -233,7 +232,7 @@ async def _run_data_ingest_streaming_core(
         if final_rc == 0:
             # Ingestion runs outside chat, so confirm the dataset here.
             try:
-                from validate_workflow_state import WorkflowState
+                from mcp_layer.validate_workflow_state import WorkflowState
                 state = WorkflowState.load()
                 state.dataset_name = ds_name
                 state.dataset_confirmed = True
@@ -363,7 +362,7 @@ async def run_data_ingest_tool(
 
         if rc == 0:
             try:
-                from validate_workflow_state import WorkflowState
+                from mcp_layer.validate_workflow_state import WorkflowState
                 state = WorkflowState.load()
                 state.dataset_name = name
                 state.dataset_confirmed = True

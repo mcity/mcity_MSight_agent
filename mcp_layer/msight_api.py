@@ -6,8 +6,6 @@ lives in mcp_server.py's process, and a second MSightControlPlane here would div
 import asyncio
 import json
 import logging
-import os
-import sys
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -20,14 +18,12 @@ from fastapi.staticfiles import StaticFiles
 from fastmcp import Client
 from fastmcp.client.transports import SSETransport
 
-sys.path.append(os.path.dirname(__file__))
-
 logging.basicConfig(
     level=logging.WARNING,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
-from host_utils import resolve_host
+from mcp_layer.host_utils import resolve_host
 
 
 @asynccontextmanager

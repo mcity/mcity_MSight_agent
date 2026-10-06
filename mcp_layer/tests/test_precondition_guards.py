@@ -1,5 +1,5 @@
 """auto_labeling can_* guards: (False, error) when blocked, (True, "") when met."""
-from validate_workflow_state import WorkflowState, AutoLabelingState
+from mcp_layer.validate_workflow_state import WorkflowState, AutoLabelingState
 
 
 # WorkflowState.can_confirm_dataset

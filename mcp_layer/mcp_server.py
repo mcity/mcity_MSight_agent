@@ -1,16 +1,16 @@
 # Tool modules are imported only to register their @mcp.tool() functions.
-from mcptools import (  # noqa: F401
+from mcp_layer.mcptools import (  # noqa: F401
     mcp,
     workflow_selector,
 )
-from mcptools.auto_labeling import (  # noqa: F401
+from mcp_layer.mcptools.auto_labeling import (  # noqa: F401
     auto_labeling,
     cvat_export,
     data_ingest,
     label_studio_export,
     v51,
 )
-from mcptools.msight import (  # noqa: F401
+from mcp_layer.mcptools.msight import (  # noqa: F401
     docker,
     nodes,
     record_archive,

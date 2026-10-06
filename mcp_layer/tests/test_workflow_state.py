@@ -1,6 +1,6 @@
 """valid_tool_names() and auto_labeling tool filtering (pure, no config.py I/O)."""
 import pytest
-from validate_workflow_state import (
+from mcp_layer.validate_workflow_state import (
     WorkflowState, AutoLabelingState, LabelingBackend, AutoLabelingPhase,
     WORKFLOW_SPECS, ALWAYS_TOOLS as ALWAYS,
 )

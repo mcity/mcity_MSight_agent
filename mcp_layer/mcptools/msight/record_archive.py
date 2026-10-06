@@ -15,9 +15,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from mcptools import mcp
-from mcptools.mcp_json import error_json, ok_json
-from mcptools.msight.docker import _control_plane, _get_msight_path
+from mcp_layer.mcptools import mcp
+from mcp_layer.mcptools.mcp_json import error_json, ok_json
+from mcp_layer.mcptools.msight.docker import _control_plane, _get_msight_path
 
 # Sensor of the latest recording session, so stop can find its segments.
 _LAST_RECORDING_SENSOR: Optional[str] = None

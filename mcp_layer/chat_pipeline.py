@@ -3,13 +3,13 @@ import logging
 
 from fastmcp import Client
 
-from pipeline_common import (
+from mcp_layer.pipeline_common import (
     Sentinels, HardStop, Injection, FallThrough, ToolRouting, WRITE_TOOLS,
     unwrap_tool_output, TOOL_STATUS_MESSAGES,
 )
-from pipeline_handlers.auto_labeling import AutoLabelingHandlers
-from pipeline_handlers.msight_pipeline import MsightPipelineHandlers
-from validate_workflow_state import (
+from mcp_layer.pipeline_handlers.auto_labeling import AutoLabelingHandlers
+from mcp_layer.pipeline_handlers.msight_pipeline import MsightPipelineHandlers
+from mcp_layer.validate_workflow_state import (
     WorkflowState, AutoLabelingPhase, WORKFLOW_SPECS, validate_tool_input,
 )
 

@@ -1,5 +1,5 @@
 """unwrap_tool_output(): one test group per input shape."""
-from chat_pipeline import unwrap_tool_output
+from mcp_layer.chat_pipeline import unwrap_tool_output
 
 
 # None input

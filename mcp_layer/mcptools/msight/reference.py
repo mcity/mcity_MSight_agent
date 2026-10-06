@@ -1,8 +1,8 @@
 """On-demand reference docs, served as a plain tool (the client doesn't use MCP Resources)."""
 from pathlib import Path
 
-from mcptools import mcp
-from mcptools.mcp_json import error_json, ok_json
+from mcp_layer.mcptools import mcp
+from mcp_layer.mcptools.mcp_json import error_json, ok_json
 
 _REFERENCE_DIR = Path(__file__).resolve().parents[2] / "prompts" / "msight_reference"
 

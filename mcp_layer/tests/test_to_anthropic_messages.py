@@ -1,5 +1,5 @@
 """ClaudeClient._to_anthropic_messages() format conversion."""
-from llm_clients import ClaudeClient
+from mcp_layer.llm_clients import ClaudeClient
 
 tam = ClaudeClient._to_anthropic_messages
 

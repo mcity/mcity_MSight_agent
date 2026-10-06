@@ -133,17 +133,17 @@ Resources:
           EOF
           chmod 600 .env
 
-          # PYTHONPATH lets mcp_layer scripts import the config/ package from project root.
+          # PYTHONPATH (project root) makes mcp_layer and config importable as packages.
           export PYTHONPATH=/home/ubuntu/myapp
 
           nohup python3 session_v51.py > session_v51.log 2>&1 &
 
           cd mcp_layer
-          nohup python3 client_chat.py --ui > client_chat.log 2>&1 &
-          nohup python3 mcp_server.py > mcp_server.log 2>&1 &
-          nohup python3 llm_clients.py > llm_clients.log 2>&1 &
-          nohup python3 chat_server.py > chat_server.log 2>&1 &
-          nohup uvicorn ingest_server:app --host 0.0.0.0 --port 8002 > ingest_server.log 2>&1
+          nohup python3 -m mcp_layer.client_chat --ui > client_chat.log 2>&1 &
+          nohup python3 -m mcp_layer.mcp_server > mcp_server.log 2>&1 &
+          nohup python3 -m mcp_layer.llm_clients > llm_clients.log 2>&1 &
+          nohup python3 -m mcp_layer.chat_server > chat_server.log 2>&1 &
+          nohup uvicorn mcp_layer.ingest_server:app --host 0.0.0.0 --port 8002 > ingest_server.log 2>&1
 
 Outputs:
   PublicIP:
