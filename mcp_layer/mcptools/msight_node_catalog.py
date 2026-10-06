@@ -94,7 +94,7 @@ NODE_CATALOG: dict[str, NodeSpec] = {
         invocation="supervisor",
         default_name="frame_annotator",
         # Our own script; it has no --sensor-name flag, so never pass sensor_name.
-        script_path=Path(__file__).resolve().parents[1] / "msight_nodes" / "annotated_frame_publisher.py",
+        script_path=Path(__file__).resolve().parents[2] / "upstream" / "msight_vision_nodes" / "annotated_frame_publisher.py",
     ),
     "video_aggregator": NodeSpec(
         node_type="video_aggregator",

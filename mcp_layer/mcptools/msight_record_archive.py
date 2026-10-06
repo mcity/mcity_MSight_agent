@@ -1,7 +1,7 @@
 """Record & Archive: supervisor-run nodes that record the annotated feed.
 
     video_source --> camera/$SENSOR_NAME --> rfdetr_detector --> detection/$SENSOR_NAME
-        --> annotated_frame_publisher (ours, msight_nodes/) --> annotated/$SENSOR_NAME
+        --> annotated_frame_publisher (upstream/msight_vision_nodes/) --> annotated/$SENSOR_NAME
         --> image_to_video_aggregator --> video/$SENSOR_NAME --> video_local_dumper / aws_video_pusher
 
 The annotator/aggregator are shared parents: started before either sink and
