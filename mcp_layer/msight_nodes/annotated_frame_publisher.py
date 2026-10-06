@@ -1,4 +1,4 @@
-"""Standalone MSight node (not an MCP tool, launched as a subprocess by msight_record_archive.py): draws detection boxes and republishes frames as ImageData for image_to_video_aggregator to consume."""
+"""MSight node: draws detection boxes and republishes frames as ImageData for the aggregator."""
 import cv2
 
 from msight_core.data import DetectionResultsData, ImageData

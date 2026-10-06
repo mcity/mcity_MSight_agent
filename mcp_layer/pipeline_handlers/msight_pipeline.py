@@ -1,10 +1,4 @@
-"""MSight-pipeline workflow handlers for ChatPipeline, split out of
-chat_pipeline.py to keep that file from growing without bound as more
-workflows are added. Mixed into ChatPipeline via multiple inheritance --
-methods here run with the same `self` (self.state, self._progress_cb,
-self._intro_sent_this_turn, etc.) as methods defined directly on ChatPipeline
-or on other handler mixins.
-"""
+"""MSight-pipeline handlers, mixed into ChatPipeline (shares its `self`)."""
 import json
 import logging
 import time
@@ -23,8 +17,7 @@ class MsightPipelineHandlers:
     """Mixin: all msight_pipeline-workflow tool handlers. See chat_pipeline.ChatPipeline."""
 
     def _maybe_reset_msight_calibration(self, workflow_name: str) -> None:
-        """Per explicit user request: a fresh msight_pipeline entry must not
-        inherit a previous session's uploaded calibration -- reset to default."""
+        """Reset calibration to the default on fresh entry, so uploads don't carry over."""
         if workflow_name != "msight_pipeline":
             return
         msight_path, err = _get_msight_path()
@@ -59,8 +52,7 @@ class MsightPipelineHandlers:
         )]
 
     def _msight_calibration_summary_line(self) -> str:
-        """One-line calibration status for the pre-run consent summary --
-        same check as chat_server.py's SESSION_STATE hint, so they never disagree."""
+        """Calibration status line for the consent summary (same check as the state hint)."""
         msight_path, err = _get_msight_path()
         if err:
             return "not available (MSIGHT_VISION_PATH not configured on this host)"
@@ -79,10 +71,7 @@ class MsightPipelineHandlers:
     def _format_msight_run_confirmation_prompt(
         self, mp: MsightPipelineState, replacing_running: bool = False
     ) -> str:
-        """Pre-run consent summary. replacing_running is set when a pipeline
-        is already up and this would swap in a different source -- called
-        out explicitly so a Demo user isn't confused by an unexpected
-        confirmation step, since Demo otherwise never shows one."""
+        """Pre-run consent summary; replacing_running notes a source swap on a live pipeline."""
         source_label = f"RTSP stream: {mp.rtsp_url}" if mp.rtsp_url else f"Video file/folder: {mp.video_input}"
         recording = (
             "enabled" if mp.recording_active else
@@ -114,8 +103,7 @@ class MsightPipelineHandlers:
         )
 
     def _deferred_record_archive_routings(self, mp: MsightPipelineState) -> list[ToolRouting]:
-        """Fires any recording/archiving request deferred while the pipeline
-        was still starting, once it's actually running."""
+        """Start recording/archiving that was deferred until the pipeline is running."""
         routings: list[ToolRouting] = [FallThrough()]
         if not mp.pipeline_running:
             return routings
@@ -141,8 +129,7 @@ class MsightPipelineHandlers:
     def _require_run_consent(
         self, mp: MsightPipelineState, replacing_running: bool
     ) -> tuple[str, list[ToolRouting]]:
-        """The not-yet-confirmed half of the consent gate -- returns the
-        sentinel + HardStop that ends the turn with the confirmation prompt."""
+        """End the turn with the confirmation prompt (unconfirmed half of the gate)."""
         sentinel = self._build_msight_run_needs_confirmation_sentinel(mp)
         return sentinel, [HardStop(
             self._format_msight_run_confirmation_prompt(mp, replacing_running=replacing_running)
@@ -167,8 +154,7 @@ class MsightPipelineHandlers:
         return f"MSIGHT_MODE_SET: mode={mode!r}", [FallThrough()]
 
     def _fallback_demo_intro(self, mp: MsightPipelineState) -> str:
-        """Static backstop intro used only if the LLM started the Demo pipeline
-        without calling send_intro first."""
+        """Fallback intro if the LLM started Demo without send_intro."""
         source = f"RTSP stream {mp.rtsp_url}" if mp.rtsp_url else f"video {mp.video_input}"
         return (
             "MSight Vision is the camera perception module of the MSight roadside "
@@ -184,11 +170,7 @@ class MsightPipelineHandlers:
     async def _handle_start_msight_pipeline(
         self, fn_args: dict, mcp_client
     ) -> tuple[str, list[ToolRouting]]:
-        """Persist the source on success only. Gated on run_confirmed,
-        mirroring AutoLabelingState's confirm_run pattern: the first call
-        records the request and shows a consent summary; only a second call,
-        after confirm_run, actually starts anything. Wraps the call with
-        set/clear_active_progress_cb so ctx.log() streams as "log" SSE events during the docker compose call."""
+        """Consent-gated start: first call shows a summary, the call after confirm_run starts it."""
         if not fn_args.get("video_input") and not fn_args.get("rtsp_url"):
             return (
                 "MSIGHT_SOURCE_REQUIRED: start_msight_pipeline needs video_input or "
@@ -202,10 +184,7 @@ class MsightPipelineHandlers:
             self.state.msight_pipeline = MsightPipelineState()
         mp = self.state.msight_pipeline
 
-        # Captured before any mutation below: True here means this call is
-        # the second half of an explicit confirm_run() round trip (a prior
-        # turn already showed a consent summary), as opposed to a one-shot
-        # Demo start with no consent step at all.
+        # True if a consent summary was already shown on a previous turn.
         run_confirmed_at_entry = mp.run_confirmed
         was_running = mp.pipeline_running
         old_source = (mp.video_input, mp.rtsp_url)
@@ -221,13 +200,8 @@ class MsightPipelineHandlers:
 
         source_changed = old_source != (mp.video_input, mp.rtsp_url)
 
-        # Demo skips the consent round trip -- derived from tracked state, not
-        # a per-call LLM flag (testing showed the model wasn't reliably
-        # consistent deciding it itself). Exception: replacing an already-
-        # running pipeline with a different source still requires
-        # confirmation even in Demo -- the model didn't reliably ask about
-        # that on its own either (silently replaced, or stopped the old one
-        # without asking, in about half of direct-repro runs).
+        # Demo skips consent (decided from state, not by the LLM), unless it
+        # would replace a running pipeline's source.
         skip_confirmation = mp.mode == "demo" and not (was_running and source_changed)
 
         if not mp.run_confirmed and not skip_confirmation:
@@ -236,12 +210,7 @@ class MsightPipelineHandlers:
             self.state.save()
             return self._require_run_consent(mp, replacing_running=was_running and source_changed)
 
-        # Safety net: the LLM is told to call send_intro before this, but that
-        # instruction gets skipped often enough that we guarantee it here too.
-        # Skipped for a call arriving already-confirmed (run_confirmed_at_entry)
-        # -- that means a consent summary was already shown last turn, so a
-        # fresh "what is MSight" explainer here would just be redundant noise
-        # right as the pipeline actually starts.
+        # Guarantee the intro the LLM often skips (not needed after a consent summary).
         if (
             skip_confirmation and not run_confirmed_at_entry
             and not self._intro_sent_this_turn and self._progress_cb
@@ -292,13 +261,12 @@ class MsightPipelineHandlers:
     async def _handle_msight_record_archive(
         self, fn_name: str, fn_args: dict, mcp_client
     ) -> tuple[str, list[ToolRouting]]:
-        """Persist recording_active/archiving_active on success; also handles the deferred-until-pipeline-running path (see MsightPipelineState)."""
+        """Persist recording/archiving flags; defers start until the pipeline runs."""
         if self.state.msight_pipeline is None:
             self.state.msight_pipeline = MsightPipelineState()
         mp = self.state.msight_pipeline
 
-        # Demo is watch-only -- enforced here, not just in the prompt, so a wayward
-        # LLM turn can't start recording/archiving against the shipped demo footage.
+        # Demo is watch-only; enforced in code, not just the prompt.
         if fn_name in ("start_msight_recording", "start_msight_archiving") and mp.mode == "demo":
             return json.dumps({
                 "status": "error",

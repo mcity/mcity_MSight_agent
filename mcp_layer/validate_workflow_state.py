@@ -1,7 +1,4 @@
-"""
-Pydantic state machine over WORKFLOW_STATE in config.py.
-Provides typed schemas, precondition guards, tool input validation, and persistence.
-"""
+"""Pydantic state machine over WORKFLOW_STATE in config.py: schemas, guards, persistence."""
 
 import ast
 import importlib
@@ -19,8 +16,7 @@ CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "config.py"
 
 @dataclass(frozen=True)
 class WorkflowSpec:
-    """Single registration point for a workflow. chat_server.py, chat_pipeline.py,
-    and WorkflowState all read from WORKFLOW_SPECS instead of hardcoding names."""
+    """Single registration point for a workflow."""
     label: str                            # display label in the greeting list
     prompt_file: str                      # prompts/workflows/<file> — per-workflow LLM guidance
     requires_dataset: bool = True         # False = skip the FiftyOne dataset step entirely
@@ -29,8 +25,7 @@ class WorkflowSpec:
 
 
 def _resolve_substate_cls(name: Optional[str]) -> Optional[type[BaseModel]]:
-    """Resolve a WorkflowSpec.substate_cls_name to its class object. String-based
-    and resolved lazily so WORKFLOW_SPECS can be declared before the models it references."""
+    """Lazily resolve substate_cls_name so WORKFLOW_SPECS can precede the models."""
     return globals()[name] if name else None
 
 
@@ -53,8 +48,7 @@ WORKFLOW_SPECS: dict[str, WorkflowSpec] = {
 #: Derived from WORKFLOW_SPECS' keys so there is no second list to fall out of sync.
 VALID_WORKFLOW = Literal[tuple(WORKFLOW_SPECS) + ("",)]
 
-#: Tools callable regardless of workflow/step. Module-level so tests and other
-#: consumers import the same object instead of keeping their own copy in sync by hand.
+#: Tools callable regardless of workflow/step.
 ALWAYS_TOOLS: frozenset[str] = frozenset({
     "send_reply", "send_intro", "switch_workflow", "reset_workflow_state",
     "select_msight_mode",
@@ -70,11 +64,7 @@ ALWAYS_TOOLS: frozenset[str] = frozenset({
 
 
 class LabelingBackend:
-    """String constants for annotation backend names.
-
-    Values match the Pydantic Literal fields in AutoLabelingState/SetLabelingBackendInput;
-    those Literal definitions are the authoritative schema and are NOT changed here.
-    """
+    """Annotation backend names (the Pydantic Literals remain the schema)."""
     CVAT         = "cvat"
     LABEL_STUDIO = "label_studio"
     BOTH         = "both"   # sentinel: both backends available, user must choose
@@ -82,11 +72,7 @@ class LabelingBackend:
 
 
 class AutoLabelingPhase:
-    """String constants for auto-labeling workflow phase names.
-
-    Values match the Pydantic Literal field in AutoLabelingState; that definition
-    is the authoritative schema and is NOT changed here.
-    """
+    """Auto-labeling phase names (the Pydantic Literal remains the schema)."""
     PENDING    = ""            # Zone A — mutable configuration
     ANNOTATING = "annotating"  # post-export, locked until import
     TRAINING   = "training"    # post-run, locked until import
@@ -94,11 +80,7 @@ class AutoLabelingPhase:
 
 
 class LabelingPath:
-    """String constants for auto-labeling path names.
-
-    Values match the Pydantic Literal field in AutoLabelingState; that definition
-    is the authoritative schema and is NOT changed here.
-    """
+    """Auto-labeling path names (the Pydantic Literal remains the schema)."""
     MANUAL = "manual"
     AUTO   = "auto"
 
@@ -166,9 +148,7 @@ class AutoLabelingState(BaseModel):
     model_name: str = ""
     # "" = Zone A (mutable), "annotating" = post-export, "training" = post-run, "complete" = terminal
     phase: Literal["", "annotating", "training", "complete"] = ""
-    # Chat-session tracking only -- main.py reads the actual values from
-    # config.WORKFLOWS["auto_labeling"], not here. Lets the prompt know whether
-    # the user has already configured it, so it isn't re-asked.
+    # Chat tracking only (main.py reads config.WORKFLOWS); avoids re-asking.
     localization_enabled: bool = False
 
     _RESET_SEQUENCE: ClassVar[list[str]] = [
@@ -261,36 +241,28 @@ class AutoLabelingState(BaseModel):
 
 
 class MsightPipelineState(BaseModel):
-    """Tracks msight_pipeline's customize checklist deterministically -- not
-    phase-locked (items fire in any order), but "which items are done" must
-    never be something the LLM infers from conversation history; every field
-    here is surfaced to the LLM every turn via chat_server._build_state_hint."""
+    """msight_pipeline checklist, surfaced every turn so the LLM never infers it from history."""
     model_config = ConfigDict(extra="forbid")
-    # Set once via select_msight_mode -- real state, not a per-call LLM flag
-    # (testing showed the model wasn't reliably consistent re-deciding it).
+    # Set once via select_msight_mode; the LLM wasn't consistent re-deciding it.
     mode: str = ""  # "" | "demo" | "custom"
     video_input: str = ""
     rtsp_url: str = ""
     sensor_name: str = ""
     recording_active: bool = False
     archiving_active: bool = False
-    # Deferred start_msight_recording/start_msight_archiving request, auto-fired once start_msight_pipeline next succeeds.
+    # Deferred recording/archiving requests, fired once the pipeline starts.
     recording_pending: bool = False
     recording_pending_since: float = 0.0
     archiving_pending: bool = False
     archiving_pending_since: float = 0.0
     archiving_pending_bucket: str = ""
     archiving_pending_prefix: str = ""
-    # True after a successful start_msight_pipeline, False after a
-    # successful stop -- surfaced every turn so the LLM can remind the user
-    # it's still running and confirm before replacing it, instead of relying
-    # on conversation memory. Not a live check; see get_msight_status for that.
+    # Cached flag (not a live check), resynced each turn by chat_server.
     pipeline_running: bool = False
     # Mirrors AutoLabelingState's run_confirmed/run_awaiting_confirmation.
     run_confirmed: bool = False
     run_awaiting_confirmation: bool = False
-    # Dedicated short TTL, separate from the global config.py-mtime TTL below,
-    # since that mtime gets refreshed by unrelated state writes.
+    # Own short TTL: config.py's mtime is refreshed by unrelated writes.
     run_confirmation_requested_at: float = 0.0
 
 
@@ -387,10 +359,7 @@ class WorkflowState(BaseModel):
 
         if al.labeling_path == LabelingPath.AUTO:
             if not al.auto_labeling_complete:
-                # configure_auto_labeling and set_auto_labeling_hyperparams are visible
-                # from the start of the auto path; their respective preconditions
-                # (can_configure_auto_labeling, can_set_auto_labeling_hyperparams)
-                # block premature calls with clear recovery messages.
+                # Visible early; their preconditions block premature calls.
                 base = ALWAYS | {
                     "set_selected_dataset",
                     "configure_auto_labeling",
@@ -416,9 +385,7 @@ class WorkflowState(BaseModel):
             raw = cls._migrate(raw)
             state = cls.model_validate(raw)
 
-            # TTL: if config.py has not been written in over an hour, the session
-            # that set run_awaiting_confirmation / export_confirmed is stale.
-            # Reset those flags so a fresh conversation does not resume a dead gate.
+            # TTL: after an hour without writes, clear stale confirmation gates.
             try:
                 import time as _time
                 age = _time.time() - CONFIG_PATH.stat().st_mtime
@@ -429,11 +396,7 @@ class WorkflowState(BaseModel):
                     if state.auto_labeling.export_confirmed:
                         state.auto_labeling.export_confirmed = False
                         logging.warning("[STATE] TTL: cleared stale export_confirmed")
-                # msight_pipeline uses its own dedicated, much shorter TTL below
-                # (run_confirmation_requested_at is always set alongside
-                # run_awaiting_confirmation, so that one always fires first) --
-                # an unanswered consent summary should not be silently revived
-                # by a later, unrelated message.
+                # msight_pipeline's shorter TTL below always fires first.
                 mp = state.msight_pipeline
                 if mp and mp.run_awaiting_confirmation and mp.run_confirmation_requested_at:
                     pending_age = _time.time() - mp.run_confirmation_requested_at
@@ -444,7 +407,7 @@ class WorkflowState(BaseModel):
                             f"[STATE] TTL: cleared stale msight_pipeline pending "
                             f"confirmation after {pending_age:.0f}s unanswered"
                         )
-                # Same reasoning as above -- a deferred recording/archiving request should not auto-fire on a much-later, unrelated pipeline start.
+                # Expire deferred requests so they don't fire on an unrelated later start.
                 if mp and mp.recording_pending and mp.recording_pending_since and _time.time() - mp.recording_pending_since > 3600:
                     mp.recording_pending = False
                     mp.recording_pending_since = 0.0

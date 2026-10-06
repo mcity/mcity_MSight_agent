@@ -1,20 +1,8 @@
-"""
-Priority 7: filter_tools_for_state() from chat_server.py.
-
-Fails-open behavior:
-  - state is None                → all tools returned
-  - valid_tool_names() raises    → all tools returned (fail-open)
-  - valid_tool_names() returns None → all tools returned
-  - valid_tool_names() returns a set → filtered list returned
-
-The current fail-open behavior (returning all tools on exception) is documented
-here as the CURRENT behavior, not necessarily the desired one. See the report for
-the security note about this choice.
-"""
+"""filter_tools_for_state(): filters by valid_tool_names(), fails open otherwise."""
 from unittest.mock import MagicMock
 
 from chat_server import filter_tools_for_state
-from validate_workflow_state import WorkflowState, AutoLabelingState
+from validate_workflow_state import WorkflowState
 
 
 def _tool(name: str) -> dict:
@@ -24,18 +12,14 @@ def _tool(name: str) -> dict:
 ALL_TOOLS = [_tool("send_reply"), _tool("select_workflow"), _tool("set_selected_dataset")]
 
 
-# ---------------------------------------------------------------------------
 # state=None → fails open (all tools)
-# ---------------------------------------------------------------------------
 
 def test_filter_tools_none_state_returns_all_tools():
     result = filter_tools_for_state(ALL_TOOLS, None)
     assert result == ALL_TOOLS
 
 
-# ---------------------------------------------------------------------------
 # valid_tool_names() returns None → fails open (all tools)
-# ---------------------------------------------------------------------------
 
 def test_filter_tools_valid_tool_names_returns_none_returns_all_tools():
     state = MagicMock()
@@ -44,9 +28,7 @@ def test_filter_tools_valid_tool_names_returns_none_returns_all_tools():
     assert result == ALL_TOOLS
 
 
-# ---------------------------------------------------------------------------
 # valid_tool_names() raises → fails open (all tools)
-# ---------------------------------------------------------------------------
 
 def test_filter_tools_valid_tool_names_raises_returns_all_tools():
     state = MagicMock()
@@ -62,9 +44,7 @@ def test_filter_tools_valid_tool_names_raises_attribute_error_returns_all_tools(
     assert result == ALL_TOOLS
 
 
-# ---------------------------------------------------------------------------
 # valid_tool_names() returns a set → filtered list
-# ---------------------------------------------------------------------------
 
 def test_filter_tools_filters_to_valid_set():
     state = MagicMock()
@@ -93,9 +73,7 @@ def test_filter_tools_preserves_order_of_all_tools():
     assert names == ["a", "c"]
 
 
-# ---------------------------------------------------------------------------
 # Real WorkflowState integration
-# ---------------------------------------------------------------------------
 
 def test_filter_tools_with_real_state_no_workflow():
     """WorkflowState with no workflow set → only select_workflow + always tools visible."""

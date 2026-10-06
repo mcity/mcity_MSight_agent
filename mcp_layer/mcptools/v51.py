@@ -61,10 +61,7 @@ def launch_voxel51_session(dataset_name: str = "") -> str:
             return f"Dataset '{target_dataset}' could not be loaded after 10 seconds. Please try again."
 
     try:
-        # session_v51.py always binds the same fixed port (V51_PORT). A second
-        # instance launched while one is already running fails to bind and dies
-        # silently -- kill any existing session first so the new dataset actually
-        # takes over the port instead of leaving a stale dataset displayed.
+        # Fixed port: kill any existing session so the new one can bind it.
         subprocess.run(
             ["pkill", "-f", "session_v51.py"],
             stdout=subprocess.DEVNULL,

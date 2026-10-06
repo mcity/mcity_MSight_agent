@@ -1,28 +1,10 @@
-"""
-Priority 6: ClaudeClient._to_anthropic_messages() format conversion.
-
-_to_anthropic_messages is a @staticmethod — callable without instantiating ClaudeClient
-(the __init__ import of AsyncAnthropic is deferred and never triggered here).
-
-Tests cover:
-  - System message accumulation into system_parts
-  - Tool result attachment to preceding user message
-  - Tool result with no preceding user message (new user block created)
-  - Empty tool_calls list on assistant message → placeholder " " block
-  - Consecutive user messages merged
-  - Leading non-user message trimmed from result list
-  - Empty/whitespace system content filtered
-  - Empty user content filtered out at end
-"""
-import pytest
+"""ClaudeClient._to_anthropic_messages() format conversion."""
 from llm_clients import ClaudeClient
 
 tam = ClaudeClient._to_anthropic_messages
 
 
-# ---------------------------------------------------------------------------
 # System messages
-# ---------------------------------------------------------------------------
 
 def test_system_messages_accumulated_into_system_parts():
     msgs = [
@@ -62,9 +44,7 @@ def test_system_message_none_content_is_filtered():
     assert system_parts == []
 
 
-# ---------------------------------------------------------------------------
 # User messages
-# ---------------------------------------------------------------------------
 
 def test_single_user_message():
     msgs = [{"role": "user", "content": "hello"}]
@@ -93,9 +73,7 @@ def test_empty_user_content_filtered_from_result():
     assert result == []
 
 
-# ---------------------------------------------------------------------------
 # Tool result messages
-# ---------------------------------------------------------------------------
 
 def test_tool_result_appended_to_preceding_user_message():
     msgs = [
@@ -124,9 +102,7 @@ def test_tool_result_with_no_preceding_user_message_creates_new_user_block():
     assert result[0]["content"][0]["type"] == "tool_result"
 
 
-# ---------------------------------------------------------------------------
 # Assistant messages
-# ---------------------------------------------------------------------------
 
 def test_assistant_with_text_content():
     msgs = [
@@ -140,10 +116,7 @@ def test_assistant_with_text_content():
 
 
 def test_assistant_with_empty_tool_calls_list_gets_placeholder_block():
-    """
-    Empty tool_calls + empty content → blocks is empty → fallback placeholder ' '.
-    This placeholder is intentional and must not be filtered by the content filter.
-    """
+    """Empty assistant message gets an intentional ' ' placeholder block."""
     msgs = [
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "", "tool_calls": []},
@@ -195,9 +168,7 @@ def test_assistant_with_object_style_tool_call():
     assert tool_block["input"] == {"message": "hi"}
 
 
-# ---------------------------------------------------------------------------
 # Leading role trim
-# ---------------------------------------------------------------------------
 
 def test_leading_assistant_message_is_trimmed():
     msgs = [
@@ -219,9 +190,7 @@ def test_leading_system_messages_do_not_appear_in_result_list():
     assert len([m for m in result if m["role"] == "system"]) == 0
 
 
-# ---------------------------------------------------------------------------
 # Empty messages list
-# ---------------------------------------------------------------------------
 
 def test_empty_messages_list_returns_empty_system_parts_and_empty_result():
     system_parts, result = tam([])

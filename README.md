@@ -362,7 +362,6 @@ git add .gitmodules $(git submodule foreach --quiet 'echo $name')
 │  │   ├── label_studio_export.py
 │  │   ├── msight_docker.py     # start/stop/status/logs — docker compose control for MSight_Vision
 │  │   ├── msight_record_archive.py # Local recording + S3 archiving as tracked host subprocesses
-│  │   ├── msight_calibration_helper.py # Fisheye-intrinsics auto-detect (not yet registered)
 │  │   └── v51.py               # Voxel51 integration
 │  ├── msight_nodes/            # Standalone MSight nodes (not MCP tools) launched as
 │  │   │                        # subprocesses via MSight_Vision's own venv interpreter

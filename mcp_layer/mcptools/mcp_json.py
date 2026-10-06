@@ -1,5 +1,4 @@
-"""Shared response-JSON builders for MCP tool functions -- factors out the
-{"status": "ok"/"error", ...} shape repeated across mcptools/*.py."""
+"""Builders for the {"status": "ok"/"error", ...} MCP tool response shape."""
 import json
 
 

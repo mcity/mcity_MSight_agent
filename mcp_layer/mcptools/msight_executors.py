@@ -1,16 +1,8 @@
 """Pluggable execution backends for MSightControlPlane.
 
-An Executor only knows how to run an already-built argv somewhere and track
-it by name -- it has no knowledge of node types, topics, or MSight_Vision's
-directory layout (that's msight_node_catalog.py / msight_control_plane.py's
-job). This is deliberately an open interface, not a closed enum: the two
-first-party backends below are resolved through a small built-in dict, but
-resolve_executor() also checks the "msight_agent.executors" entry-point
-group, so a third-party pip-installed package can register its own backend
-(Kubernetes, systemd, Nomad, ...) without touching this file. The entry-point
-path works today even though this repo itself has no installed package
-metadata -- importlib.metadata.entry_points() finds whatever's installed in
-the environment regardless of whether *this* repo is pip-installed.
+An Executor runs an already-built argv and tracks it by name; it knows nothing
+about node types or topics. Extra backends can be registered via the
+"msight_agent.executors" entry-point group.
 """
 import asyncio
 import importlib.metadata as metadata
@@ -31,8 +23,7 @@ _gpu_available: Optional[bool] = None
 
 
 async def has_gpu() -> bool:
-    """Cached nvidia-smi check, moved from msight_docker.py so both the
-    Docker executor and the pre-migration compose path can share it."""
+    """Cached nvidia-smi check."""
     global _gpu_available
     if _gpu_available is not None:
         return _gpu_available
@@ -80,14 +71,7 @@ _cpu_image_ready: Optional[bool] = None
 
 
 async def _ensure_cpu_image(msight_path: Path) -> str:
-    """Built once, cached for the process lifetime (and by Docker's own layer
-    cache afterward) -- unlike the default GPU image, there's no pre-built
-    CPU tag to pull, so a genuinely GPU-needing node on a GPU-less host (the
-    confirmed r5 deployment target) would otherwise be unable to run at all.
-    Reuses this repo's own Dockerfile.msight-cpu (not MSight_Vision's) --
-    the same one msight_docker.py's build=True/CPU-compose-override path
-    already relies on, just invoked as a plain `docker build` instead of via
-    compose, since DockerExecutor otherwise deliberately never builds."""
+    """Build the CPU image from Dockerfile.msight-cpu once per process (no prebuilt CPU tag exists)."""
     global _cpu_image_ready
     if _cpu_image_ready:
         return _CPU_IMAGE_TAG
@@ -119,13 +103,10 @@ async def _ensure_cpu_image(msight_path: Path) -> str:
 
 
 class DockerExecutor:
-    """Runs each node as its own `docker run` against the already-built
-    michigantrafficlab/msight-vision image -- not a generated/edited compose
-    file. A missing image surfaces as a plain docker error (the caller can
-    translate it into a friendly message the way msight_docker.py already
-    does for compose errors). The one exception to "never builds": a GPU-
-    needing node on a GPU-less host falls back to a locally-built CPU image
-    (_ensure_cpu_image) instead of failing outright -- see its docstring."""
+    """One `docker run` per node on the prebuilt msight-vision image.
+
+    Never builds, except the CPU fallback image for GPU nodes on GPU-less hosts.
+    """
 
     async def start(self, name: str, cmd: list[str], cwd: Path, env: dict[str, str],
                      needs_gpu: bool = False, mounts: Optional[list[Mount]] = None) -> DockerHandle:
@@ -136,10 +117,7 @@ class DockerExecutor:
         else:
             image = os.environ.get("MSIGHT_VISION_IMAGE", "michigantrafficlab/msight-vision:latest")
 
-        # Defensive cleanup: --restart and --rm are mutually exclusive in Docker,
-        # so a stopped-but-not-yet-removed container from a prior run (stop()
-        # below removes it, but this guards against anything that skipped that)
-        # would otherwise collide with this name.
+        # Remove any leftover container with this name (--restart precludes --rm).
         cleanup = await asyncio.create_subprocess_exec(
             "docker", "rm", "-f", container_name,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
@@ -171,9 +149,7 @@ class DockerExecutor:
         return DockerHandle(container_name=container_name)
 
     async def stop(self, handle: DockerHandle) -> None:
-        # Graceful stop (SIGTERM, Docker's default grace period) so a node can
-        # deregister itself from Redis on shutdown, then remove the container
-        # so a later start() with the same name never collides.
+        # Graceful stop so the node can deregister, then remove to free the name.
         proc = await asyncio.create_subprocess_exec(
             "docker", "stop", handle.container_name,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
@@ -194,8 +170,7 @@ class DockerExecutor:
         return out.decode(errors="replace")
 
     async def is_alive(self, handle: DockerHandle) -> bool:
-        """Real liveness from the daemon, not in-memory tracking. A missing
-        container is "not alive", not an error."""
+        """Liveness from the Docker daemon; a missing container is not alive."""
         proc = await asyncio.create_subprocess_exec(
             "docker", "inspect", "-f", "{{.State.Running}}", handle.container_name,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
@@ -205,11 +180,7 @@ class DockerExecutor:
 
 
 class SupervisorHandle(ExecutorHandle):
-    """`process` is set when this handle came from the same process that
-    spawned it (the normal case); `pid` alone is set when it was recovered
-    from the on-disk pidfile after a restart -- an asyncio.subprocess.Process
-    wrapper can't be reconstructed for a PID this process didn't itself
-    spawn, so that path signals it directly instead."""
+    """`process` when spawned here; only `pid` when recovered from a pidfile."""
     def __init__(self, name: str, process: Optional[asyncio.subprocess.Process] = None,
                  pid: Optional[int] = None):
         self.process = process
@@ -222,11 +193,7 @@ def _pid_path(name: str) -> Path:
 
 
 def recover_supervisor_handle(name: str) -> Optional[SupervisorHandle]:
-    """Best-effort restart-resilience fallback for supervisor-backed nodes,
-    mirroring DockerHandle's deterministic-container-name fallback -- reads
-    the pidfile SupervisorExecutor.start() writes, confirms the PID is still
-    alive, and returns a handle stop()/logs() can act on despite this
-    process never having tracked it in memory."""
+    """Recover a supervisor node's handle from its pidfile after a restart."""
     pid_path = _pid_path(name)
     if not pid_path.is_file():
         return None
@@ -235,10 +202,7 @@ def recover_supervisor_handle(name: str) -> Optional[SupervisorHandle]:
         os.kill(pid, 0)  # raises if the PID is gone
     except (ValueError, ProcessLookupError, PermissionError):
         return None
-    # PIDs get reused by the OS over time -- a bare `kill(pid, 0)` success
-    # doesn't prove this is still *our* process, just that *some* process
-    # holds that PID. Cheap extra check: does its cmdline still mention this
-    # node's name (every launched cmd includes `--name <name>`)?
+    # Guard against PID reuse: the cmdline must still contain this node's name.
     try:
         cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
         if name not in cmdline:
@@ -249,9 +213,7 @@ def recover_supervisor_handle(name: str) -> Optional[SupervisorHandle]:
 
 
 class SupervisorExecutor:
-    """Generalized from msight_record_archive.py's _launch/_stop/_ACTIVE --
-    same detached-subprocess mechanism, now taking an already-built argv
-    instead of building one of 4 hardcoded commands inline."""
+    """Runs each node as a detached local subprocess."""
 
     def __init__(self):
         self._active: dict[str, asyncio.subprocess.Process] = {}
@@ -262,8 +224,7 @@ class SupervisorExecutor:
 
     async def start(self, name: str, cmd: list[str], cwd: Path, env: dict[str, str],
                      needs_gpu: bool = False, mounts: Optional[list[Mount]] = None) -> SupervisorHandle:
-        # mounts is a docker-only concept -- a bare subprocess already sees
-        # the whole host filesystem, nothing to mount.
+        # mounts are docker-only; a subprocess already sees the host filesystem.
         if self._is_alive(name):
             return SupervisorHandle(name, process=self._active[name])
 
@@ -287,10 +248,7 @@ class SupervisorExecutor:
             raise RuntimeError(f"'{name}' exited immediately (code {proc.returncode}): {tail}")
 
         self._active[name] = proc
-        # Written only once the process has cleared the startup-grace check
-        # above, so a stale pidfile never points at a node that never
-        # actually came up -- read by recover_supervisor_handle() to survive
-        # this process (mcp_server.py) restarting while the node keeps running.
+        # Written after the startup check so a pidfile always means the node came up.
         _pid_path(name).write_text(str(proc.pid))
         return SupervisorHandle(name, process=proc)
 
@@ -303,9 +261,7 @@ class SupervisorExecutor:
                 handle.process.kill()
                 await handle.process.wait()
         elif handle.pid is not None:
-            # Recovered from a pidfile after a restart -- no
-            # asyncio.subprocess.Process wrapper exists for a PID this
-            # process didn't itself spawn, so signal it directly.
+            # Recovered from a pidfile: no Process wrapper, signal directly.
             try:
                 os.kill(handle.pid, signal.SIGTERM)
             except ProcessLookupError:

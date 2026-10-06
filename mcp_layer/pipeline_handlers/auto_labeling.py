@@ -1,9 +1,4 @@
-"""Auto-labeling workflow handlers for ChatPipeline, split out of chat_pipeline.py
-to keep that file from growing without bound as more workflows are added.
-Mixed into ChatPipeline via multiple inheritance -- methods here run with the
-same `self` (self.state, self.auto_labeling_cache, self._progress_cb, etc.) as
-methods defined directly on ChatPipeline or on other handler mixins.
-"""
+"""Auto-labeling handlers, mixed into ChatPipeline (shares its `self`)."""
 import asyncio
 import json
 import logging
@@ -27,11 +22,7 @@ class AutoLabelingHandlers:
         return (self.state.auto_labeling.labeling_backend if self.state.auto_labeling else "") or ""
 
     def _preserve_zone_a_state_on_switch(self, dataset_name: str) -> tuple[bool, bool]:
-        """If this is a mid-session dataset switch, update AutoLabelingState for Zone A.
-
-        Returns (was_dataset_switch, path_was_preserved).
-        Zone A (phase == "") preserves all config flags; locked phases preserve only backend.
-        """
+        """Handle a mid-session dataset switch. Returns (was_dataset_switch, path_was_preserved)."""
         if not (self.state.dataset_confirmed and self.state.dataset_name != dataset_name):
             return False, False
 
@@ -64,11 +55,7 @@ class AutoLabelingHandlers:
         return True, path_was_preserved
 
     async def _retry_dataset_lookup(self, dataset_name: str, mcp_client) -> str:
-        """Call set_selected_dataset with exponential backoff on DATASET_NOT_FOUND.
-
-        FiftyOne's registry cache can lag after recent ingestion, so we retry up to
-        three times (at 2 s, 4 s, 6 s) before returning the final result.
-        """
+        """set_selected_dataset with retries on DATASET_NOT_FOUND (FiftyOne registry lag)."""
         raw = await mcp_client.call_tool("set_selected_dataset", {"dataset_name": dataset_name})
         tool_output = unwrap_tool_output(raw)
 
@@ -249,14 +236,7 @@ class AutoLabelingHandlers:
         return result, [HardStop(self._format_model_list(result))]
 
     async def _auto_detect_backend(self, mcp_client) -> dict | None:
-        """Detect backend from env vars directly; avoids repr-vs-JSON parse issues in MCP call.
-
-        Note: token presence is treated as token validity here.  An expired or
-        scoped-down token will still report the backend as "available" and the
-        error will only surface later at export time.  A network round-trip to
-        verify validity on every dataset-selection call is not warranted for this
-        low-severity case — this is known/accepted behaviour.
-        """
+        """Detect the labeling backend from env vars (token presence only; validity checked at export)."""
         try:
             cvat_ok = bool(os.getenv("CVAT_ACCESS_TOKEN", "").strip())
             ls_ok   = bool(os.getenv("LS_TOKEN", "").strip())
@@ -464,8 +444,7 @@ class AutoLabelingHandlers:
     async def _handle_set_msight_localization_config(
         self, fn_args: dict, mcp_client
     ) -> tuple[str, list[ToolRouting]]:
-        """Sets AutoLabelingState.localization_enabled on success only -- chat-session
-        tracking only; the values main.py executes with live in config.WORKFLOWS."""
+        """Set localization_enabled on success (chat tracking only)."""
         if self.state.auto_labeling is None:
             self.state.auto_labeling = AutoLabelingState()
 
@@ -549,12 +528,7 @@ class AutoLabelingHandlers:
     async def _handle_export_generic(
         self, backend: str, fn_args: dict, mcp_client
     ) -> tuple[str, list[ToolRouting]]:
-        """Shared implementation for export_to_cvat and export_to_label_studio.
-
-        Parameterized by backend ("cvat" or "label_studio"); all other per-backend
-        differences (env var, tool name, success key, task-state field) are derived
-        from that single value so the logic only lives in one place.
-        """
+        """Shared export_to_cvat / export_to_label_studio implementation."""
         is_ls = backend == LabelingBackend.LABEL_STUDIO
         backend_label = "Label Studio" if is_ls else "CVAT"
         tool_name = "export_to_label_studio" if is_ls else "export_to_cvat"
@@ -630,9 +604,7 @@ class AutoLabelingHandlers:
         return self._handle_export_success(result, fn_args, is_ls)
 
     def _export_error_routing(self, result: str, is_ls: bool) -> Optional[list[ToolRouting]]:
-        """None if `result` isn't an error; otherwise the routing to end the
-        turn with the error message. CVAT sentinels checked first for CVAT
-        exports; the LS/generic set applies either way."""
+        """None if `result` isn't an error, else routing that ends the turn with it."""
         if not is_ls and any(s in result for s in [
             Sentinels.CVAT_TASK_LIMIT_REACHED, Sentinels.CVAT_STORAGE_LIMIT_REACHED,
             Sentinels.CVAT_FORBIDDEN, Sentinels.CVAT_AUTH_ERROR,
@@ -654,9 +626,7 @@ class AutoLabelingHandlers:
     def _handle_export_success(
         self, result: str, fn_args: dict, is_ls: bool
     ) -> tuple[str, list[ToolRouting]]:
-        """Backend-specific bookkeeping once an export call returned without
-        an error sentinel -- pull the new task id(s) out of the result and
-        move the workflow into the ANNOTATING phase."""
+        """Record new task id(s) and move to the ANNOTATING phase."""
         al = self.state.auto_labeling
         if not al:
             return result, [FallThrough()]
@@ -854,10 +824,7 @@ class AutoLabelingHandlers:
             )
 
         result = unwrap_tool_output(await mcp_client.call_tool("set_labeling_backend", fn_args))
-        # LS_BACKEND_ERROR is the sentinel for missing credentials on EITHER backend
-        # (the MCP tool uses this prefix regardless of whether CVAT or LS was requested).
-        # "Invalid backend" should not appear here due to Pydantic pre-validation but is
-        # checked defensively to match the pattern in _handle_export_to_cvat.
+        # LS_BACKEND_ERROR covers missing credentials for either backend.
         _backend_error_sentinels = [Sentinels.LS_BACKEND_ERROR, "Invalid backend"]
         if any(s in result for s in _backend_error_sentinels):
             err = result.split(":", 1)[1].strip() if ":" in result else result
@@ -1025,10 +992,7 @@ class AutoLabelingHandlers:
     async def _do_post_run_export(
         self, backend: str, dataset_name: str, mcp_client
     ) -> str:
-        """Call the appropriate export tool after auto-labeling and update task-ID state.
-
-        Returns the text to append to the run reply.  Callers catch any exception.
-        """
+        """Export after auto-labeling; returns text to append to the run reply."""
         is_ls = backend == LabelingBackend.LABEL_STUDIO
         tool_name     = "export_to_label_studio" if is_ls else "export_to_cvat"
         backend_label = "Label Studio"            if is_ls else "CVAT"
@@ -1126,8 +1090,7 @@ class AutoLabelingHandlers:
         return tool_output.strip()
 
     async def _handle_confirm_auto_labeling_run(self) -> tuple[str, list[ToolRouting]]:
-        """auto_labeling side of the workflow-agnostic confirm_run tool
-        (dispatched from ChatPipeline._handle_confirm_run)."""
+        """auto_labeling branch of confirm_run."""
         if self.state.auto_labeling is None:
             self.state.auto_labeling = AutoLabelingState()
         self.state.auto_labeling.run_confirmed = True
@@ -1145,9 +1108,7 @@ class AutoLabelingHandlers:
     async def _handle_configure_auto_labeling_gated(
         self, fn_args: dict, mcp_client, messages: list
     ) -> tuple[str, list[ToolRouting]]:
-        """Blocks configure_auto_labeling if the model name isn't actually in the
-        user's recent messages -- guards against the LLM inferring/inventing a
-        model choice instead of the user explicitly naming one."""
+        """Block configure_auto_labeling unless the user actually named the model."""
         model_name_raw = fn_args.get("selected_model", "")
         recent_user_text = " ".join(
             m["content"].lower()
@@ -1175,9 +1136,7 @@ class AutoLabelingHandlers:
     async def _dispatch_run_auto_labeling(
         self, fn_args: dict, mcp_client, progress_cb
     ) -> tuple[str, list[ToolRouting]]:
-        """run_auto_labeling streams live progress when a progress_cb is available
-        (the normal SSE-connected chat path); falls back to a single blocking call
-        otherwise (e.g. no streaming transport)."""
+        """Run auto-labeling, streaming progress when a progress_cb is available."""
         if progress_cb:
             return await self._handle_run_auto_labeling_streaming(fn_args, progress_cb, mcp_client)
         return await self._handle_run_auto_labeling(fn_args, mcp_client)

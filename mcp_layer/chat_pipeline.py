@@ -1,13 +1,11 @@
 import json
 import logging
-import time
-from typing import Optional
 
 from fastmcp import Client
 
 from pipeline_common import (
     Sentinels, HardStop, Injection, FallThrough, ToolRouting, WRITE_TOOLS,
-    unwrap_tool_output, TOOL_STATUS_MESSAGES, CONFIRM_GATES,
+    unwrap_tool_output, TOOL_STATUS_MESSAGES,
 )
 from pipeline_handlers.auto_labeling import AutoLabelingHandlers
 from pipeline_handlers.msight_pipeline import MsightPipelineHandlers
@@ -17,9 +15,7 @@ from validate_workflow_state import (
 
 
 def _tool_result_reports_error(result: str) -> bool:
-    """True for a well-formed {"status": "error", ...} tool response -- a
-    handled failure, distinct from _dispatch's exception flag. A plain-text
-    sentinel isn't JSON, so this correctly leaves those alone."""
+    """True for a {"status": "error", ...} tool response (a handled failure)."""
     try:
         parsed = json.loads(result)
     except (TypeError, ValueError):
@@ -29,17 +25,11 @@ def _tool_result_reports_error(result: str) -> bool:
 
 class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
     """
-    Owns all processing between the HTTP endpoint and the MCP tools.
+    Everything between the HTTP endpoint and the MCP tools.
 
-    Invariant: every tool result is appended to `messages` immediately after
-    execution in `_dispatch`, so the OpenAI message history never has an
-    assistant tool_call_id without a matching tool result.
-
-    Workflow-specific tool handlers live in the AutoLabelingHandlers and
-    MsightPipelineHandlers mixins (pipeline_handlers/) -- this class holds
-    the dispatch loop and the handful of handlers that are genuinely
-    workflow-agnostic (workflow switching, send_intro, confirm_run's
-    routing, dataset-list fetching).
+    Invariant: _dispatch appends every tool result to `messages` immediately,
+    so no tool_call_id is ever left without a result. Workflow-specific
+    handlers live in the pipeline_handlers/ mixins.
     """
 
     def __init__(self, mcp_client: Client, llm):
@@ -59,11 +49,9 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
             "max_grad_norm": 0.01,
         }
         self._progress_cb = None  # async (event_type: str, data: dict) -> None
-        # Set by _handle_send_intro; lets _handle_start_msight_pipeline's Demo path
-        # inject a fallback intro if the LLM skipped calling send_intro itself.
+        # Lets Demo start inject a fallback intro if send_intro was skipped.
         self._intro_sent_this_turn = False
-        # Set once any WRITE_TOOLS call succeeds this turn -- forces
-        # send_reply to omit its source tag (see _handle_send_reply).
+        # Any WRITE_TOOLS success this turn drops send_reply's source tag.
         self.write_succeeded_this_turn = False
 
     def _set_flag_if_ok(
@@ -72,16 +60,7 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
         error_sentinels: list[str],
         state_setter,
     ) -> "HardStop | None":
-        """Guard a state-flag write against known error sentinels.
-
-        If any sentinel appears in `result` the setter is NOT called and a
-        HardStop with the tool's own error text is returned.  When no sentinel
-        matches the setter runs and state is persisted.
-
-        Pass an empty list for `error_sentinels` when the underlying MCP tool
-        has no documented error sentinel (flag is always set; a sentinel should
-        be added on the MCP server side as a follow-up).
-        """
+        """Run `setter` and save state unless `result` contains an error sentinel (then HardStop)."""
         if error_sentinels and any(s in result for s in error_sentinels):
             err = result.split(":", 1)[1].strip() if ":" in result else result
             return HardStop(err)
@@ -90,8 +69,7 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
         return None
 
     async def _emit_raw_logs(self, result: str, fn_args: dict, progress_cb) -> None:
-        """Surfaces get_msight_logs' real output to the frontend verbatim,
-        before the LLM's summary reply."""
+        """Stream get_msight_logs output to the frontend verbatim before the summary."""
         try:
             parsed = json.loads(result)
         except (json.JSONDecodeError, TypeError):
@@ -203,11 +181,7 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
     async def _dispatch(
         self, fn_name, fn_args, call, mcp_client, messages, progress_cb=None
     ) -> tuple[str, list[ToolRouting], bool]:
-        """Execute one tool call; always appends result to messages before returning.
-        The bool return is whether this call failed -- run() uses it to force the
-        model back into a real tool call next iteration rather than narrating an
-        unverified "it worked". Only the silent exception path is flagged here;
-        the state-save failure already surfaces to the user via HardStop."""
+        """Execute one tool call and append its result; returns whether it raised."""
         if progress_cb and fn_name not in ("send_reply", "send_intro"):
             status = TOOL_STATUS_MESSAGES.get(fn_name, f"Running {fn_name.replace('_', ' ')}...")
             await progress_cb("status", {"message": status})
@@ -247,12 +221,7 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
         return result, routings, failed
 
     def _build_dispatch_table(self, fn_name, fn_args, mcp_client, messages, progress_cb):
-        """Maps tool name -> zero-arg async handler, closing over this call's
-        fn_args/mcp_client/messages/progress_cb. Built fresh per call (cheap
-        dict of closures) so registering a new tool is one line here instead
-        of another branch in a long if/elif chain. Handlers themselves live
-        on this class or on the AutoLabelingHandlers/MsightPipelineHandlers
-        mixins -- self._handle_x resolves to whichever defines it via MRO."""
+        """Tool name -> zero-arg async handler for this call. Register new tools here."""
         return {
             "send_reply": lambda: self._handle_send_reply(fn_args),
             "send_intro": lambda: self._handle_send_intro(fn_args, progress_cb),
@@ -313,17 +282,12 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
             spec = WORKFLOW_SPECS.get(workflow_name)
             same_workflow = workflow_name == self.state.workflow_name
 
-            # Same workflow, dataset step not done yet — guard against a dataset-list
-            # loop. Scoped to dataset-requiring workflows so msight_pipeline (which
-            # never confirms one) doesn't misfire this when switching away.
+            # Same workflow, dataset not confirmed yet: avoid a dataset-list loop.
             dataset_list_loop = (
                 same_workflow and spec is not None and spec.requires_dataset
                 and not self.state.dataset_confirmed
             )
-            # Non-dataset workflows have no "restart via switch_workflow" pattern
-            # (unlike auto_labeling's documented confirm_restart mechanism), so
-            # switching to the already-active one is always a misfire — no-op
-            # instead of silently wiping substate via reset_for_workflow.
+            # Re-selecting an active non-dataset workflow is a no-op, not a reset.
             same_workflow_no_restart_path = (
                 same_workflow and spec is not None and not spec.requires_dataset
             )
@@ -393,20 +357,14 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
         return result, [await self._post_workflow_select_routing(workflow_name)]
 
     async def _post_workflow_select_routing(self, workflow_name: str) -> "ToolRouting":
-        """After select/switch_workflow: dataset-driven workflows get the dataset
-        list; others (e.g. msight_pipeline) fall through to their own per-workflow
-        prompt. Relies on chat_server.py rebuilding the system prompt every
-        iteration so the LLM isn't stuck on the stale pre-selection prompt."""
+        """After workflow selection: list datasets if required, else fall through."""
         spec = WORKFLOW_SPECS.get(workflow_name)
         if spec and not spec.requires_dataset:
             return FallThrough()
         return HardStop(await self._fetch_and_return_dataset_list())
 
     async def _handle_send_intro(self, fn_args: dict, progress_cb) -> tuple[str, list[ToolRouting]]:
-        """Shows an informational message without ending the turn (unlike send_reply),
-        so the LLM can explain what it's about to do before the next tool call's own
-        progress/log events stream in. Emitted as an "intro" SSE event; the frontend
-        (index.html's convertStatusBubbleToIntro) makes the status bubble persistent."""
+        """Emit an "intro" SSE message without ending the turn (unlike send_reply)."""
         message = fn_args.get("message", "")
         if progress_cb:
             await progress_cb("intro", {"message": message})
@@ -414,44 +372,10 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
         return message, [FallThrough()]
 
     async def _handle_confirm_run(self) -> tuple[str, list[ToolRouting]]:
-        """confirm_run is workflow-agnostic -- branch on the active workflow
-        rather than adding a near-duplicate tool per workflow. The two branches
-        (auto_labeling vs msight_pipeline) live on their respective handler
-        mixins; this is just the routing between them."""
+        """Route confirm_run to the active workflow's handler."""
         if self.state.workflow_name == "msight_pipeline":
             return await self._handle_confirm_msight_run()
         return await self._handle_confirm_auto_labeling_run()
-
-    def _check_confirm_gate(self, gate_name: str, *, bypass: bool, summary: str) -> Optional[HardStop]:
-        """Generic consent-gate check, matching the shape both
-        _handle_start_msight_pipeline and auto_labeling's run-confirmation
-        handlers already hand-implement (see CONFIRM_GATES in
-        pipeline_common.py for why this is data-driven rather than one
-        `if` block per workflow). Not yet called by either existing site --
-        scaffolding for a future third gate; see ConfirmGateSpec's docstring.
-        Returns a HardStop to return immediately if confirmation is needed,
-        or None if the caller should proceed."""
-        spec = CONFIRM_GATES[gate_name]
-        substate = getattr(self.state, spec.state_path)
-        if bypass or getattr(substate, spec.confirmed_attr):
-            return None
-        setattr(substate, spec.awaiting_attr, True)
-        if spec.requested_at_attr:
-            setattr(substate, spec.requested_at_attr, time.time())
-        self.state.save()
-        return HardStop(summary)
-
-    def _clear_confirm_gate(self, gate_name: str) -> None:
-        """Reset a gate's confirmed/awaiting/TTL bookkeeping after the gated
-        action has been attempted (success or failure) -- pairs with
-        _check_confirm_gate. See that method's docstring."""
-        spec = CONFIRM_GATES[gate_name]
-        substate = getattr(self.state, spec.state_path)
-        setattr(substate, spec.confirmed_attr, False)
-        setattr(substate, spec.awaiting_attr, False)
-        if spec.requested_at_attr:
-            setattr(substate, spec.requested_at_attr, 0.0)
-        self.state.save()
 
     async def _handle_reset_workflow_state(self, mcp_client) -> tuple[str, list[ToolRouting]]:
         result = unwrap_tool_output(await mcp_client.call_tool("reset_workflow_state", {}))

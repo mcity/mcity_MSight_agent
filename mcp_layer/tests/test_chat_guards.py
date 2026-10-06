@@ -1,5 +1,4 @@
-"""Turn-level guards in chat_server.py: the diagnose-then-act consent gate and
-the one-shot LLM connection retry."""
+"""chat_server turn guards: diagnose-then-act consent gate and LLM retry."""
 import asyncio
 
 import pytest

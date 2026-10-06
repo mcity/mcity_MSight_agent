@@ -1,9 +1,4 @@
-"""
-Priority 1: valid_tool_names() and the auto_labeling tool-filtering function.
-
-Each function under test is pure (no I/O); instances are constructed directly from
-Pydantic models — no state is loaded from or saved to config.py.
-"""
+"""valid_tool_names() and auto_labeling tool filtering (pure, no config.py I/O)."""
 import pytest
 from validate_workflow_state import (
     WorkflowState, AutoLabelingState, LabelingBackend, AutoLabelingPhase,
@@ -11,9 +6,7 @@ from validate_workflow_state import (
 )
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 def _al_state(**kwargs) -> WorkflowState:
     """WorkflowState for auto_labeling with a confirmed dataset."""
@@ -26,9 +19,7 @@ def _al_state(**kwargs) -> WorkflowState:
     )
 
 
-# ---------------------------------------------------------------------------
 # valid_tool_names() — base routing
-# ---------------------------------------------------------------------------
 
 def test_valid_tool_names_no_workflow_selected():
     state = WorkflowState()
@@ -43,18 +34,14 @@ def test_valid_tool_names_auto_labeling_dataset_not_confirmed():
 
 
 def test_valid_tool_names_msight_pipeline_skips_dataset_gate():
-    """msight_pipeline is registered with requires_dataset=False -- its tools
-    are already unconditionally in ALWAYS, so no dataset step should appear
-    even though dataset_confirmed is False (the default)."""
+    """msight_pipeline has no dataset step."""
     state = WorkflowState(workflow_name="msight_pipeline")
     result = state.valid_tool_names()
     assert result == ALWAYS
 
 
 def test_workflow_specs_registry_matches_valid_workflow_literal():
-    """WORKFLOW_SPECS is the single source of truth VALID_WORKFLOW derives
-    from -- this documents that invariant rather than testing something that
-    could actually drift (it can't, by construction)."""
+    """VALID_WORKFLOW derives from WORKFLOW_SPECS."""
     assert set(WORKFLOW_SPECS) == {"auto_labeling", "msight_pipeline"}
     for name in WORKFLOW_SPECS:
         WorkflowState(workflow_name=name)  # must not raise
@@ -62,9 +49,7 @@ def test_workflow_specs_registry_matches_valid_workflow_literal():
         WorkflowState(workflow_name="bogus_workflow")
 
 
-# ---------------------------------------------------------------------------
 # _auto_labeling_tools — Phase-locked states
-# ---------------------------------------------------------------------------
 
 def test_auto_labeling_tools_phase_complete():
     state = _al_state(phase=AutoLabelingPhase.COMPLETE, labeling_backend=LabelingBackend.CVAT)
@@ -91,9 +76,7 @@ def test_auto_labeling_tools_phase_training_label_studio_returns_import_from_ls(
     assert state.valid_tool_names() == ALWAYS | {"import_from_label_studio"}
 
 
-# ---------------------------------------------------------------------------
 # _auto_labeling_tools — Backend-selection gate (al=None / no path yet)
-# ---------------------------------------------------------------------------
 
 def test_auto_labeling_tools_al_substate_none_awaiting_backend():
     """With al=None (not yet initialized), should ask for backend detection."""
@@ -126,9 +109,7 @@ def test_auto_labeling_tools_no_path_backend_confirmed_label_studio():
     assert result == ALWAYS | {"set_selected_dataset", "set_labeling_path", "set_labeling_backend"}
 
 
-# ---------------------------------------------------------------------------
 # _auto_labeling_tools — Manual path (CVAT)
-# ---------------------------------------------------------------------------
 
 def test_auto_labeling_tools_manual_cvat_no_classes_no_task():
     state = _al_state(
@@ -166,9 +147,7 @@ def test_auto_labeling_tools_manual_cvat_labels_imported():
     assert result == ALWAYS | {"launch_voxel51_session"}
 
 
-# ---------------------------------------------------------------------------
 # _auto_labeling_tools — Manual path (Label Studio)
-# ---------------------------------------------------------------------------
 
 def test_auto_labeling_tools_manual_ls_no_classes_no_tasks():
     state = _al_state(
@@ -206,16 +185,10 @@ def test_auto_labeling_tools_manual_ls_labels_imported():
     assert result == ALWAYS | {"launch_voxel51_session"}
 
 
-# ---------------------------------------------------------------------------
 # _auto_labeling_tools — Auto path
-# ---------------------------------------------------------------------------
 
 def test_auto_labeling_tools_auto_path_models_listed_true_both_config_tools_visible():
-    """
-    Post-Session-2 collapse: configure_auto_labeling and set_auto_labeling_hyperparams
-    are BOTH visible once models_listed=True (their precondition guards handle premature
-    calls). This was the key collapsed behavior to lock in.
-    """
+    """Both configure tools are visible once models_listed=True."""
     state = _al_state(
         labeling_path="auto", labeling_backend=LabelingBackend.CVAT,
         models_listed=True, model_configured=False, auto_labeling_complete=False,

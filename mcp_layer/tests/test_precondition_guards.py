@@ -1,19 +1,8 @@
-"""
-Priority 2: All can_* precondition guards for the auto_labeling workflow.
-
-Each guard is a method on a Pydantic state model. Tests verify:
-  - Blocking case: precondition not met → (False, non-empty error string)
-  - Passing case: precondition met → (True, "")
-
-No I/O — models constructed directly.
-"""
-import pytest
+"""auto_labeling can_* guards: (False, error) when blocked, (True, "") when met."""
 from validate_workflow_state import WorkflowState, AutoLabelingState
 
 
-# ---------------------------------------------------------------------------
 # WorkflowState.can_confirm_dataset
-# ---------------------------------------------------------------------------
 
 def test_can_confirm_dataset_blocks_when_no_workflow():
     state = WorkflowState()
@@ -29,9 +18,7 @@ def test_can_confirm_dataset_passes_when_workflow_set():
     assert msg == ""
 
 
-# ---------------------------------------------------------------------------
 # AutoLabelingState.can_configure_auto_labeling
-# ---------------------------------------------------------------------------
 
 def test_can_configure_auto_labeling_blocks_when_models_not_listed():
     al = AutoLabelingState(models_listed=False)
@@ -47,9 +34,7 @@ def test_can_configure_auto_labeling_passes_when_models_listed():
     assert msg == ""
 
 
-# ---------------------------------------------------------------------------
 # AutoLabelingState.can_set_auto_labeling_hyperparams
-# ---------------------------------------------------------------------------
 
 def test_can_set_hyperparams_blocks_when_model_not_configured():
     al = AutoLabelingState(model_configured=False)
@@ -65,9 +50,7 @@ def test_can_set_hyperparams_passes_when_model_configured():
     assert msg == ""
 
 
-# ---------------------------------------------------------------------------
 # AutoLabelingState.can_run_auto_labeling
-# ---------------------------------------------------------------------------
 
 def test_can_run_auto_labeling_blocks_when_dataset_not_confirmed():
     al = AutoLabelingState(model_configured=True, labeling_path="auto")
@@ -97,9 +80,7 @@ def test_can_run_auto_labeling_passes_on_auto_path_with_model():
     assert msg == ""
 
 
-# ---------------------------------------------------------------------------
 # AutoLabelingState.can_export_to_cvat
-# ---------------------------------------------------------------------------
 
 def test_can_export_to_cvat_without_predictions_always_passes():
     al = AutoLabelingState(auto_labeling_complete=False)
@@ -122,9 +103,7 @@ def test_can_export_to_cvat_with_predictions_passes_when_complete():
     assert msg == ""
 
 
-# ---------------------------------------------------------------------------
 # AutoLabelingState.can_import_from_cvat
-# ---------------------------------------------------------------------------
 
 def test_can_import_from_cvat_blocks_when_no_task():
     al = AutoLabelingState(cvat_task_id=0)
@@ -140,9 +119,7 @@ def test_can_import_from_cvat_passes_when_task_exists():
     assert msg == ""
 
 
-# ---------------------------------------------------------------------------
 # AutoLabelingState.can_export_to_label_studio
-# ---------------------------------------------------------------------------
 
 def test_can_export_to_label_studio_without_predictions_always_passes():
     al = AutoLabelingState(auto_labeling_complete=False)
@@ -165,9 +142,7 @@ def test_can_export_to_label_studio_with_predictions_passes_when_complete():
     assert msg == ""
 
 
-# ---------------------------------------------------------------------------
 # AutoLabelingState.can_import_from_label_studio
-# ---------------------------------------------------------------------------
 
 def test_can_import_from_label_studio_blocks_when_no_task_ids():
     al = AutoLabelingState(ls_task_ids=[])

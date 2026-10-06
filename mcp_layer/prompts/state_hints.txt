@@ -5,10 +5,7 @@ Machine-parsed: each fragment starts with a line of the form
 filled in via str.format() at call time — see _build_state_hint for exactly
 which values are passed for which fragment. This file holds only the
 instructional prose; the branching logic (which fragment applies, and what
-values to interpolate) stays in chat_server.py, not here — splitting "which
-message" from "what the message says" across two files was judged not worth
-it for control flow this fine-grained (see msight-customizable-pipeline.md
-prompt-architecture note).
+values to interpolate) stays in chat_server.py.
 
 === dataset_not_confirmed ===
 dataset=not confirmed — NEXT STEP: wait for the user to name a dataset, then call set_selected_dataset immediately. Do NOT infer or reuse a dataset name from earlier in the conversation — the user must explicitly type a dataset name in their CURRENT message. Do NOT call switch_workflow or select_workflow again.

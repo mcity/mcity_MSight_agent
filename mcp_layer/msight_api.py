@@ -1,15 +1,7 @@
-"""Plain REST peer to the MCP tool surface -- the `API` front door from the
-original architecture sketch, alongside `MCP` (mcp_server.py, reached by the
-LLM through chat_server.py). Both are thin front doors onto the same
-MSightControlPlane; this one is just triggered by a plain HTTP request
-instead of a model's tool-call decision.
+"""REST front door for the dashboard, alongside the MCP one used by the LLM.
 
-Every route below is a call into an existing MCP tool over the same kind of
-persistent MCP client connection chat_server.py already opens in its own
-lifespan -- deliberately never importing mcptools.* directly. MSightControlPlane's
-node tracking is in-memory, inside whichever process constructed it (that's
-mcp_server.py's process today); a second instance constructed here would
-silently diverge from the one that's actually tracking running nodes.
+Routes call MCP tools rather than importing mcptools directly: node tracking
+lives in mcp_server.py's process, and a second MSightControlPlane here would diverge.
 """
 import asyncio
 import json
@@ -42,9 +34,7 @@ from host_utils import resolve_host
 async def _lifespan(app: FastAPI):
     host = resolve_host()
     mcp_transport = SSETransport(url=f"http://{host}:8000/sse")
-    # Same retry-with-backoff as chat_server.py's lifespan -- deploy-agent.yml
-    # launches services with no ordering guarantee, so mcp_server.py may not
-    # be listening yet on the first attempt.
+    # Retry: mcp_server.py may not be listening yet at startup.
     mcp_client_cm = Client(mcp_transport)
     last_exc: Optional[Exception] = None
     for attempt in range(15):
@@ -87,12 +77,7 @@ async def _json_body(request: Request) -> dict:
 
 
 def _unwrap_json(raw) -> str:
-    """Like pipeline_common.unwrap_tool_output, minus its \\n -> real-newline
-    substitution -- that substitution is meant to make tool output read
-    nicely in the chat UI, but it corrupts JSON re-parsing here whenever a
-    string value contains a real newline (confirmed: get_msight_logs's
-    `logs` field always does), since a raw newline inside a JSON string is
-    invalid syntax."""
+    """unwrap_tool_output without the newline substitution, which breaks JSON re-parsing."""
     if raw is None:
         return ""
     if isinstance(raw, str):
@@ -225,13 +210,7 @@ async def reference(request: Request, topic: str):
     return await _call_tool(request, "get_msight_reference", {"topic": topic})
 
 
-# Dashboard static files (mcp_layer/dashboard, `npm run build`'d into
-# dist/spa) -- mounted last, deliberately, so it only catches whatever none
-# of the explicit routes above matched (Starlette tries routes in
-# registration order; a Mount registered first would shadow everything).
-# Fetches from the dashboard to this same origin need no CORS/CSP exception
-# in production, unlike the `quasar dev` case (a different port, handled by
-# a dev-only <meta> tag in the dashboard's own index.html).
+# Built dashboard (dist/spa), mounted last so it doesn't shadow the API routes.
 _DASHBOARD_DIST = Path(__file__).resolve().parent / "dashboard" / "dist" / "spa"
 if _DASHBOARD_DIST.is_dir():
     app.mount("/", StaticFiles(directory=str(_DASHBOARD_DIST), html=True), name="dashboard")

@@ -1,17 +1,5 @@
-"""
-Priority 4: ChatPipeline._orchestrate() two-pass routing logic.
-
-_orchestrate is synchronous. Tests verify:
-  - Single Injection + single HardStop: Injection appended to messages, HardStop becomes early_reply
-  - Multiple Injections, no HardStop: all appended in order, no early_reply returned
-  - Multiple HardStops: the LAST one wins (documented behavior)
-  - FallThrough items: no effect on messages or early_reply
-
-state.save() is mocked to prevent disk writes; the MCP transport and LLM
-are mocked since _orchestrate never calls them.
-"""
-import pytest
-from unittest.mock import MagicMock, patch
+"""ChatPipeline._orchestrate(): Injections appended in order, last HardStop wins."""
+from unittest.mock import MagicMock
 
 from chat_pipeline import ChatPipeline, Injection, HardStop, FallThrough
 from validate_workflow_state import WorkflowState
@@ -27,9 +15,7 @@ def make_pipeline(dataset_confirmed=False):
     return pipeline
 
 
-# ---------------------------------------------------------------------------
 # Single Injection + single HardStop
-# ---------------------------------------------------------------------------
 
 def test_orchestrate_injection_appended_and_hardstop_returned():
     pipeline = make_pipeline()
@@ -54,9 +40,7 @@ def test_orchestrate_hardstop_alone_returns_reply_with_no_injection():
     assert len(system_msgs) == 0
 
 
-# ---------------------------------------------------------------------------
 # Multiple Injections, no HardStop
-# ---------------------------------------------------------------------------
 
 def test_orchestrate_multiple_injections_all_appended_in_order():
     pipeline = make_pipeline()
@@ -83,9 +67,7 @@ def test_orchestrate_no_routings_returns_none():
     assert result is None
 
 
-# ---------------------------------------------------------------------------
 # Multiple HardStops — last one wins
-# ---------------------------------------------------------------------------
 
 def test_orchestrate_last_hardstop_wins_within_single_list():
     pipeline = make_pipeline()
@@ -117,9 +99,7 @@ def test_orchestrate_last_hardstop_wins_interleaved_with_injections():
     assert result == "last"
 
 
-# ---------------------------------------------------------------------------
 # FallThrough items — no effect
-# ---------------------------------------------------------------------------
 
 def test_orchestrate_fallthrough_items_do_not_affect_messages():
     pipeline = make_pipeline()
@@ -140,9 +120,7 @@ def test_orchestrate_fallthrough_mixed_with_injection_and_hardstop():
     assert any(m["content"] == "ctx" for m in system_msgs)
 
 
-# ---------------------------------------------------------------------------
 # CURRENT_DATASET injection when dataset is confirmed
-# ---------------------------------------------------------------------------
 
 def test_orchestrate_injects_current_dataset_message_when_confirmed():
     pipeline = make_pipeline(dataset_confirmed=True)

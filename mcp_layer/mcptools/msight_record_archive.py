@@ -1,16 +1,11 @@
-"""Record & Archive: nodes that record the *annotated* feed, run through the
-same MSightControlPlane the main pipeline (msight_docker.py) uses -- these 4
-node types are cataloged with invocation="supervisor" (never Docker, per this
-file's original design point: avoid touching the MSight_Vision checkout).
+"""Record & Archive: supervisor-run nodes that record the annotated feed.
 
     video_source --> camera/$SENSOR_NAME --> rfdetr_detector --> detection/$SENSOR_NAME
         --> annotated_frame_publisher (ours, msight_nodes/) --> annotated/$SENSOR_NAME
-        --> image_to_video_aggregator (unmodified) --> video/$SENSOR_NAME --> video_local_dumper / aws_video_pusher
+        --> image_to_video_aggregator --> video/$SENSOR_NAME --> video_local_dumper / aws_video_pusher
 
-The annotator/aggregator dependency chain below (ensure-parent-before-child,
-don't tear down a shared parent while a sibling sink still needs it) is this
-file's own orchestration logic, not something the generic control plane
-models -- it's preserved as-is, just delegating node start/stop through it.
+The annotator/aggregator are shared parents: started before either sink and
+kept alive while any sink still needs them.
 """
 import asyncio
 import os
@@ -24,14 +19,10 @@ from mcptools import mcp
 from mcptools.mcp_json import error_json, ok_json
 from mcptools.msight_docker import _control_plane, _get_msight_path
 
-# Sensor the current/most-recent recording session used -- lets
-# stop_msight_recording find the right segment folder without a
-# sensor_name parameter stop calls don't otherwise need.
+# Sensor of the latest recording session, so stop can find its segments.
 _LAST_RECORDING_SENSOR: Optional[str] = None
 
-# Finished, single-file recordings for chat_server.py's
-# /msight/download_recording route -- separate from the raw per-segment
-# save_dir so a download is always one file, never a folder of chunks.
+# Concatenated single-file recordings served by /msight/download_recording.
 DOWNLOAD_DIR = Path("output/msight_downloads")
 
 ANNOTATOR_NODE = "frame_annotator"
@@ -40,22 +31,17 @@ DUMPER_NODE = "local_dumper"
 PUSHER_NODE = "s3_pusher"
 
 DEFAULT_SENSOR_NAME = "gs_mcity_1"
-# The aggregator only publishes a clip once it's collected this many
-# frames -- no time-based fallback, so a shorter session silently produces
-# zero segments. Kept low so a short test session still produces one; real
-# deployments just get more, smaller segments, auto-concatenated on stop.
+# Frames per aggregator clip; kept low since shorter sessions produce no clip at all.
 DEFAULT_BUFFER_SIZE = 40
 DEFAULT_OVERLAP_SIZE = 0
 DEFAULT_FPS = 20
 
 
 def _active_sensor_name(msight_path: Path) -> str:
-    """Resolve the sensor_name the *running* pipeline actually uses, by
-    reading MSight_Vision's own .env directly rather than guessing --
-    video_source falls back to .env's SENSOR_NAME whenever
-    start_msight_pipeline doesn't override it, and a mismatched guess here
-    would leave the aggregator subscribed to a topic nothing publishes to
-    (stays alive, looks fine, silently records nothing)."""
+    """Sensor name the running pipeline uses (falls back to MSight_Vision's .env).
+
+    A wrong guess leaves the aggregator silently recording nothing.
+    """
     env_path = msight_path / ".env"
     if env_path.is_file():
         for line in env_path.read_text().splitlines():
@@ -68,7 +54,7 @@ def _active_sensor_name(msight_path: Path) -> str:
 
 
 def recording_segment_status(sensor: str) -> dict:
-    """Live on-disk scan of recorded segments -- the only honest way to know if a clip has landed yet."""
+    """Live on-disk scan of recorded segments."""
     save_dir = Path(os.environ.get("MSIGHT_RECORDING_SAVE_DIR", "output/msight_recordings"))
     segment_dir = save_dir / sensor
     segments = sorted(segment_dir.glob(f"{sensor}_*.mp4")) if segment_dir.is_dir() else []
@@ -82,7 +68,7 @@ def recording_segment_status(sensor: str) -> dict:
 
 
 async def _ensure_annotator(msight_path: Path, sensor_name: str) -> tuple[bool, str]:
-    """Idempotent, same pattern as _ensure_aggregator -- draws boxes onto detections and republishes for the aggregator to consume."""
+    """Idempotently start the frame annotator."""
     cp = _control_plane()
     if cp.is_tracked(ANNOTATOR_NODE):
         return True, ""
@@ -97,14 +83,10 @@ async def _ensure_annotator(msight_path: Path, sensor_name: str) -> tuple[bool, 
 
 
 async def _ensure_aggregator(msight_path: Path, sensor_name: str) -> tuple[bool, str]:
-    """Idempotent: archiving alone still needs the aggregator running,
-    since the S3 pusher subscribes to the aggregator's video/ output, not
-    the annotated frame feed directly. Starting recording first is not
-    required.
+    """Idempotently start the aggregator (needed by both recording and archiving).
 
-    Known gap: if the aggregator is already alive, sensor_name isn't
-    checked against what it was actually launched with -- a topic mismatch
-    from a prior call would go unnoticed here."""
+    Known gap: an already-running aggregator isn't checked for a sensor_name mismatch.
+    """
     cp = _control_plane()
     if cp.is_tracked(AGGREGATOR_NODE):
         return True, ""
@@ -157,11 +139,7 @@ async def start_msight_recording(sensor_name: Optional[str] = None) -> str:
 
 
 async def _concat_recording_segments(save_dir: Path, sensor: str) -> tuple[Optional[Path], Optional[str]]:
-    """Combine this session's .mp4 segments (one per aggregator buffer, named
-    "<sensor>_<capture_timestamp>.mp4" -- lexicographic sort is chronological)
-    into one file via ffmpeg's concat demuxer. Stream copy is safe since
-    every segment shares an encoder/pipeline run. Segments are deleted after
-    a successful concat so a later session's segments don't get merged in."""
+    """Concat this session's segments (name order is chronological) with ffmpeg, then delete them."""
     segment_dir = save_dir / sensor
     segments = sorted(segment_dir.glob(f"{sensor}_*.mp4"))
     if not segments:

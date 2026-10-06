@@ -1,12 +1,4 @@
-"""
-Priority 3: WorkflowState._migrate() backward-compatibility logic.
-
-_migrate is a classmethod that normalizes old-shape WORKFLOW_STATE dicts to the
-current schema. Tests verify that representative old shapes migrate without data
-loss or silently dropped fields, and that the migrated dict is accepted by
-WorkflowState.model_validate().
-"""
-import pytest
+"""WorkflowState._migrate(): old WORKFLOW_STATE shapes migrate without data loss."""
 from validate_workflow_state import WorkflowState
 
 
@@ -15,9 +7,7 @@ def migrate(raw: dict) -> dict:
     return WorkflowState._migrate(dict(raw))
 
 
-# ---------------------------------------------------------------------------
 # workflow_name normalization
-# ---------------------------------------------------------------------------
 
 def test_migrate_workflow_name_none_becomes_empty_string():
     result = migrate({"workflow_name": None})
@@ -29,9 +19,7 @@ def test_migrate_workflow_name_already_present_unchanged():
     assert result["workflow_name"] == "auto_labeling"
 
 
-# ---------------------------------------------------------------------------
 # Old top-level auto_labeling fields lifted into subdict
-# ---------------------------------------------------------------------------
 
 def test_migrate_top_level_auto_labeling_complete_lifted_to_subdict():
     """Old shape had auto_labeling_complete at top level with workflow=auto_labeling."""
@@ -80,9 +68,7 @@ def test_migrate_top_level_auto_labeling_fields_dropped_for_non_auto_labeling_wo
     assert "cvat_task_id" not in result
 
 
-# ---------------------------------------------------------------------------
 # auto_labeling subdict — missing optional fields get defaults
-# ---------------------------------------------------------------------------
 
 def test_migrate_auto_labeling_subdict_gets_missing_defaults():
     """An existing auto_labeling subdict that's missing new fields gets defaults added."""
@@ -155,9 +141,7 @@ def test_migrate_auto_labeling_subdict_removes_pending_dataset_change():
     assert "pending_dataset_change" not in result["auto_labeling"]
 
 
-# ---------------------------------------------------------------------------
 # Unknown top-level keys are stripped
-# ---------------------------------------------------------------------------
 
 def test_migrate_unknown_top_level_keys_are_removed():
     raw = {
@@ -183,9 +167,7 @@ def test_migrate_known_top_level_keys_are_preserved():
     assert result["labeled_dataset_name"] == "my_dataset_labeled"
 
 
-# ---------------------------------------------------------------------------
 # Round-trip: migrated dict is valid for WorkflowState.model_validate
-# ---------------------------------------------------------------------------
 
 def test_migrate_result_is_valid_workflow_state_fresh():
     raw = {"workflow_name": None}

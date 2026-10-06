@@ -231,9 +231,7 @@ async def _run_data_ingest_streaming_core(
             ds_name = dataset_prefix or "custom_dataset"
 
         if final_rc == 0:
-            # Ingestion runs outside any chat turn, so nothing else marks the
-            # dataset confirmed -- without this the next chat message can't call
-            # set_labeling_path until the user separately names the dataset.
+            # Ingestion runs outside chat, so confirm the dataset here.
             try:
                 from validate_workflow_state import WorkflowState
                 state = WorkflowState.load()

@@ -53,11 +53,7 @@ def _save_registry(registry: dict):
 
 
 def _build_label_config(classes: list[str]) -> str:
-    """
-    Generate a Label Studio XML label config for rectangle labeling.
-    If no classes are provided (manual path), labels are left empty and the
-    annotator adds them manually in the UI.
-    """
+    """Label Studio rectangle-label XML config (empty labels for the manual path)."""
     label_tags = "\n    ".join(
         f'<Label value="{c}"/>' for c in classes
     ) if classes else ""
@@ -70,10 +66,7 @@ def _build_label_config(classes: list[str]) -> str:
 
 
 def _upload_image(http, project_id: int, path: Path) -> list[int]:
-    """
-    Upload a single image to a Label Studio project.
-    Returns a list of task IDs, resolving the async import job if needed.
-    """
+    """Upload one image; returns its task IDs."""
     import mimetypes
     mime = mimetypes.guess_type(path)[0] or "image/jpeg"
 
@@ -116,13 +109,9 @@ def _upload_image(http, project_id: int, path: Path) -> list[int]:
 def _upload_images_concurrent(
     http, project_id: int, paths: list[Path], max_workers: int = 3
 ) -> dict[str, int]:
-    """
-    Upload images one-per-POST using a thread pool, return {filename: task_id}.
+    """Upload images one per POST (LS makes one task per POST); returns {filename: task_id}.
 
-    LS creates exactly one task per POST regardless of how many files are packed
-    into a single multipart body, so per-file uploads are required for N tasks.
-    Concurrency removes the per-image latency; max_workers=3 stays under LS
-    cloud rate limits (429 appears above ~5 simultaneous uploads).
+    max_workers=3 stays under LS cloud rate limits (429s above ~5).
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -169,10 +158,7 @@ def _upload_images_concurrent(
 
 
 def _detections_to_ls_results(detections) -> list:
-    """
-    Convert FiftyOne detections to Label Studio rectanglelabels result format.
-    FiftyOne bbox: [x, y, w, h] normalized [0,1] -> LS percentages [0,100].
-    """
+    """FiftyOne detections (normalized) -> LS rectanglelabels (percent)."""
     results = []
     for det in detections:
         x, y, w, h = det.bounding_box
@@ -192,13 +178,7 @@ def _detections_to_ls_results(detections) -> list:
 
 
 def _attach_as_annotations(http, task_id: int, detections, label_field: str):
-    """
-    Import model detections as annotations (not predictions) so they appear
-    as editable boxes in the Label Studio labeling interface.
-
-    Predictions are read-only and cause a blank image when clicking Label.
-    Annotations are editable and become ground truth after the annotator submits.
-    """
+    """Import detections as editable annotations (predictions render blank in the Label view)."""
     results = _detections_to_ls_results(detections)
     if not results:
         return
@@ -221,10 +201,7 @@ def _attach_as_annotations(http, task_id: int, detections, label_field: str):
 
 
 def _export_snapshot(http, project_id: int) -> list[dict]:
-    """
-    Create an export snapshot, poll until ready, and download as JSON.
-    Returns a list of task dicts.
-    """
+    """Create an export snapshot, wait for it, and return its task dicts."""
     snap_resp = http.request(
         f"/api/projects/{project_id}/exports",
         method="POST",
@@ -264,10 +241,7 @@ def _export_snapshot(http, project_id: int) -> list[dict]:
 
 
 def _ls_result_to_fo_detection(result: dict, img_w: int, img_h: int):
-    """
-    Convert a single Label Studio rectanglelabels result to a FiftyOne Detection.
-    LS value coords are percentages [0,100]; FiftyOne expects normalized [0,1].
-    """
+    """LS rectanglelabels result (percent) -> FiftyOne Detection (normalized)."""
     val = result.get("value", {})
     labels = val.get("rectanglelabels", [])
     if not labels:
@@ -377,10 +351,7 @@ def export_to_label_studio(
         return "LS_TOKEN not set in .env"
 
     try:
-        # fo.load_dataset() returns a process-wide singleton keyed by name — if this
-        # process already loaded this dataset earlier (e.g. during selection/listing),
-        # its in-memory schema can be stale relative to fields another process (the
-        # auto-labeling subprocess) just wrote. reload() forces a resync from Mongo.
+        # load_dataset() returns a cached singleton; reload() picks up fields another process wrote.
         dataset = fo.load_dataset(dataset_name)
         dataset.reload()
     except Exception as e:
@@ -447,8 +418,7 @@ def export_to_label_studio(
         project_id = project.id
         logging.warning(f"[LS] Created project {project_id} for dataset '{dataset_name}'")
 
-        # PATCH label config separately — projects.create() sometimes ignores it
-        # on HumanSignal cloud, so this guarantees labels appear in the UI.
+        # PATCH separately: HumanSignal cloud sometimes ignores it on create.
         if classes:
             patch_resp = http.request(
                 f"/api/projects/{project_id}",
@@ -606,8 +576,7 @@ def import_from_label_studio(dataset_name: str) -> str:
             image_ref  = data.get("image", "") or data.get("$undefined$", "")
             filename   = image_ref.split("/")[-1].split("?")[0]  # strip query params
 
-            # LS prepends a random UUID to uploaded filenames (e.g. "8c7230d6-000001.jpg").
-            # Try a direct match first, then strip the UUID prefix.
+            # LS prefixes uploads with a UUID ("8c7230d6-000001.jpg"); try both forms.
             filepath = path_map.get(filename)
             if not filepath:
                 parts = filename.split("-", 1)

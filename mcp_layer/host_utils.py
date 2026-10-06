@@ -2,10 +2,7 @@ import logging
 
 import requests
 
-# Cached for the process lifetime -- whether this host is on EC2, and what its
-# public IP is, can't change mid-run. Without caching, a high-frequency caller
-# (e.g. the dashboard's status polling, every 4s) would pay IMDS's ~2s timeout
-# on every single call -- confirmed happening live before this fix.
+# Cached per process: IMDS lookups can take ~2s and the dashboard polls every 4s.
 _imds_token: str | None = None
 _imds_checked = False
 _resolved_host: str | None = None
@@ -56,5 +53,5 @@ def resolve_host() -> str:
 
 
 def is_cloud_deployment() -> bool:
-    """True if running on an EC2 instance -- used to decide whether a local host filesystem path is meaningful to offer the user."""
+    """True if running on EC2."""
     return get_imds_token() is not None

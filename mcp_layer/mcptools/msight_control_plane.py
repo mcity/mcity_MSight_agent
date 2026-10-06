@@ -1,18 +1,8 @@
-"""MSightControlPlane -- the one wrapper class msight_docker.py and
-msight_record_archive.py delegate to. It is the only thing that knows which
-nodes are tracked; it has no @mcp.tool() of its own and is never imported by
-mcp_server.py directly (it's plumbing, not a tool module).
+"""MSightControlPlane: the single owner of tracked MSight nodes (no MCP tools here).
 
-add_node / delete_node / recompose dispatch each node to whichever Executor
-its NodeSpec names (docker vs supervisor) -- picked per node type, not once
-globally, since msight_record_archive.py's whole design point is to avoid
-Docker entirely, while the RF-DETR stack needs the image's ML environment.
-
-get_status() bypasses the executor completely: every msight_core node
-self-registers into the Redis hash "MSIGHT:NODES" (confirmed literal --
-docker-compose.yml's own startup line does `redis-cli hdel MSIGHT:NODES
-video_source rfdetr_detector detection_viewer`) regardless of who launched
-it, so status is read straight from Redis, backend-agnostic for free.
+Each node runs on the Executor its NodeSpec names (docker or supervisor).
+Status is read from the Redis hash MSIGHT:NODES, where every msight_core
+node self-registers, so it is backend-agnostic.
 """
 import asyncio
 import json
@@ -79,16 +69,11 @@ def _publishers(rows: list[dict]) -> dict[str, list[dict]]:
 
 
 def structural_findings(rows: list[dict]) -> list[dict]:
-    """Cheap graph checks -- registry topics + liveness only, no rate probe,
-    so safe to run on every status call. rows need name, alive,
-    publish_topics, subscribe_topics.
+    """Cheap graph checks (registry + liveness, no rate probe).
 
-    DEAD               a registered/tracked node isn't running
-    MISSING_PUBLISHER  a running node subscribes to a topic no registered node
-                       publishes (upstream removed, crashed and deregistered,
-                       or never started) -- this is how a node deleted from the
-                       middle of a pipeline shows up, without knowing its name
-    TOPIC_MISMATCH     same, but a published topic name is a near-match
+    DEAD               tracked node isn't running
+    MISSING_PUBLISHER  a running node subscribes to a topic nobody publishes
+    TOPIC_MISMATCH     same, but a published topic is a near-match
     """
     import difflib
     pubs = _publishers(rows)
@@ -122,8 +107,7 @@ def structural_findings(rows: list[dict]) -> list[dict]:
     return findings
 
 
-# User-facing wording -- no tool names (base_prompt.txt forbids showing them);
-# the model maps these to the right tool calls itself.
+# User-facing wording: no tool names (base_prompt.txt forbids showing them).
 _FIXES = {
     "DEAD": "Restart that node with the same settings (or restart the whole pipeline "
             "if it's one of the standard pipeline's nodes).",
@@ -138,13 +122,11 @@ _FIXES = {
 
 
 def diagnose_from_health(rows: list[dict]) -> dict:
-    """Ranked root causes vs downstream effects, from node_health() rows.
+    """Rank root causes vs downstream effects from node_health() rows.
 
-    A broken node only counts as a root cause if nothing upstream of it is
-    also broken -- msight_core nodes kill themselves after ~15s without input,
-    so one failure cascades, and the downstream deaths are effects, not causes.
-    STARVED nodes are always effects; each is attributed to the first broken
-    node found walking upstream from it (or to its missing publisher)."""
+    A broken node is a root cause only if nothing upstream is broken, since
+    msight_core nodes exit after ~15s without input and failures cascade.
+    """
     if not rows:
         return {"verdict": "empty", "summary": "No MSight nodes are registered or tracked.",
                 "root_causes": [], "affected": [], "nodes": []}
@@ -225,16 +207,11 @@ def diagnose_from_health(rows: list[dict]) -> dict:
 
 
 def _sample_topic_rates(topics: list[str], max_window: float) -> dict[str, dict]:
-    """Per-topic message count and rate, measured by subscribing (the
-    `ros2 topic hz` approach). msight_core's Redis backend publishes on a
-    channel named exactly the topic string. Own client, decode_responses=False:
-    payloads are binary frames/detections, not text.
+    """Per-topic message rate, measured by subscribing to each topic's Redis channel.
 
-    Adaptive window: stops as soon as every topic has delivered a message, else
-    at max_window. A fixed short window misreads slow-but-healthy topics as
-    silent -- RF-DETR on this host emits one detection every ~4.5s, so a 2s
-    window flapped between 0 and 1 messages (confirmed live). max_window must
-    exceed the slowest healthy interval."""
+    Stops once every topic has delivered, else at max_window, which must exceed
+    the slowest healthy interval (RF-DETR on CPU: ~4.5s).
+    """
     import time
     import redis
     if not topics:
@@ -257,9 +234,7 @@ def _sample_topic_rates(topics: list[str], max_window: float) -> dict[str, dict]
                 if channel in counts:
                     counts[channel] += 1
                     if all(counts.values()):
-                        # Keep listening to at least 1s so an early lucky
-                        # message doesn't yield a wildly inflated rate (saw
-                        # 11 Hz from 0.1s for a 0.2 Hz topic).
+                        # Listen >=1s so one early message doesn't inflate the rate.
                         deadline = min(deadline, max(start + 1.0, time.monotonic()))
     finally:
         pubsub.close()
@@ -292,9 +267,7 @@ class MSightControlPlane:
 
         if name in self._nodes:
             tracked = self._nodes[name]
-            # Verify liveness, don't just trust presence -- a node that died
-            # externally would otherwise stay "tracked" forever and this
-            # idempotency check would skip restarting it.
+            # Check liveness, not tracking, so an externally-killed node gets restarted.
             if await self._executor_for(tracked.invocation).is_alive(tracked.handle):
                 return tracked.handle
             del self._nodes[name]
@@ -326,19 +299,13 @@ class MSightControlPlane:
         return handle
 
     def is_tracked(self, name: str) -> bool:
-        """In-memory tracking, plus a cheap synchronous fallback for
-        supervisor-backed nodes via their pidfile (recover_supervisor_handle
-        -- no subprocess call needed, unlike Docker's equivalent check, so
-        this stays sync rather than forcing every caller to await it)."""
+        """In-memory tracking, with a pidfile fallback for supervisor nodes."""
         if name in self._nodes:
             return True
         return recover_supervisor_handle(name) is not None
 
     async def is_alive(self, name: str) -> bool:
-        """Real liveness, not just tracking -- is_tracked() can be stale.
-        Same dual fallback as delete_node(): tracked in memory, or
-        recoverable by deterministic name (Docker) / pidfile (Supervisor)
-        after a restart."""
+        """Real liveness; survives restarts via container name or pidfile."""
         tracked = self._nodes.get(name)
         if tracked is not None:
             return await self._executor_for(tracked.invocation).is_alive(tracked.handle)
@@ -355,8 +322,7 @@ class MSightControlPlane:
             executor = self._executor_for(tracked.invocation)
             await executor.stop(tracked.handle)
         else:
-            # Not tracked in memory (e.g. the server restarted) -- try both
-            # recovery paths; harmless if neither finds anything.
+            # Not tracked (e.g. server restarted): try both recovery paths.
             try:
                 await self._executor_for("docker").stop(DockerHandle(f"msight-{name}"))
             except Exception:
@@ -367,8 +333,7 @@ class MSightControlPlane:
                     await self._executor_for("supervisor").stop(recovered)
                 except Exception:
                     pass
-        # Nodes don't reliably deregister from Redis on shutdown -- clear it
-        # ourselves so get_status() doesn't report ghosts.
+        # Nodes don't reliably deregister on shutdown; clear Redis to avoid ghosts.
         self._redis_client().hdel(NODES_REDIS_KEY, name)
 
     async def recompose(self, desired: list[dict]) -> dict:
@@ -389,8 +354,7 @@ class MSightControlPlane:
         for name, d in desired_by_name.items():
             tracked = self._nodes.get(name)
             if tracked is not None and tracked.node_type == d["node_type"]:
-                # Verify liveness, don't just trust tracking -- a node that
-                # died externally would otherwise stay "unchanged" forever.
+                # Check liveness, not tracking, so dead nodes aren't kept as "unchanged".
                 executor = self._executor_for(tracked.invocation)
                 if await executor.is_alive(tracked.handle):
                     unchanged.append(name)
@@ -404,11 +368,7 @@ class MSightControlPlane:
         return {"added": added, "removed": removed, "unchanged": unchanged}
 
     async def _ensure_redis(self) -> None:
-        """redis itself isn't an msight_core node -- it never registers into
-        MSIGHT:NODES -- so it's deliberately not in NODE_CATALOG, but every
-        node needs it reachable before it can even start. Starts our own
-        container only if nothing is already listening; leaves an existing
-        Redis (host-installed, or someone else's container) untouched."""
+        """Start a Redis container only if nothing is listening (Redis isn't in NODE_CATALOG)."""
         import redis as redis_lib
         host = os.environ.get("MSIGHT_REDIS_MESSAGE_BROKER_HOST", "localhost")
         port = int(os.environ.get("MSIGHT_REDIS_MESSAGE_BROKER_PORT", 6379))
@@ -462,18 +422,13 @@ class MSightControlPlane:
         return sorted(nodes, key=lambda n: n["name"])
 
     async def node_health(self, max_window: float = 10.0) -> list[dict]:
-        """One health verdict per node, from real liveness plus measured topic
-        rates rather than heartbeats alone. msight_core only heartbeats every N
-        *messages*, so a starved downstream node goes stale exactly like a dead
-        one -- and with its default action_on_error="stop" it then kills itself,
-        cascading one failure down the pipeline. Rates tell the two apart:
+        """One verdict per node from liveness + measured topic rates (heartbeats
+        alone can't tell starved from dead).
 
-          DEAD          process/container not running
-          UNREGISTERED  running, but missing from the Redis registry
-          STARVED       running, but nothing arrives on its input topic
-                        (an upstream problem -- a symptom, not the cause)
-          STALLED       input arriving (or it's a source), but it publishes nothing
-                        (this node itself is broken)
+          DEAD          not running
+          UNREGISTERED  running, missing from the Redis registry
+          STARVED       running, no input arriving (upstream problem)
+          STALLED       input arriving (or a source), publishes nothing
           OK            otherwise
         """
         import time
@@ -545,10 +500,7 @@ class MSightControlPlane:
         if tracked is not None:
             executor = self._executor_for(tracked.invocation)
             return await executor.logs(tracked.handle, tail)
-        # Not tracked in this process's memory -- e.g. the server restarted.
-        # Docker containers have a deterministic name (msight-{name}), and
-        # supervisor-backed nodes leave a pidfile behind -- either way, logs
-        # are still reachable even though we lost the in-memory handle.
+        # Not tracked (e.g. server restarted): recover via container name or pidfile.
         try:
             return await self._executor_for("docker").logs(DockerHandle(f"msight-{name}"), tail)
         except Exception:

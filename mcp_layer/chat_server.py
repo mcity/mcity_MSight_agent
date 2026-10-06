@@ -103,8 +103,7 @@ def _reset_state_on_startup() -> None:
 
 
 async def _mcp_log_handler(params) -> None:
-    """Relay ctx.log() notifications from a running MCP tool call to whichever
-    /chat/stream request is awaiting one, via progress_relay, as an SSE "log" event."""
+    """Relay MCP ctx.log() notifications to the active /chat/stream as SSE "log" events."""
     cb = get_active_progress_cb()
     if not cb:
         return
@@ -118,13 +117,8 @@ async def _lifespan(app: FastAPI):
     app.state.llm_clients = {}
     host = resolve_host()
     mcp_transport = SSETransport(url=f"http://{host}:8000/sse")
-    # One persistent MCP connection for the app's lifetime, instead of opening
-    # a fresh SSE connection per chat turn (was adding several seconds of
-    # connect + initialize overhead to every request that called a tool).
-    #
-    # deploy-agent.yml launches mcp_server.py and chat_server.py back-to-back
-    # with no ordering guarantee, so mcp_server may not be listening yet on
-    # the first attempt -- retry with backoff instead of failing startup.
+    # One persistent MCP connection for the app's lifetime; retried because
+    # mcp_server.py may not be listening yet at startup.
     mcp_client_cm = Client(mcp_transport, log_handler=_mcp_log_handler)
     last_exc: Exception | None = None
     for attempt in range(15):
@@ -155,8 +149,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Workflow registration lives in validate_workflow_state.WORKFLOW_SPECS — add an
-# entry there + drop the file in prompts/workflows/ to register a new workflow.
+# New workflow: add to WORKFLOW_SPECS and drop its prompt in prompts/workflows/.
 _PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 WORKFLOW_PROMPT_TEXT = {
@@ -164,8 +157,7 @@ WORKFLOW_PROMPT_TEXT = {
     for name, spec in WORKFLOW_SPECS.items()
 }
 
-# Demo mode's default video source is deployment-specific, so it's read from
-# .env rather than hardcoded in the prompt file.
+# Demo video is deployment-specific, so it comes from .env.
 _MSIGHT_DEMO_VIDEO_PATH = os.environ.get("MSIGHT_DEMO_VIDEO_PATH", "").strip()
 if _MSIGHT_DEMO_VIDEO_PATH:
     _DEMO_VIDEO_HINT = (
@@ -188,9 +180,7 @@ else:
         "within Demo — Demo never takes one."
     )
 
-# Checked once at startup (IMDSv2) -- a local file/folder path is only a
-# meaningful thing to offer the user when they actually have access to this
-# host's filesystem, which isn't true for a cloud sandbox.
+# Local paths are only offered when the user can reach this host's filesystem.
 _ENVIRONMENT_HINT = (
     "This host is a cloud sandbox — the user has no access to its filesystem. "
     "Never offer or accept a local file/folder path as a video source here; "
@@ -201,9 +191,7 @@ _ENVIRONMENT_HINT = (
     "so a local file/folder path is a valid video source option here."
 )
 def _strip_marked_block(text: str, tag: str, keep: bool) -> str:
-    """Removes a <!-- TAG:START -->...<!-- TAG:END --> block from
-    msight_pipeline.txt. keep=True strips just the marker lines; keep=False
-    strips the marker lines and everything between them."""
+    """Strip <!-- TAG:START/END --> markers; keep=False also drops the content between them."""
     start, end = f"<!-- {tag}:START -->", f"<!-- {tag}:END -->"
     if keep:
         return text.replace(start + "\n", "").replace(end + "\n", "")
@@ -233,11 +221,9 @@ BASE_PROMPT = (
 
 
 def _load_state_hints() -> dict[str, str]:
-    """Parse prompts/state_hints.txt into {name: template}, sections delimited
-    by "=== name ===" marker lines. Filled in via .format() in _build_state_hint."""
+    """Parse prompts/state_hints.txt ("=== name ===" sections) into {name: template}."""
     text = (_PROMPTS_DIR / "state_hints.txt").read_text()
     sections = re.split(r"^=== (\w+) ===\s*$", text, flags=re.MULTILINE)
-    # re.split with a capturing group returns [preamble, name1, body1, name2, body2, ...]
     return {
         name: body.strip()
         for name, body in zip(sections[1::2], sections[2::2])
@@ -269,9 +255,7 @@ def _attach_source(message: str, source: str | None) -> str:
 def _iteration_tool_choice(
     iteration: int, force_ground_next: bool, allow_send_reply_on_iteration_0: bool, current_tools: list
 ) -> tuple[str, bool, list]:
-    """(tool_choice, force_grounded, iteration_tools) for one run_pipeline
-    loop iteration -- see _GROUNDING_EXEMPT_TOOLS for why send_reply is
-    excluded on a grounded iteration."""
+    """(tool_choice, force_grounded, iteration_tools) for one loop iteration."""
     force_grounded = iteration == 0 or force_ground_next
     tool_choice = "required" if force_grounded else "auto"
     exclude_send_reply = force_grounded and not (iteration == 0 and allow_send_reply_on_iteration_0)
@@ -283,9 +267,7 @@ def _iteration_tool_choice(
 
 
 async def _chat_with_retry(llm_client, messages, **kwargs):
-    """One retry on a dropped connection/timeout -- matched by exception class
-    name so it works across the openai/anthropic/groq/httpx SDKs. Anything
-    else (bad request, auth) fails immediately."""
+    """Retry once on connection/timeout errors (matched by class name across SDKs)."""
     try:
         return await llm_client.chat(messages, **kwargs)
     except Exception as e:
@@ -307,8 +289,7 @@ def _llm_connection_error_message(exc: Exception) -> str:
 
 
 def _solo_send_reply_message(tool_call, pipeline) -> str:
-    """Final reply text for a solo send_reply call -- same source-tag
-    enforcement as chat_pipeline.py's _handle_send_reply."""
+    """Reply text for a solo send_reply call (mirrors ChatPipeline._handle_send_reply)."""
     try:
         args = json.loads(tool_call.function.arguments)
         source = None if (pipeline and pipeline.write_succeeded_this_turn) else args.get("source")
@@ -318,8 +299,7 @@ def _solo_send_reply_message(tool_call, pipeline) -> str:
 
 
 def _next_force_ground(tool_results: list) -> tuple[bool, str]:
-    """Whether the *next* iteration must be grounded, and why (for logging):
-    send_intro without its promised follow-up, or a real tool failure."""
+    """Whether the next iteration must be grounded, and why."""
     if len(tool_results) == 1 and tool_results[0]["name"] == "send_intro":
         return True, "send_intro without its promised follow-up call"
     failed = [r["name"] for r in tool_results if r.get("failed")]
@@ -329,9 +309,7 @@ def _next_force_ground(tool_results: list) -> tuple[bool, str]:
 
 
 def _honest_exhaustion_fallback(all_tool_results: list) -> str:
-    """Absolute last resort, only reached if even the forced wrap-up call
-    (see run_pipeline) fails outright. Must not claim generic failure when a
-    real action actually succeeded this turn -- that was the whole bug."""
+    """Last-resort reply; never claims failure if a write tool succeeded this turn."""
     if any(r["name"] in WRITE_TOOLS and not r.get("failed") for r in all_tool_results):
         return (
             "I made real progress on this before running out of steps to summarize it "
@@ -355,28 +333,19 @@ def filter_tools_for_state(all_tools: list, state) -> list:
 
 
 def _msight_calibration_hint() -> str:
-    """Live filesystem+checksum check, called directly (not via MCP round trip)
-    since it must run on every turn's state hint, not only when the LLM asks."""
+    """Live calibration check, called directly since it runs every turn."""
     msight_path, err = _get_msight_path()
     if err:
         return "calibration=unknown (MSIGHT_VISION_PATH not configured)"
     return calibration_state_label(_calibration_status(msight_path)["state"], prefixed=True)
 
 
-#: Fixed names start_msight_pipeline always uses (see mcptools/msight_docker.py).
 _DEMO_PIPELINE_NODE_NAMES = ("video_source", "rfdetr_detector", "detection_viewer")
 
-# tool_choice="required" only guarantees *a* tool call, not the right one --
-# send_reply is a valid, zero-effect "just talk" tool the model could use to
-# narrate a result instead of producing it. Excluded whenever a turn is
-# grounded (iteration 0, and right after a real failure) so send_reply can't
-# become an escape hatch. Named/documented so a future text-only tool doesn't
-# quietly become a new one.
+# Text-only tools, excluded on grounded iterations so they can't narrate instead of act.
 _GROUNDING_EXEMPT_TOOLS = frozenset({"send_reply"})
 
-# Diagnose-then-act consent gate: once a turn has run diagnose_msight_pipeline,
-# write tools stay off for the rest of it unless the user's message asked for
-# a change ("the viewer is frozen" reports a symptom; "...fix it" asks).
+# Consent gate: after a diagnosis, write tools stay off unless the user asked for a change.
 _CHANGE_REQUEST_RE = re.compile(
     r"\b(fix|repair|restart|restore|resolve|recover|relaunch|reset|start|stop|add|"
     r"remove|delete|re-?add|bring (it )?back|go ahead|do it|yes|yeah|yep|sure|ok|okay)\b",
@@ -392,19 +361,14 @@ _WRITES_BLOCKED_NOTE = (
 def _without_writes(tool_list: list) -> list:
     return [t for t in tool_list if t["function"]["name"] not in WRITE_TOOLS]
 
-# Default workflow entry (see chat_stream): auto_labeling is the only other
-# top-level-reachable workflow, so a plain keyword check is enough to decide
-# the default without asking the model to remember to do it every session.
+# Keyword check for the default workflow; anything else defaults to msight_pipeline.
 _AUTO_LABELING_TRIGGERS = (
     "auto labeling", "auto-labeling", "auto labelling", "auto-labelling", "autolabeling",
 )
 
 
 async def _msight_any_alive(names: tuple[str, ...]) -> bool:
-    """Live check (is_alive, not is_tracked -- presence in memory can be
-    stale) -- pipeline_running/recording_active/archiving_active are only
-    updated by this chat's own handlers, so they drift if the underlying
-    thing is stopped/started any other way (dashboard, direct API, crash)."""
+    """Live liveness check; persisted *_active flags drift when changed outside chat."""
     msight_path, err = _get_msight_path()
     if err:
         return False
@@ -423,10 +387,7 @@ async def _msight_pipeline_running_live() -> bool:
 
 
 async def _msight_problems_hint() -> str:
-    """Generic graph problems (dead nodes, inputs with no publisher) over every
-    registered node, injected every turn as a blunt fact -- asking the model to
-    spot a node missing from a status list has repeatedly not worked. Cheap:
-    no data-flow sampling (that's diagnose_msight_pipeline)."""
+    """Structural graph problems (dead nodes, unpublished inputs), injected every turn."""
     msight_path, err = _get_msight_path()
     if err:
         return ""
@@ -445,8 +406,7 @@ async def _msight_problems_hint() -> str:
 
 
 async def _msight_pipeline_state_hint(mp, state=None) -> str:
-    """Status for msight_pipeline's customize checklist, reported every turn
-    so the LLM never has to infer checklist progress from conversation memory."""
+    """Per-turn checklist status so the LLM never infers progress from memory."""
     if mp is None:
         return (
             "msight_checklist(mode=not set, source=not set, "
@@ -469,9 +429,7 @@ async def _msight_pipeline_state_hint(mp, state=None) -> str:
     parts.append(f"archiving={'active' if archiving_active else 'pending (will auto-start when pipeline starts)' if mp.archiving_pending else 'not active'}")
     parts.append(f"pipeline_running={pipeline_running}")
 
-    # Every persisted flag above is a display cache, not ground truth -- resync
-    # any that drifted (stopped/started via a non-chat route) in one save, so
-    # they don't keep re-diverging and re-checking every single turn.
+    # Persisted flags are a cache; resync any that drifted from live state.
     dirty = False
     for attr, live in (
         ("recording_active", recording_active),
@@ -552,9 +510,7 @@ async def _build_state_hint(state=None) -> str:
                         STATE_HINTS["manual_classes_awaiting_confirm"].format(classes=classes_s)
                     )
             if al.phase in (AutoLabelingPhase.ANNOTATING, AutoLabelingPhase.TRAINING):
-                # COMPLETE deliberately excluded: it's handled below by the
-                # labels_imported check instead. Including it here used to make
-                # both hints fire at once with contradictory advice.
+                # COMPLETE is handled by the labels_imported check below.
                 action = {
                     AutoLabelingPhase.ANNOTATING: "export complete — awaiting annotation",
                     AutoLabelingPhase.TRAINING:   "auto-labeling complete — awaiting import",
@@ -603,8 +559,7 @@ async def msight_upload_calibration(
     intrinsics: UploadFile = File(...),
     locmap: UploadFile = File(...),
 ):
-    """Writes the user's calibration files into MSight_Vision at the fixed
-    paths rfdetr_config.yaml already points at, so the config never needs touching."""
+    """Write calibration files to the fixed paths rfdetr_config.yaml already references."""
     msight_path, err = _get_msight_path()
     if err:
         return JSONResponse({"status": "error", "message": err}, status_code=400)
@@ -674,7 +629,6 @@ async def msight_upload_calibration(
     })
 
 
-# Lets a browser-uploaded video land on this server's disk for use as video_input (cloud sandboxes have no shared host filesystem with the user).
 MSIGHT_UPLOAD_DIR = Path("output/msight_uploads")
 MSIGHT_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
 MSIGHT_MAX_UPLOAD_BYTES = int(os.environ.get("MSIGHT_MAX_UPLOAD_BYTES", 2 * 1024**3))  # 2GB default
@@ -683,7 +637,7 @@ _UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
 
 @app.post("/msight/upload_video")
 async def msight_upload_video(video: UploadFile = File(...)):
-    """Streams the upload to disk in chunks (unlike upload_calibration's small-file `read()`) and enforces MSIGHT_MAX_UPLOAD_BYTES while streaming."""
+    """Stream a browser-uploaded video to disk for use as video_input, enforcing the size cap."""
     suffix = Path(video.filename or "").suffix.lower()
     if suffix not in MSIGHT_VIDEO_EXTENSIONS:
         return JSONResponse(
@@ -722,16 +676,15 @@ async def msight_upload_video(video: UploadFile = File(...)):
     return JSONResponse({
         "status": "ok",
         "message": f"Uploaded '{video.filename}' ({written / 1024**2:.1f} MB).",
-        # Absolute, since docker compose resolves VIDEO_INPUT relative to its own cwd, not this server's.
+        # Absolute: docker compose resolves VIDEO_INPUT against its own cwd.
         "video_input": str(dest.resolve()),
     })
 
 
 @app.get("/msight/download_recording/{filename}")
 async def msight_download_recording(filename: str):
-    """Serves a finished recording as a browser download, since a chat reply
-    can only hand back a server-local path the user may have no access to."""
-    # Reject anything but a bare filename so a crafted "../.." can't escape the dir.
+    """Serve a finished recording as a browser download."""
+    # Bare filenames only, to block path traversal.
     if "/" in filename or "\\" in filename or filename in (".", ".."):
         return JSONResponse({"status": "error", "message": "Invalid filename."}, status_code=400)
 
@@ -797,11 +750,7 @@ async def msight_record_status():
 async def _select_default_workflow(
     _state: "WorkflowState | None", message: str, llm_client, request: Request
 ) -> tuple["WorkflowState | None", "ChatPipeline | None"]:
-    """Deterministic default workflow entry -- see _AUTO_LABELING_TRIGGERS
-    above. Reuses ChatPipeline's own select_workflow handler (not a
-    re-implementation) so this stays in sync with what an LLM-driven
-    select_workflow call would do. No-op (returns _state unchanged, no
-    pipeline) unless a workflow still needs to be picked this session."""
+    """Pick a default workflow in code via ChatPipeline's own handler; no-op if one is set."""
     if _state is None or _state.workflow_name:
         return _state, None
 
@@ -888,26 +837,12 @@ async def chat_stream(request: Request):
     async def run_pipeline() -> None:
         try:
             current_tools = active_tools
-            # Reuse the pipeline the default-workflow-selection step already
-            # built, if any, instead of losing its state/write-tracking.
             pipeline = early_pipeline
-            # 8, not the usual ReAct-loop 10-25 -- these tools are coarse
-            # (one call does a lot), but a real action plus a few verification
-            # calls (status, logs, reference) can still legitimately use 5+.
+            # Tools are coarse, but an action plus a few verification calls can use 5+.
             MAX_AGENTIC_ITERATIONS = 8
-            # Accumulated across every iteration so the budget-exhausted path
-            # can tell "real progress happened" from "nothing happened" --
-            # never claim generic failure when a write tool actually succeeded.
             all_tool_results: list[dict] = []
-            # Set after a real tool call fails -- forces the *next* iteration
-            # grounded too (tool_choice reverts to "auto" otherwise, and
-            # send_reply could narrate success over an actual failure).
             force_ground_next = False
-            # A fresh session's first LLM call still requires *some* tool
-            # call, but send_reply stays allowed here specifically so the
-            # model can ask STEP 1's question instead of guessing a mode.
-            # Not relaxed for later turns -- that's exactly the escape hatch
-            # the exclusion otherwise prevents.
+            # Fresh session: let the model ask STEP 1's question instead of guessing.
             allow_send_reply_on_iteration_0 = early_pipeline is not None
             change_requested = bool(_CHANGE_REQUEST_RE.search(message))
             writes_blocked_noted = False
@@ -928,9 +863,7 @@ async def chat_stream(request: Request):
 
                 if not (hasattr(assistant_message, "tool_calls") and assistant_message.tool_calls):
                     if force_grounded:
-                        # tool_choice="required" should never produce a plain
-                        # no-tool-call reply -- if a provider ignores that
-                        # anyway, retry grounded rather than accept it.
+                        # Provider ignored tool_choice="required"; retry rather than accept.
                         logging.warning(
                             f"[STREAM DECISION] iter={iteration} → provider ignored "
                             "tool_choice='required' (no tool call on a grounded "
@@ -998,10 +931,7 @@ async def chat_stream(request: Request):
                         writes_blocked_noted = True
                         logging.warning("[STREAM] Diagnosis without a change request -- write tools off for this turn")
 
-                # Rebuild so a workflow change earlier this iteration (e.g.
-                # select_workflow) is reflected for the rest of the turn --
-                # needed by workflows that fall through instead of HardStop
-                # right after selection (e.g. msight_pipeline).
+                # Rebuild in case this iteration switched workflow.
                 messages[0]["content"] = _build_system_prompt(pipeline.state)
 
                 workflow_spec = WORKFLOW_SPECS.get(pipeline.state.workflow_name)
@@ -1022,11 +952,7 @@ async def chat_stream(request: Request):
                     })
 
             logging.warning(f"[STREAM] Exceeded {MAX_AGENTIC_ITERATIONS} agentic iterations")
-            # Don't just claim generic failure -- force one guaranteed final
-            # call, restricted to send_reply only, so the model must honestly
-            # summarize what the tool results already in this conversation
-            # actually showed, rather than the loop silently misreporting a
-            # real success as a failure just because it ran out of turns.
+            # Force one send_reply-only call so the model summarizes what actually happened.
             send_reply_only = [t for t in current_tools if t["function"]["name"] == "send_reply"]
             if send_reply_only:
                 messages.append({"role": "system", "content": (

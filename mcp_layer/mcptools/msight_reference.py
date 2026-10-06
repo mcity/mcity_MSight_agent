@@ -1,7 +1,4 @@
-"""Reference documentation, fetchable on demand -- reuses the ordinary
-tool-calling loop instead of MCP Resources (this client never calls
-resources/list/resources/read) or a Skill-style loader (unnecessary; a plain
-tool call that returns markdown text does the same job)."""
+"""On-demand reference docs, served as a plain tool (the client doesn't use MCP Resources)."""
 from pathlib import Path
 
 from mcptools import mcp

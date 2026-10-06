@@ -1,12 +1,4 @@
-"""
-Tests for ChatPipeline._auto_detect_backend.
-
-Regression guard: prior cleanup removed `import os as _os` from the function
-body without adding `import os` at module level, causing a silent NameError
-caught by the broad except-handler and returning None instead of a backend_info
-dict.  These tests confirm os.getenv is reachable and that the returned dict
-has the expected shape under each credential combination.
-"""
+"""ChatPipeline._auto_detect_backend under each credential combination."""
 import asyncio
 from unittest.mock import MagicMock, patch
 
@@ -34,9 +26,7 @@ def detect(cvat_token: str = "", ls_token: str = "") -> dict | None:
             return pipeline, asyncio.run(pipeline._auto_detect_backend(mcp_client=MagicMock()))
 
 
-# ---------------------------------------------------------------------------
 # Regression: os.getenv must not raise NameError → result must not be None
-# ---------------------------------------------------------------------------
 
 def test_auto_detect_backend_no_nameerror():
     """os.getenv must be reachable — no NameError from missing 'import os'."""
@@ -53,9 +43,7 @@ def test_auto_detect_backend_no_nameerror():
     )
 
 
-# ---------------------------------------------------------------------------
 # No credentials → backend = "none"
-# ---------------------------------------------------------------------------
 
 def test_auto_detect_backend_no_credentials():
     _, result = detect(cvat_token="", ls_token="")
@@ -65,9 +53,7 @@ def test_auto_detect_backend_no_credentials():
     assert result["ls_available"] is False
 
 
-# ---------------------------------------------------------------------------
 # Only LS_TOKEN set → backend = "label_studio"
-# ---------------------------------------------------------------------------
 
 def test_auto_detect_backend_ls_only():
     _, result = detect(cvat_token="", ls_token="tok123")
@@ -77,9 +63,7 @@ def test_auto_detect_backend_ls_only():
     assert result["cvat_available"] is False
 
 
-# ---------------------------------------------------------------------------
 # Only CVAT_ACCESS_TOKEN set → backend = "cvat"
-# ---------------------------------------------------------------------------
 
 def test_auto_detect_backend_cvat_only():
     _, result = detect(cvat_token="cvattok", ls_token="")
@@ -89,9 +73,7 @@ def test_auto_detect_backend_cvat_only():
     assert result["ls_available"] is False
 
 
-# ---------------------------------------------------------------------------
 # Both credentials set → backend = "both"
-# ---------------------------------------------------------------------------
 
 def test_auto_detect_backend_both():
     _, result = detect(cvat_token="cvattok", ls_token="lstok")
@@ -101,9 +83,7 @@ def test_auto_detect_backend_both():
     assert result["ls_available"] is True
 
 
-# ---------------------------------------------------------------------------
 # State is written for single-backend cases, not for NONE
-# ---------------------------------------------------------------------------
 
 def test_auto_detect_backend_writes_state_for_ls():
     pipeline = make_pipeline()

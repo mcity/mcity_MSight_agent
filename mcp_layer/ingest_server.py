@@ -1,4 +1,3 @@
-# ui_ingest_server.py
 import asyncio
 import json
 import shutil
@@ -27,9 +26,7 @@ JOB_LOGS: dict[str, asyncio.Queue[str | None]] = {}
 
 
 async def run_ingest_and_stream(job_id, zip_path, fps, train, val, test):
-    """
-    Run the ingestion and push events to the JOB_LOGS queue for this job_id.
-    """
+    """Run ingestion, pushing events to this job's JOB_LOGS queue."""
     q = JOB_LOGS[job_id]
 
     async def emit(ev: dict):
@@ -60,9 +57,7 @@ async def ingest_upload(
     val: float = Form(...),
     test: float = Form(...)
 ):
-    """
-    Upload a zip file for ingestion. Starts ingestion in background and returns job_id.
-    """
+    """Start background ingestion of an uploaded zip; returns job_id."""
     tmp_path = Path("/tmp") / f"{uuid.uuid4()}_{file.filename}"
     try:
         with open(tmp_path, "wb") as f:
@@ -80,9 +75,7 @@ async def ingest_upload(
 
 @app.get("/ingest/stream/{job_id}")
 async def ingest_stream(job_id: str):
-    """
-    Stream ingestion logs/events to the client as Server-Sent Events (SSE).
-    """
+    """Stream ingestion events as SSE."""
     q = JOB_LOGS.get(job_id)
     if q is None:
         return StreamingResponse(iter(["event: done\ndata: {}\n\n"]), media_type="text/event-stream")

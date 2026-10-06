@@ -1,20 +1,9 @@
-"""Data-driven catalog of msight_core node types this agent knows how to run.
+"""Data-driven catalog of msight_core node types this agent can run.
 
-Every msight_core node CLI shares a base argument parser
-(msight_core.utils.get_default_arg_parser): --name is always required, and
---publish-topic / --subscribe-topic / --sensor-name are added per category
-(source: publish-topic + required sensor-name; processing: publish-topic +
-subscribe-topic + optional sensor-name; sink: subscribe-topic only) --
-confirmed by reading MSight_Vision/venv/.../msight_core/utils.py directly, not
-inferred. resolve_cmd() builds those automatically so NodeSpec only needs to
-declare what's specific to that node type.
-
-Only the 6 node types already wired today (as docker-compose.yml services or
-as msight_record_archive.py's hardcoded subprocesses) are catalogued here.
-Adding one of the ~25 other node types msight_core ships is meant to be a new
-NodeSpec entry, not new code -- but verify its real CLI flags first by reading
-MSight_Vision/cli/launch_*.py or the matching file under
-MSight_Vision/venv/.../site-packages/cli/, the way the 6 below were verified.
+resolve_cmd() adds the shared base flags (--name, --publish-topic,
+--subscribe-topic, --sensor-name per category), so a NodeSpec only declares
+what's node-specific. To add a node type, add a NodeSpec after checking its
+real flags in MSight_Vision/cli/launch_*.py.
 """
 from dataclasses import dataclass, field
 from enum import Enum
@@ -38,20 +27,12 @@ class NodeSpec:
     positional_flags: tuple[str, ...] = ()
     needs_gpu: bool = False
     default_name: str | None = None
-    # If set (docker invocation only): when config[mount_config_key] is a host
-    # path (not a URL), mount it read-only at mount_container_path inside the
-    # container and rewrite the flag's value to that container path -- mirrors
-    # docker-compose.yml's own `${VIDEO_INPUT:-/tmp}:/input:ro` bind mount.
+    # Docker only: if config[mount_config_key] is a host path, mount it ro and rewrite the flag.
     mount_config_key: str | None = None
     mount_container_path: str | None = None
-    # supervisor-only: run `venv_python3 <script_path> <flags>` instead of a
-    # venv binary directly -- for a node that's the agent's own script (e.g.
-    # frame_annotator), not one of msight_core's installed console scripts.
+    # Supervisor only: run `python <script_path>` for the agent's own node scripts.
     script_path: Path | None = None
-    # Mounts that are always applied for this node type, independent of any
-    # per-call config -- (path relative to MSIGHT_VISION_PATH, container path,
-    # "ro"|"rw"). E.g. rfdetr_detector's config/calibration/locmap/model dirs,
-    # which docker-compose.yml bind-mounts unconditionally.
+    # Always-on mounts: (path relative to MSIGHT_VISION_PATH, container path, "ro"|"rw").
     fixed_mounts: tuple[tuple[str, str, str], ...] = ()
 
 
@@ -65,8 +46,7 @@ NODE_CATALOG: dict[str, NodeSpec] = {
         required_config=("rtsp_url",),
         arg_map={"rtsp_url": "--url", "rtsp_transport": "--rtsp-transport"},
         default_name="video_source",
-        # msight_launch_rtsp also accepts a local file path as --url (a single
-        # video file, as opposed to a folder) -- mount it if it's not a URL.
+        # --url also accepts a local file; mount it when it isn't a URL.
         mount_config_key="rtsp_url",
         mount_container_path="/input",
     ),
@@ -113,10 +93,7 @@ NODE_CATALOG: dict[str, NodeSpec] = {
         binary="python3",
         invocation="supervisor",
         default_name="frame_annotator",
-        # This agent's own script -- not one of msight_core's console scripts,
-        # and its argparse has no --sensor-name flag, so no sensor_name is
-        # ever passed in its config (resolve_cmd only adds that flag when the
-        # config key is present).
+        # Our own script; it has no --sensor-name flag, so never pass sensor_name.
         script_path=Path(__file__).resolve().parents[1] / "msight_nodes" / "annotated_frame_publisher.py",
     ),
     "video_aggregator": NodeSpec(
@@ -253,9 +230,7 @@ NODE_CATALOG: dict[str, NodeSpec] = {
     "custom_fuser": NodeSpec(
         node_type="custom_fuser", category=NodeCategory.PROCESSING,
         binary="msight_launch_custom_fuser", invocation="supervisor",
-        # sensor_name is optional for PROCESSING nodes per the base parser,
-        # but FuserNode's own __init__ hard-asserts it's set -- required here
-        # so a missing one is a clear error, not a container crash.
+        # FuserNode asserts sensor_name, so require it here for a clear error.
         required_config=("fusion_config", "sensor_name"),
         arg_map={"fusion_config": "--fusion-config", "wait": "--wait"},
     ),
@@ -276,10 +251,7 @@ NODE_CATALOG: dict[str, NodeSpec] = {
         binary="msight_launch_yolo_onestage_detection", invocation="supervisor",
         required_config=("det_configs",),
         arg_map={"det_configs": "--det-configs", "wait": "--wait"},
-        # Not marked needs_gpu -- unlike rfdetr_detector this runs via the
-        # local venv (not a fixed docker image), so it can use whatever GPU
-        # is actually present via its own torch.cuda.is_available() check,
-        # and degrades to CPU gracefully with no image swap needed either way.
+        # No needs_gpu: runs in the local venv and falls back to CPU on its own.
     ),
     "2d_viewer": NodeSpec(
         node_type="2d_viewer", category=NodeCategory.SINK,
@@ -296,10 +268,7 @@ NODE_CATALOG: dict[str, NodeSpec] = {
 
 
 def resolve_cmd(spec: NodeSpec, name: str, config: dict) -> list[str]:
-    """Build the argv (binary name + flags) for one node, minus any path
-    resolution -- MSightControlPlane decides whether `spec.binary` needs
-    resolving to an absolute path (supervisor) or is already on PATH inside
-    the image (docker) before handing this to an Executor."""
+    """Build a node's argv; binary path resolution is left to MSightControlPlane."""
     missing = [k for k in spec.required_config if k not in config]
     if missing:
         raise ValueError(

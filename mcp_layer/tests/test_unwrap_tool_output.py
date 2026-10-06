@@ -1,25 +1,14 @@
-"""
-Priority 5: unwrap_tool_output() — all input shapes handled by the function.
-
-Tests cover every distinct branch in the implementation:
-  None, str, object-with-text, list, dict-with-text, dict-with-content-list,
-  dict-with-data.msg, dict-with-message, dict-with-detail, and the str() fallback.
-"""
-import pytest
+"""unwrap_tool_output(): one test group per input shape."""
 from chat_pipeline import unwrap_tool_output
 
 
-# ---------------------------------------------------------------------------
 # None input
-# ---------------------------------------------------------------------------
 
 def test_unwrap_none_returns_empty_string():
     assert unwrap_tool_output(None) == ""
 
 
-# ---------------------------------------------------------------------------
 # String input (returned as-is; no stripping of the raw string)
-# ---------------------------------------------------------------------------
 
 def test_unwrap_plain_string_returned_as_is():
     assert unwrap_tool_output("hello world") == "hello world"
@@ -34,9 +23,7 @@ def test_unwrap_string_with_escaped_newlines_not_modified():
     assert unwrap_tool_output("line1\\nline2") == "line1\\nline2"
 
 
-# ---------------------------------------------------------------------------
 # Object with .text attribute (e.g. MCP ContentBlock)
-# ---------------------------------------------------------------------------
 
 class _TextObj:
     def __init__(self, text):
@@ -63,9 +50,7 @@ def test_unwrap_object_with_none_text_returns_empty_string():
     assert unwrap_tool_output(obj) == ""
 
 
-# ---------------------------------------------------------------------------
 # List input — parts joined with \n, empty parts filtered
-# ---------------------------------------------------------------------------
 
 def test_unwrap_list_of_strings_joined():
     result = unwrap_tool_output(["part1", "part2"])
@@ -92,9 +77,7 @@ def test_unwrap_list_all_empty_parts_returns_empty_string():
     assert result == ""
 
 
-# ---------------------------------------------------------------------------
 # Dict with "text" key
-# ---------------------------------------------------------------------------
 
 def test_unwrap_dict_with_text_key_returns_stripped_value():
     assert unwrap_tool_output({"text": "  hello  "}) == "hello"
@@ -104,9 +87,7 @@ def test_unwrap_dict_with_text_key_converts_escaped_newlines():
     assert unwrap_tool_output({"text": "a\\nb"}) == "a\nb"
 
 
-# ---------------------------------------------------------------------------
 # Dict with "content" list key (recursive)
-# ---------------------------------------------------------------------------
 
 def test_unwrap_dict_with_content_list_delegates_to_list_handler():
     d = {"content": ["part1", "part2"]}
@@ -120,9 +101,7 @@ def test_unwrap_dict_with_content_text_objects():
     assert result == "x\ny"
 
 
-# ---------------------------------------------------------------------------
 # Dict with "data" → {"msg": ...}
-# ---------------------------------------------------------------------------
 
 def test_unwrap_dict_data_msg_returns_string_of_msg():
     d = {"data": {"msg": "operation succeeded"}}
@@ -136,9 +115,7 @@ def test_unwrap_dict_data_msg_converts_escaped_newlines():
     assert result == "line1\nline2"
 
 
-# ---------------------------------------------------------------------------
 # Dict with "message" key
-# ---------------------------------------------------------------------------
 
 def test_unwrap_dict_message_key_returned():
     d = {"message": "error occurred"}
@@ -150,9 +127,7 @@ def test_unwrap_dict_message_key_converts_escaped_newlines():
     assert unwrap_tool_output(d) == "a\nb"
 
 
-# ---------------------------------------------------------------------------
 # Dict with "detail" key (checked after "message")
-# ---------------------------------------------------------------------------
 
 def test_unwrap_dict_detail_key_returned():
     d = {"detail": "not found"}
@@ -164,9 +139,7 @@ def test_unwrap_dict_detail_key_converts_escaped_newlines():
     assert unwrap_tool_output(d) == "a\nb"
 
 
-# ---------------------------------------------------------------------------
 # Dict — "message" takes priority over "detail"
-# ---------------------------------------------------------------------------
 
 def test_unwrap_dict_message_takes_priority_over_detail():
     d = {"message": "from message", "detail": "from detail"}
@@ -174,9 +147,7 @@ def test_unwrap_dict_message_takes_priority_over_detail():
     assert result == "from message"
 
 
-# ---------------------------------------------------------------------------
 # Fallback: str(raw).strip()
-# ---------------------------------------------------------------------------
 
 def test_unwrap_arbitrary_object_falls_back_to_str():
     class _Weird:

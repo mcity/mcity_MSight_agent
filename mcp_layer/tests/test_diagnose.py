@@ -1,5 +1,4 @@
-"""Graph diagnosis logic (msight_control_plane.diagnose_from_health) --
-pure function over node_health() rows, no Docker/Redis needed."""
+"""diagnose_from_health over synthetic node_health() rows (no Docker/Redis)."""
 import pytest
 
 from mcptools.msight_control_plane import diagnose_from_health, structural_findings

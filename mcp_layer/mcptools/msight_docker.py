@@ -21,16 +21,14 @@ from host_utils import resolve_host
 load_dotenv()
 
 VIEWER_PORT = 9010
-COMPOSE_TIMEOUT_UP, COMPOSE_TIMEOUT_SHORT = 600, 60  # build ~206s measured locally; ps/logs/down are fast
+COMPOSE_TIMEOUT_UP = 600  # image build takes ~206s locally
 FIXED_PIPELINE_NODES = ("video_source", "rfdetr_detector", "detection_viewer")
 
 # Fixed calibration file locations, matching what rfdetr_config.yaml points at.
 CALIBRATION_INTRINSICS_REL = Path("examples/rfdetr/calibration/intrinsics.json")
 CALIBRATION_LOCMAP_REL = Path("examples/rfdetr/locmaps/locmap_sip_gs_Fuller_Glazier2_v1.npz")
 
-# SHA256 of the shipped demo calibration files -- distinguishes "still the
-# default" from "user uploaded their own" without a separate flag that could
-# drift from what's actually on disk.
+# SHA256 of the shipped demo calibration, to tell default from user-uploaded.
 _DEFAULT_INTRINSICS_SHA256 = "a04a32ac2bb4e7b54d58769b37cb79c9c7447b4b46c2279db65d05fb2c3eb57a"
 _DEFAULT_LOCMAP_SHA256 = "367ca8bfc6446efb5b7e1ba3ff5704da66bdcc5d70c35b2415f597c41a2eddd7"
 
@@ -64,8 +62,7 @@ def _sha256(path: Path) -> Optional[str]:
 
 
 def _calibration_status(msight_path: Path) -> dict:
-    """Live filesystem + checksum check, called both by the MCP tool below
-    and directly (no MCP round-trip) by chat_server.py's per-turn state hint."""
+    """Live calibration check (also called directly by chat_server's state hint)."""
     intrinsics_path = msight_path / CALIBRATION_INTRINSICS_REL
     locmap_path = msight_path / CALIBRATION_LOCMAP_REL
     intrinsics_hash = _sha256(intrinsics_path)
@@ -93,8 +90,7 @@ def _calibration_status(msight_path: Path) -> dict:
     }
 
 
-# prefixed for SESSION_STATE hints, plain for the consent summary -- single
-# source of truth so the two can't drift apart on wording.
+# Shared wording for SESSION_STATE hints (prefixed) and the consent summary (plain).
 _CALIBRATION_STATE_LABELS = {
     "missing": (
         "calibration=missing (no calibration files found)",
@@ -124,11 +120,7 @@ def calibration_state_label(state: str, *, prefixed: bool) -> str:
 
 
 def _reset_calibration_to_default(msight_path: Path) -> None:
-    """Restore the shipped demo calibration files, overwriting any user
-    upload -- called whenever msight_pipeline is freshly (re)selected.
-    Uses `git show HEAD:<path>` rather than `git checkout` so this only ever
-    touches the two calibration files via a plain write, never the working
-    tree, and can't clobber unrelated uncommitted changes in that repo."""
+    """Restore the demo calibration via `git show HEAD:<path>` (touches only those two files)."""
     for rel_path in (CALIBRATION_INTRINSICS_REL, CALIBRATION_LOCMAP_REL):
         result = subprocess.run(
             ["git", "show", f"HEAD:{rel_path.as_posix()}"],
@@ -140,10 +132,7 @@ def _reset_calibration_to_default(msight_path: Path) -> None:
 
 
 def _check_msight_env(msight_path: Path, overriding_source: bool = False) -> Optional[str]:
-    """overriding_source=True means the caller passed video_input/rtsp_url, which
-    docker compose applies as process env and takes precedence over --env-file for
-    ${VAR} interpolation -- so .env's own static VIDEO_INPUT/RTSP_URL value never
-    actually gets used and isn't worth validating."""
+    """overriding_source=True skips validating .env's VIDEO_INPUT/RTSP_URL (they're overridden)."""
     env_path = msight_path / ".env"
     if not env_path.is_file():
         return None
@@ -200,12 +189,7 @@ _rendered_cpu_override: Optional[Path] = None
 
 
 def _render_cpu_override() -> Path:
-    """msight_cpu_override.yml's build.dockerfile is a {DOCKERFILE_PATH}
-    placeholder -- substituted here with this repo's own Dockerfile.msight-cpu
-    (absolute path, since it lives outside MSight_Vision's checkout and the
-    override's build.context, so a relative path wouldn't reach it). Rendered
-    once per process into a temp file; the source template and the absolute
-    path of this file on disk are both fixed for the process lifetime."""
+    """Render msight_cpu_override.yml with the absolute Dockerfile.msight-cpu path (cached)."""
     global _rendered_cpu_override
     if _rendered_cpu_override is not None and _rendered_cpu_override.is_file():
         return _rendered_cpu_override
@@ -222,17 +206,10 @@ async def _run_compose(
     msight_path: Path, args: list[str], timeout: int, env: Optional[dict] = None,
     ctx: Optional[Context] = None,
 ) -> tuple[int, str, str]:
-    """Runs docker compose, streaming stdout/stderr line-by-line via ctx.log()
-    as they arrive -- a `--build` can take minutes, otherwise the user just
-    stares at one static message. Still returns the full accumulated text
-    for friendly-error matching and the truncated-tail fallback below."""
+    """Run docker compose, streaming output via ctx.log(); returns the full output."""
     compose_files = ["-f", "docker-compose.yml"]
-    # Our own override, not MSight_Vision's docker-compose.cpu.yml -- that file's
-    # `deploy: {}` doesn't actually clear the base file's GPU device reservation
-    # (Compose merges mappings recursively; an empty override is a no-op), and its
-    # BASE_IMAGE build arg is a no-op too (Dockerfile-local hardcodes FROM with no
-    # ARG). Kept here rather than fixed in MSight_Vision's checkout, which is
-    # never modified.
+    # Our own CPU override: MSight_Vision's docker-compose.cpu.yml doesn't clear
+    # the GPU reservation (`deploy: {}` is a no-op under Compose merging).
     if not await has_gpu():
         compose_files += ["-f", str(_render_cpu_override())]
     try:
@@ -286,22 +263,18 @@ def _control_plane() -> MSightControlPlane:
 
 
 def _default_source_from_env(msight_path: Path) -> tuple[Optional[str], Optional[str]]:
-    """Neither video_input nor rtsp_url given -- the old docker-compose flow
-    fell back to MSight_Vision's own .env values via --env-file interpolation;
-    replicate that by reading them directly. Returns (video_input, rtsp_url)."""
+    """(video_input, rtsp_url) from MSight_Vision's .env when neither was given."""
     from dotenv import dotenv_values
     values = dotenv_values(msight_path / ".env")
     return (values.get("VIDEO_INPUT") or None), (values.get("RTSP_URL") or None)
 
 
 def _resolve_video_source(video_input: Optional[str], rtsp_url: Optional[str], sensor: str) -> tuple[str, dict]:
-    """(node_type, config) for the video_source node -- mirrors the branching
-    docker-compose.yml's own video_source entrypoint script does at runtime."""
+    """(node_type, config) for video_source, mirroring docker-compose.yml's entrypoint."""
     base = {"publish_topic": f"camera/{sensor}", "sensor_name": sensor}
     if rtsp_url:
         return "video_source_rtsp", {**base, "rtsp_url": rtsp_url}
-    # A directory plays sequentially via mp4_folder; a single file path is
-    # accepted by msight_launch_rtsp itself (its --url also takes a local path).
+    # Directory -> mp4_folder; a single file works with msight_launch_rtsp's --url.
     return (
         ("video_source_mp4_folder", {**base, "folder": video_input})
         if Path(video_input).is_dir()
@@ -335,9 +308,7 @@ async def start_msight_pipeline(
         return error_json(env_err)
 
     if build:
-        # Building the image is the one thing DockerExecutor deliberately
-        # doesn't do -- still supported here as an explicit, occasional step,
-        # reusing the same compose+CPU-override selection as before.
+        # Explicit image build (DockerExecutor itself never builds).
         returncode, stdout, stderr = await _run_compose(msight_path, ["build"], COMPOSE_TIMEOUT_UP, ctx=ctx)
         if returncode != 0:
             friendly = _friendly_error_from_output(stdout, stderr)
@@ -373,19 +344,14 @@ async def start_msight_pipeline(
 
 @mcp.tool()
 async def stop_msight_pipeline(remove_volumes: bool = False, ctx: Context = None) -> str:
-    # remove_volumes is now a no-op -- docker run here never creates named
-    # volumes to remove -- kept only so the signature/schema stay unchanged.
+    # remove_volumes is a no-op, kept for schema compatibility.
     msight_path, err = _get_msight_path()
     if err:
         return error_json(err)
 
     try:
         cp = _control_plane()
-        # Explicit names, not recompose([]) -- recompose only diffs against
-        # nodes tracked in *this process's* memory, so it silently does
-        # nothing (while still returning "ok") if the server restarted since
-        # start_msight_pipeline ran. delete_node() falls back to each node's
-        # deterministic container name, so this works either way.
+        # Explicit names, not recompose([]), so this still works after a server restart.
         for name in FIXED_PIPELINE_NODES:
             await cp.delete_node(name)
     except Exception as e:
@@ -395,9 +361,7 @@ async def stop_msight_pipeline(remove_volumes: bool = False, ctx: Context = None
 
 
 async def _enrich_node_status(cp, nodes: list[dict]) -> list[dict]:
-    """Adds a computed seconds_since_heartbeat, and a real "alive" field
-    (is_alive(), not Redis's self-reported status -- that never expires, so
-    a node that died hard without deregistering would report RUNNING forever)."""
+    """Add seconds_since_heartbeat and real liveness (Redis status never expires)."""
     now = time.time()
     out = []
     for n in nodes:
@@ -423,17 +387,11 @@ async def get_msight_status(ctx: Context = None) -> str:
         return error_json(f"Could not read MSight_Vision status: {e}")
 
     extra = {"services": services}
-    # Only report a viewer_url when the viewer is actually alive -- a name
-    # match against Redis alone isn't enough (a stale ghost entry has the
-    # right name but a self-reported, never-expiring status).
+    # viewer_url only when the viewer is actually alive (Redis entries can be stale).
     if any(s.get("name") == "detection_viewer" and s.get("alive") for s in services):
         extra["viewer_url"] = f"http://{resolve_host()}:{VIEWER_PORT}"
 
-    # Explicit, precomputed facts rather than something the caller has to
-    # notice on its own (spotting an absence from a list of what IS present has
-    # repeatedly not worked). Generic graph checks over whatever is registered,
-    # not a fixed list of node names -- cheap, no data-flow sampling; that's
-    # diagnose_msight_pipeline's job.
+    # Precomputed structural problems; the LLM is bad at spotting absences in a list.
     problems = await cp.structural_check()
     if problems:
         extra["problems"] = problems
@@ -442,8 +400,7 @@ async def get_msight_status(ctx: Context = None) -> str:
             "live data flow, which catches nodes that are running but stuck."
         )
     elif any(s.get("alive") for s in services):
-        # "Up" is not "working" -- without this the caller reports a healthy
-        # pipeline off process state alone.
+        # "Up" is not "working".
         extra["data_flow"] = (
             "NOT MEASURED -- this only shows processes are up. If the user asked whether "
             "the pipeline is working or healthy, call diagnose_msight_pipeline before answering."
@@ -467,10 +424,7 @@ _LOG_TS_RE = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+')
 
 
 def _seconds_since_last_log_line(text: str) -> Optional[int]:
-    """msight_core nodes log with a leading `YYYY-MM-DD HH:MM:SS,ms` timestamp
-    (confirmed live: `2026-09-08 14:38:22,397 - ... - INFO :: ...`). Reported
-    alongside logs as a hint only -- diagnose_msight_pipeline's measured topic
-    rates are the authoritative stuck/idle signal."""
+    """Parse msight_core's `YYYY-MM-DD HH:MM:SS,ms` log timestamp (a hint only)."""
     for line in reversed(text.splitlines()):
         m = _LOG_TS_RE.match(line)
         if m:

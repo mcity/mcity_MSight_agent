@@ -1,10 +1,4 @@
-"""
-Shared pytest configuration for mcp_layer unit tests.
-
-Adds the project root and mcp_layer/ to sys.path so that:
-  - config.config is importable (used by validate_workflow_state)
-  - validate_workflow_state, chat_pipeline, etc. are importable with flat import names
-"""
+"""Puts the project root and mcp_layer/ on sys.path for flat imports."""
 import sys
 from pathlib import Path
 

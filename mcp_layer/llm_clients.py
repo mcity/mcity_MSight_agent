@@ -55,29 +55,6 @@ class BaseLLMClient(ABC):
         """
         return await self._summarize(prompt)
 
-    async def summarize_class_mapping_output(self, tool_output: str) -> str:
-        prompt = f"""
-        Here's the output from a class mapping workflow. Summarize what was done based on the tag addition results section, and finally ask the user if they would like to visualize the results of the workflow using Voxel51.
-
-        {tool_output}
-
-        Only include:
-        - How many tags were added, in total.
-        - How many tags were added, in each category.
-        - A brief summary based on the tag addition.
-        """
-        return await self._summarize(prompt)
-
-    async def summarize_anomaly_detection_output(self, tool_output: str) -> str:
-        prompt = f"""
-        Here's the output from anomaly detection workflow. Summarize these results, and give a brief overview of what these values mean and indicate about the model performance.
-
-        {tool_output}
-
-        Finally, suggest that the user explore the results using Voxel51 by selecting the appropriate camera view and inspecting anomaly scores and masks. In particular, encourage them to filter samples by anomaly score (e.g., `pred_anomaly_score_<model>`) to view the most anomalous examples, and to use the corresponding `pred_anomaly_mask_<model>` field to visualize pixel-wise anomaly regions. This mask field name varies depending on the model used (e.g., `Padim`, `STFPM`, etc.).
-        """
-        return await self._summarize(prompt)
-
     @abstractmethod
     async def _summarize(self, prompt: str) -> str:
         raise NotImplementedError
@@ -115,7 +92,7 @@ class GroqClient(BaseLLMClient):
         kwargs = dict(model=self.model, messages=messages, temperature=0.1)
         if tools:
             kwargs["tools"] = tools
-            kwargs["parallel_tool_calls"] = False  # matches OpenAIClient: prevents missing-field errors with tool_choice="required"
+            kwargs["parallel_tool_calls"] = False  # prevents missing-field errors with tool_choice="required"
         if tool_choice:
             kwargs["tool_choice"] = tool_choice
         response = await self.client.chat.completions.create(**kwargs)
@@ -129,7 +106,7 @@ class GroqClient(BaseLLMClient):
 class GeminiClient(BaseLLMClient):
     def __init__(self):
         genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        # gemini-1.5-flash (former default) was retired (404, confirmed live).
+        # gemini-1.5-flash has been retired.
         self.model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
     async def chat(self, messages, tools=None, tool_choice=None):
@@ -163,8 +140,7 @@ class GeminiClient(BaseLLMClient):
         for t in tools:
             fn = t.get("function", {})
             params = fn.get("parameters", {"type": "object", "properties": {}})
-            # Gemini's Schema proto has no additionalProperties field (confirmed:
-            # constructing it raises) -- strip via the SDK's own helper.
+            # Gemini's Schema has no additionalProperties; strip it.
             params = json.loads(json.dumps(params))  # deep copy; strip mutates in place
             content_types.strip_additional_properties(params)
             decls.append({"name": fn.get("name", ""), "description": fn.get("description", ""), "parameters": params})
@@ -172,10 +148,7 @@ class GeminiClient(BaseLLMClient):
 
     @staticmethod
     def _to_gemini_contents(openai_messages: list) -> tuple[str, list]:
-        """Convert the shared OpenAI-format messages to Gemini's contents shape
-        (mirrors ClaudeClient._to_anthropic_messages). Tool results become
-        function_response parts matched by name -- FunctionCall has no id field.
-        """
+        """OpenAI-format messages -> Gemini contents (tool results matched by name; no ids)."""
         system_parts: list[str] = []
         result: list[dict] = []
 

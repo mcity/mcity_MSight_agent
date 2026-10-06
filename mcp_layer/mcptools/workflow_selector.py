@@ -38,10 +38,7 @@ def select_workflow(workflow_name: str) -> str:
 
 
 def _prune_stale_custom_entries() -> None:
-    """Drop datasets.yaml entries for load_custom_dataset datasets no longer in
-    FiftyOne (e.g. after manual cleanup) -- these have no lazy-load fallback, so
-    a stale entry would otherwise pass selection and fail deep inside the run.
-    """
+    """Drop datasets.yaml entries for custom datasets no longer in FiftyOne."""
     try:
         _foodm.get_db_conn()
         existing = set(fo.list_datasets())

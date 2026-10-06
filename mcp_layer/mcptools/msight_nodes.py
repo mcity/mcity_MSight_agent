@@ -1,12 +1,7 @@
-"""Generic node primitives, exposed as real tools -- the "build your own
-topology" surface, distinct from msight_docker.py's fixed 3-node pipeline
-and msight_record_archive.py's fixed record/archive chain.
+"""Generic add/remove node tools for building custom topologies.
 
-These are thin delegations to MSightControlPlane (already built, already
-live-tested) -- deliberately not gated by any consent mechanism (see the
-plan doc, Workstream D): add/remove of a single node is cheap, fast, and
-reversible, exactly like the existing ungated stop_msight_pipeline/
-stop_msight_recording/stop_msight_archiving tools.
+Thin wrappers over MSightControlPlane; not consent-gated since single-node
+changes are cheap and reversible.
 """
 from typing import Optional
 
@@ -76,11 +71,7 @@ async def add_msight_node(node_type: str, name: Optional[str] = None, config: Op
     resolved_name = name or spec.default_name or node_type
     cp = _control_plane()
 
-    # Omitting `name` collides with the catalog default (e.g. a second
-    # detection_viewer reusing "detection_viewer"), silently reusing the
-    # existing node instead of starting a new one -- surface that plainly.
-    # is_alive(), not is_tracked(): add_node() itself only reuses an entry
-    # that's verified alive, so this flag has to agree with that.
+    # Without a `name`, a live node with the default name is reused; say so.
     already_running = await cp.is_alive(resolved_name)
 
     try:
