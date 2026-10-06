@@ -1,7 +1,7 @@
 # MSight node catalog reference
 
 Every entry below is a `node_type` `add_msight_node` accepts today (confirmed
-against `mcp_layer/mcptools/msight_node_catalog.py` — 29 node types
+against `mcp_layer/mcptools/msight/node_catalog.py` — 29 node types
 cataloged). 3 real msight_core entry points are deliberately excluded, not
 just unlisted: `downloaded_image_player_fps` and `road_user_list_aggregator`
 (their source files don't exist in the installed package — genuinely broken

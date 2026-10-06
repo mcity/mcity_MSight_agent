@@ -4,7 +4,7 @@ from pathlib import Path
 from mcptools import mcp
 from mcptools.mcp_json import error_json, ok_json
 
-_REFERENCE_DIR = Path(__file__).resolve().parents[1] / "prompts" / "msight_reference"
+_REFERENCE_DIR = Path(__file__).resolve().parents[2] / "prompts" / "msight_reference"
 
 _TOPICS: dict[str, str] = {
     "node_catalog": "node_catalog.md",

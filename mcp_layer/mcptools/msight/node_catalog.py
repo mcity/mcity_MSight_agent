@@ -86,7 +86,7 @@ NODE_CATALOG: dict[str, NodeSpec] = {
         arg_map={"port": "--port"},
         default_name="detection_viewer",
     ),
-    # --- msight_record_archive.py's fixed subprocess chain (supervisor-executed) ---
+    # --- msight/record_archive.py's fixed subprocess chain (supervisor-executed) ---
     "frame_annotator": NodeSpec(
         node_type="frame_annotator",
         category=NodeCategory.PROCESSING,
@@ -94,7 +94,7 @@ NODE_CATALOG: dict[str, NodeSpec] = {
         invocation="supervisor",
         default_name="frame_annotator",
         # Our own script; it has no --sensor-name flag, so never pass sensor_name.
-        script_path=Path(__file__).resolve().parents[2] / "upstream" / "msight_vision_nodes" / "annotated_frame_publisher.py",
+        script_path=Path(__file__).resolve().parents[3] / "upstream" / "msight_vision_nodes" / "annotated_frame_publisher.py",
     ),
     "video_aggregator": NodeSpec(
         node_type="video_aggregator",

@@ -12,7 +12,7 @@ from mcptools import mcp
 
 load_dotenv()
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
+ROOT_DIR = Path(__file__).resolve().parents[3]
 
 LS_URL = os.getenv("LS_URL", "https://app.humansignal.com")
 

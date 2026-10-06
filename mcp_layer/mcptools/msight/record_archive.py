@@ -17,7 +17,7 @@ from typing import Optional
 
 from mcptools import mcp
 from mcptools.mcp_json import error_json, ok_json
-from mcptools.msight_docker import _control_plane, _get_msight_path
+from mcptools.msight.docker import _control_plane, _get_msight_path
 
 # Sensor of the latest recording session, so stop can find its segments.
 _LAST_RECORDING_SENSOR: Optional[str] = None

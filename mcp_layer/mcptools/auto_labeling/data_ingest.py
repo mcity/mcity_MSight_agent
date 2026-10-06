@@ -1,4 +1,4 @@
-# mcptools/data_ingest.py
+# mcptools/auto_labeling/data_ingest.py
 from mcptools import mcp
 from mcptools.mcp_json import error_json
 import asyncio
@@ -15,7 +15,7 @@ from typing import Optional, List, Tuple, Awaitable, Callable
 import uuid
 
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
+ROOT_DIR = Path(__file__).resolve().parents[3]
 UPLOAD_ROOT = Path(os.environ.get("MDE_UPLOAD_ROOT", ROOT_DIR / "mde_uploads")).resolve()
 UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 # Type for streaming emit callbacks

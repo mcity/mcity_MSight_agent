@@ -14,8 +14,8 @@ from fastmcp import Context
 
 from mcptools import mcp
 from mcptools.mcp_json import error_json, ok_json
-from mcptools.msight_control_plane import MSightControlPlane
-from mcptools.msight_executors import has_gpu
+from mcptools.msight.control_plane import MSightControlPlane
+from mcptools.msight.executors import has_gpu
 from host_utils import resolve_host
 
 load_dotenv()
@@ -173,7 +173,7 @@ def _friendly_error_from_output(stdout: str, stderr: str) -> Optional[str]:
             "GPU device driver 'nvidia' could not be selected, despite nvidia-smi "
             "reporting a GPU on this host -- the NVIDIA Container Toolkit is likely "
             "missing or misconfigured. (If this host has no GPU at all, this "
-            "shouldn't happen -- this repo's own msight_cpu_override.yml should "
+            "shouldn't happen -- this repo's own msight/cpu_override.yml should "
             "already be applied automatically; that auto-detection may itself be "
             "the problem.)"
         )
@@ -189,12 +189,12 @@ _rendered_cpu_override: Optional[Path] = None
 
 
 def _render_cpu_override() -> Path:
-    """Render msight_cpu_override.yml with the absolute Dockerfile.msight-cpu path (cached)."""
+    """Render cpu_override.yml with the absolute Dockerfile.cpu path (cached)."""
     global _rendered_cpu_override
     if _rendered_cpu_override is not None and _rendered_cpu_override.is_file():
         return _rendered_cpu_override
-    template = (Path(__file__).parent / "msight_cpu_override.yml").read_text()
-    dockerfile = Path(__file__).parent / "Dockerfile.msight-cpu"
+    template = (Path(__file__).parent / "cpu_override.yml").read_text()
+    dockerfile = Path(__file__).parent / "Dockerfile.cpu"
     rendered = template.replace("{DOCKERFILE_PATH}", str(dockerfile))
     out = Path(tempfile.gettempdir()) / "msight_cpu_override.rendered.yml"
     out.write_text(rendered)

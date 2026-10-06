@@ -66,12 +66,12 @@ _CPU_IMAGE_TAG = "msight-vision-cpu-local"
 _CPU_BASE_IMAGE = os.environ.get(
     "MSIGHT_VISION_CPU_BASE_IMAGE", "michigantrafficlab/msight-core:latest-pytorch2.7.1-cpu"
 )
-_CPU_DOCKERFILE = Path(__file__).resolve().parent / "Dockerfile.msight-cpu"
+_CPU_DOCKERFILE = Path(__file__).resolve().parent / "Dockerfile.cpu"
 _cpu_image_ready: Optional[bool] = None
 
 
 async def _ensure_cpu_image(msight_path: Path) -> str:
-    """Build the CPU image from Dockerfile.msight-cpu once per process (no prebuilt CPU tag exists)."""
+    """Build the CPU image from Dockerfile.cpu once per process (no prebuilt CPU tag exists)."""
     global _cpu_image_ready
     if _cpu_image_ready:
         return _CPU_IMAGE_TAG

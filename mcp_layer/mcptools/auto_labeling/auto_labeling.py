@@ -4,7 +4,7 @@ import asyncio
 import sys
 from pathlib import Path
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
+ROOT_DIR = Path(__file__).resolve().parents[3]
 
 CONFIG_PATH = ROOT_DIR / "config" / "config.py"
 MAIN_PATH = ROOT_DIR / "main.py"

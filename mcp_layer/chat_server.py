@@ -25,11 +25,11 @@ logging.basicConfig(
 from chat_pipeline import ChatPipeline
 from host_utils import is_cloud_deployment, resolve_host
 from llm_clients import ClaudeClient, GeminiClient, GroqClient, OpenAIClient
-from mcptools.msight_docker import (
+from mcptools.msight.docker import (
     CALIBRATION_INTRINSICS_REL, CALIBRATION_LOCMAP_REL,
     _calibration_status, _control_plane, _get_msight_path, calibration_state_label,
 )
-from mcptools.msight_record_archive import (
+from mcptools.msight.record_archive import (
     DEFAULT_SENSOR_NAME as MSIGHT_DEFAULT_SENSOR_NAME,
     DOWNLOAD_DIR as MSIGHT_DOWNLOAD_DIR,
     DUMPER_NODE as MSIGHT_DUMPER_NODE,

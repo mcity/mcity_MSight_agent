@@ -9,7 +9,7 @@ from fastapi.responses import StreamingResponse
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from mcptools.data_ingest import _run_data_ingest_streaming_core
+from mcptools.auto_labeling.data_ingest import _run_data_ingest_streaming_core
 from fastapi.middleware.cors import CORSMiddleware
 
 

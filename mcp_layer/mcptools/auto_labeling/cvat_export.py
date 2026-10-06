@@ -17,7 +17,7 @@ from mcptools import mcp
 
 load_dotenv()
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
+ROOT_DIR = Path(__file__).resolve().parents[3]
 CVAT_URL        = os.getenv("CVAT_URL", "https://app.cvat.ai")
 CVAT_TASKS_FILE = ROOT_DIR / "output" / "cvat_tasks.json"
 

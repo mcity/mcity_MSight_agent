@@ -12,7 +12,7 @@ import fiftyone.core.odm as _foodm
 import config.config as _cc
 from host_utils import resolve_host
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
+ROOT_DIR = Path(__file__).resolve().parents[3]
 CONFIG_PATH = ROOT_DIR / "config" / "config.py"
 
 

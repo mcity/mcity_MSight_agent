@@ -4,7 +4,7 @@ import logging
 import time
 
 from host_utils import resolve_host
-from mcptools.msight_docker import (
+from mcptools.msight.docker import (
     _calibration_status, _get_msight_path, _reset_calibration_to_default,
     calibration_state_label,
 )

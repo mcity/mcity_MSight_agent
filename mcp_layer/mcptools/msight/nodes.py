@@ -7,8 +7,8 @@ from typing import Optional
 
 from mcptools import mcp
 from mcptools.mcp_json import error_json, ok_json
-from mcptools.msight_node_catalog import NODE_CATALOG
-from mcptools.msight_docker import _control_plane, _get_msight_path
+from mcptools.msight.node_catalog import NODE_CATALOG
+from mcptools.msight.docker import _control_plane, _get_msight_path
 
 _NODE_TYPE_DESCRIPTIONS: dict[str, str] = {
     "video_source_rtsp": "Publishes frames from a live RTSP stream (or a local video file path passed as rtsp_url).",

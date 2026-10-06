@@ -112,7 +112,7 @@ The `msight_pipeline` workflow lets the agent start, stop, and monitor MSight_Vi
 - **Explicit run confirmation:** for a custom source, the first `start_msight_pipeline` call never launches anything — it returns a consent summary (source, calibration status, recording/archiving selection) that the user must confirm before any container actually starts.
 - **Camera calibration:** upload your own `intrinsics.json` + calibration `.npz` (built with [camera_calibration2](https://github.com/michigan-traffic-lab/camera_calibration2)) via the web UI's upload button; the agent validates the file formats and reports live calibration status (`default` / `user_calibrated` / `missing` / `partial`) every turn.
 - **Record & Archive:** independent, opt-in local video recording and S3 archiving of the *annotated* feed (bounding boxes/labels/scores drawn in via a small frame-annotator node this agent launches, not MSight_Vision itself) — run as tracked host subprocesses alongside the Docker-based detection pipeline.
-- **GPU vs CPU auto-detected:** checks for a working `nvidia-smi` and transparently layers in this repo's own CPU compose override (`mcp_layer/mcptools/msight_cpu_override.yml`).
+- **GPU vs CPU auto-detected:** checks for a working `nvidia-smi` and transparently layers in this repo's own CPU compose override (`mcp_layer/mcptools/msight/cpu_override.yml`).
 - **Friendly error handling:** known Docker/host failure modes (a host process already bound to Redis's port, a malformed `.env` line) are translated into actionable messages instead of raw `docker compose` output.
 
 ## Online Demo: Data Selection with Embeddings
@@ -342,40 +342,47 @@ git add .gitmodules $(git submodule foreach --quiet 'echo $name')
 │  └── install.sh               # Installs msight_base/msight_core into the active venv
 ├── mcp_layer/                   # Agentic (MCP) layer
 │  ├── mcp_server.py            # MCP tool registry (port 8000)
-│  ├── chat_server.py           # FastAPI chat endpoint (port 8001) + /msight/upload_calibration
-│  ├── ingest_server.py         # File upload & processing (port 8002)
+│  ├── chat_server.py           # FastAPI chat endpoint + MSight uploads/downloads (port 8001)
+│  ├── ingest_server.py         # Dataset upload & ingestion (port 8002)
+│  ├── msight_api.py            # REST API + built dashboard for MSight (port 8003)
 │  ├── client_chat.py           # Web/terminal client (port 5225)
 │  ├── chat_pipeline.py         # Tool dispatch, state routing, reply formatting
 │  ├── pipeline_handlers/       # Per-workflow handler mixins for ChatPipeline
 │  │   ├── auto_labeling.py
 │  │   └── msight_pipeline.py
-│  ├── pipeline_common.py       # Shared routing/sentinel primitives for the handlers above
-│  ├── progress_relay.py        # Relays live docker-compose build output to the active /chat/stream
+│  ├── pipeline_common.py       # Shared routing/sentinel primitives
+│  ├── progress_relay.py        # Relays MCP log events to the active /chat/stream
 │  ├── validate_workflow_state.py # Pydantic workflow state machine (both workflows)
 │  ├── host_utils.py            # AWS IMDSv2 host/IP resolution for the viewer URL
-│  ├── mcptools/                # Tool implementations
-│  │   ├── __init__.py
-│  │   ├── workflow_selector.py
-│  │   ├── auto_labeling.py
-│  │   ├── data_ingest.py
-│  │   ├── cvat_export.py
-│  │   ├── label_studio_export.py
-│  │   ├── msight_docker.py     # start/stop/status/logs — docker compose control for MSight_Vision
-│  │   ├── msight_record_archive.py # Local recording + S3 archiving as tracked host subprocesses
-│  │   └── v51.py               # Voxel51 integration
-│  ├── msight_nodes/            # Standalone MSight nodes (not MCP tools) launched as
-│  │   │                        # subprocesses via MSight_Vision's own venv interpreter
-│  │   └── annotated_frame_publisher.py # Draws detection boxes, republishes for Record & Archive
 │  ├── llm_clients.py           # Multi-LLM support (OpenAI, Claude, Gemini, Groq)
 │  ├── tool_schema.py           # Tool definitions exposed to the LLM
-│  ├── prompts/                 # System + per-workflow prompt text
-│  │   ├── state_hints.txt      # Per-turn SESSION_STATE hint fragments
-│  │   └── workflows/
-│  │       ├── auto_labeling.txt
-│  │       └── msight_pipeline.txt
-│  ├── tests/                   # Pytest coverage for state routing/tool filtering
-│  └── ui/                      # Web interface assets
-│      └── index.html
+│  ├── mcptools/                # MCP tool implementations
+│  │   ├── __init__.py          # Shared FastMCP instance
+│  │   ├── mcp_json.py          # {"status": ...} response helpers
+│  │   ├── workflow_selector.py # Workflow/dataset selection (shared)
+│  │   ├── auto_labeling/       # Auto-labeling workflow (synced from mcity_data_engine)
+│  │   │   ├── auto_labeling.py
+│  │   │   ├── data_ingest.py
+│  │   │   ├── cvat_export.py
+│  │   │   ├── label_studio_export.py
+│  │   │   └── v51.py           # Voxel51 integration
+│  │   └── msight/              # MSight pipeline workflow
+│  │       ├── control_plane.py # Owns tracked nodes; status from Redis MSIGHT:NODES
+│  │       ├── executors.py     # Docker / supervisor execution backends
+│  │       ├── node_catalog.py  # Data-driven msight_core node specs
+│  │       ├── docker.py        # start/stop/status/logs/diagnose tools
+│  │       ├── nodes.py         # Generic add/remove node tools
+│  │       ├── record_archive.py # Local recording + S3 archiving
+│  │       ├── reference.py     # On-demand reference docs tool
+│  │       ├── Dockerfile.cpu   # CPU image for GPU-less hosts
+│  │       └── cpu_override.yml # Compose override for CPU hosts
+│  ├── prompts/                 # System, per-workflow and reference prompt text
+│  ├── dashboard/               # Quasar dashboard served by msight_api.py
+│  ├── ui/                      # Chat web interface (index.html)
+│  ├── tests/                   # Pytest unit tests
+│  └── evals/                   # Fault-injection eval (needs a running stack)
+├── upstream/                    # Code destined for MSight_Vision itself
+│  └── msight_vision_nodes/     # annotated_frame_publisher.py (Record & Archive)
 ├── agent_deployment/            # AWS CloudFormation / Docker launcher for the agent
 ├── mcity_data_engine_scripts/   # Experiment scripts and one-time operations (Mcity internal)
 ├── .vscode                     # Settings for VS Code IDE

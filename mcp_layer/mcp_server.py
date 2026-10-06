@@ -2,15 +2,19 @@
 from mcptools import (  # noqa: F401
     mcp,
     workflow_selector,
+)
+from mcptools.auto_labeling import (  # noqa: F401
     auto_labeling,
-    data_ingest,
-    v51,
     cvat_export,
+    data_ingest,
     label_studio_export,
-    msight_docker,
-    msight_record_archive,
-    msight_nodes,
-    msight_reference,
+    v51,
+)
+from mcptools.msight import (  # noqa: F401
+    docker,
+    nodes,
+    record_archive,
+    reference,
 )
 
 if __name__ == "__main__":
