@@ -1,10 +1,10 @@
-"""chat_server turn guards: diagnose-then-act consent gate and LLM retry."""
+"""Agent turn guards: diagnose-then-act consent gate, measure-first gate and LLM retry."""
 import asyncio
 
 import pytest
 
-from mcp_layer.chat_server import (
-    _CHANGE_REQUEST_RE, _HEALTH_QUESTION_RE, _chat_with_retry, _measure_first, _without_writes,
+from mcp_layer.chat.guards import (
+    CHANGE_REQUEST_RE, HEALTH_QUESTION_RE, chat_with_retry, measure_first, without_writes,
 )
 
 
@@ -16,7 +16,7 @@ from mcp_layer.chat_server import (
 ])
 def test_symptom_reports_are_not_change_requests(message):
     # "stopped" is a symptom, not the verb "stop".
-    assert not _CHANGE_REQUEST_RE.search(message)
+    assert not CHANGE_REQUEST_RE.search(message)
 
 
 @pytest.mark.parametrize("message", [
@@ -27,13 +27,13 @@ def test_symptom_reports_are_not_change_requests(message):
     "remove viewer_2 and add it back",
 ])
 def test_change_requests_are_recognised(message):
-    assert _CHANGE_REQUEST_RE.search(message)
+    assert CHANGE_REQUEST_RE.search(message)
 
 
 def test_without_writes_keeps_read_tools():
     tools = [{"function": {"name": n}} for n in
              ("diagnose_msight_pipeline", "add_msight_node", "get_msight_logs", "stop_msight_pipeline")]
-    assert [t["function"]["name"] for t in _without_writes(tools)] == \
+    assert [t["function"]["name"] for t in without_writes(tools)] == \
         ["diagnose_msight_pipeline", "get_msight_logs"]
 
 
@@ -54,21 +54,21 @@ class _FlakyClient:
 
 def test_retry_recovers_from_one_dropped_connection():
     client = _FlakyClient(failures=1)
-    assert asyncio.run(_chat_with_retry(client, [])) == "ok"
+    assert asyncio.run(chat_with_retry(client, [])) == "ok"
     assert client.calls == 2
 
 
 def test_retry_gives_up_after_second_failure():
     client = _FlakyClient(failures=2)
     with pytest.raises(APIConnectionError):
-        asyncio.run(_chat_with_retry(client, []))
+        asyncio.run(chat_with_retry(client, []))
     assert client.calls == 2
 
 
 def test_non_connection_errors_are_not_retried():
     client = _FlakyClient(failures=1, exc=ValueError)
     with pytest.raises(ValueError):
-        asyncio.run(_chat_with_retry(client, []))
+        asyncio.run(chat_with_retry(client, []))
     assert client.calls == 1
 
 
@@ -81,12 +81,12 @@ def test_non_connection_errors_are_not_retried():
     ("add a detection viewer on port 9011", False),
 ])
 def test_health_questions_are_recognised(message, expected):
-    assert bool(_HEALTH_QUESTION_RE.search(message)) is expected
+    assert bool(HEALTH_QUESTION_RE.search(message)) is expected
 
 
 def test_measure_first_offers_only_diagnose_when_available():
     with_diag = [{"function": {"name": n}} for n in
                  ("get_msight_status", "get_msight_logs", "diagnose_msight_pipeline")]
-    assert [t["function"]["name"] for t in _measure_first(with_diag)] == ["diagnose_msight_pipeline"]
+    assert [t["function"]["name"] for t in measure_first(with_diag)] == ["diagnose_msight_pipeline"]
     status_only = [{"function": {"name": "get_msight_status"}}]
-    assert _measure_first(status_only) == status_only
+    assert measure_first(status_only) == status_only

@@ -3,63 +3,32 @@
 Routes call MCP tools rather than importing mcptools directly: node tracking
 lives in mcp_server.py's process, and a second MSightControlPlane here would diverge.
 """
-import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
-from typing import Optional
-
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from fastmcp import Client
-from fastmcp.client.transports import SSETransport
 
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
-from mcp_layer.host_utils import resolve_host
+from mcp_layer.mcp_connection import mcp_session
+from mcp_layer.pipeline_common import unwrap_tool_output
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    host = resolve_host()
-    mcp_transport = SSETransport(url=f"http://{host}:8000/sse")
-    # Retry: mcp_server.py may not be listening yet at startup.
-    mcp_client_cm = Client(mcp_transport)
-    last_exc: Optional[Exception] = None
-    for attempt in range(15):
-        try:
-            mcp_client = await mcp_client_cm.__aenter__()
-            break
-        except Exception as e:
-            last_exc = e
-            logging.warning(
-                f"[STARTUP] MCP connect attempt {attempt + 1}/15 failed: {e}; retrying in 2s"
-            )
-            await asyncio.sleep(2)
-    else:
-        raise RuntimeError("Could not connect to MCP server after 15 attempts") from last_exc
-
-    app.state.mcp_client = mcp_client
-    try:
+    async with mcp_session() as client:
+        app.state.mcp_client = client
         yield
-    finally:
-        await mcp_client_cm.__aexit__(None, None, None)
 
 
 app = FastAPI(lifespan=_lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 async def _json_body(request: Request) -> dict:
@@ -72,28 +41,9 @@ async def _json_body(request: Request) -> dict:
         return {}
 
 
-def _unwrap_json(raw) -> str:
-    """unwrap_tool_output without the newline substitution, which breaks JSON re-parsing."""
-    if raw is None:
-        return ""
-    if isinstance(raw, str):
-        return raw
-    if hasattr(raw, "text"):
-        return (raw.text or "").strip()
-    if isinstance(raw, list):
-        parts = [_unwrap_json(x) for x in raw]
-        return "\n".join(p for p in parts if p).strip()
-    if isinstance(raw, dict):
-        if "text" in raw and isinstance(raw["text"], str):
-            return raw["text"].strip()
-        if "content" in raw and isinstance(raw["content"], list):
-            return _unwrap_json(raw["content"])
-    return str(raw).strip()
-
-
 async def _call_tool(request: Request, name: str, args: dict) -> JSONResponse:
-    raw = await request.app.state.mcp_client.call_tool(name, args)
-    text = _unwrap_json(raw)
+    # No newline unescaping: the text is re-parsed as JSON.
+    text = unwrap_tool_output(await request.app.state.mcp_client.call_tool(name, args), unescape_newlines=False)
     try:
         data = json.loads(text)
     except (TypeError, ValueError):
@@ -139,9 +89,7 @@ async def pipeline_start(request: Request):
 
 @app.post("/pipeline/stop")
 async def pipeline_stop(request: Request):
-    data = await _json_body(request)
-    args = {"remove_volumes": data.get("remove_volumes", False)}
-    return await _call_tool(request, "stop_msight_pipeline", args)
+    return await _call_tool(request, "stop_msight_pipeline", {})
 
 
 @app.post("/recording/start")

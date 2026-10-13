@@ -533,7 +533,7 @@ tools = [
                         "video_input": {"type": "string", "description": "Absolute path to a video file or folder of .mp4 files on this host."},
                         "rtsp_url": {"type": "string", "description": "Live RTSP stream URL. Takes priority over video_input if both are set."},
                         "sensor_name": {"type": "string", "description": "Logical camera/sensor name. Optional — MSight_Vision defaults to gs_mcity_1 if omitted."},
-                        "build": {"type": "boolean", "description": "Rebuild Docker images from source before starting (default false — a plain `docker compose up -d` using the already-built/published image, no rebuild output). Only set true if MSight_Vision's own source has changed and the running image is stale; a rebuild prints noisy 'exporting layers'-style BuildKit output that looks alarming but is normal — avoid triggering it unless actually needed."}
+                        "build": {"type": "boolean", "description": "Rebuild the msight-vision image from MSight_Vision's source (docker compose build) before starting. Default false. Only set true if MSight_Vision's own source has changed; the build takes several minutes and prints noisy BuildKit output that is normal."}
                     }
                 }
             }
@@ -565,13 +565,8 @@ tools = [
             "type": "function",
             "function": {
                 "name": "stop_msight_pipeline",
-                "description": "Stop the MSight_Vision pipeline containers (docker compose down). Does not delete the MSight_Vision checkout or its .env.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "remove_volumes": {"type": "boolean", "description": "If true, also removes anonymous volumes (docker compose down -v). Default false."}
-                    }
-                }
+                "description": "Stop the fixed pipeline's three nodes (video_source, rfdetr_detector, detection_viewer). Nodes added with add_msight_node keep running -- remove those with remove_msight_node.",
+                "parameters": {"type": "object", "properties": {}}
             }
         },
         {

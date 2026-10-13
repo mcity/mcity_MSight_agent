@@ -5,22 +5,13 @@ from fastmcp import Client
 
 from mcp_layer.pipeline_common import (
     Sentinels, HardStop, Injection, FallThrough, ToolRouting, WRITE_TOOLS,
-    unwrap_tool_output, TOOL_STATUS_MESSAGES,
+    format_reply, tool_status, unwrap_tool_output, TOOL_STATUS_MESSAGES,
 )
 from mcp_layer.pipeline_handlers.auto_labeling import AutoLabelingHandlers
 from mcp_layer.pipeline_handlers.msight_pipeline import MsightPipelineHandlers
 from mcp_layer.validate_workflow_state import (
     WorkflowState, AutoLabelingPhase, WORKFLOW_SPECS, validate_tool_input,
 )
-
-
-def _tool_result_reports_error(result: str) -> bool:
-    """True for a {"status": "error", ...} tool response (a handled failure)."""
-    try:
-        parsed = json.loads(result)
-    except (TypeError, ValueError):
-        return False
-    return isinstance(parsed, dict) and parsed.get("status") == "error"
 
 
 class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
@@ -138,7 +129,7 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
             )
             if fn_name == "get_msight_logs" and progress_cb:
                 await self._emit_raw_logs(result, fn_args, progress_cb)
-            call_failed = failed or _tool_result_reports_error(result)
+            call_failed = failed or tool_status(result) == "error"
             if fn_name in WRITE_TOOLS and not call_failed:
                 self.write_succeeded_this_turn = True
             tool_results.append({
@@ -266,10 +257,8 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
         }
 
     async def _handle_send_reply(self, fn_args: dict) -> tuple[str, list[ToolRouting]]:
-        msg = fn_args.get("message", "")
-        src = "" if self.write_succeeded_this_turn else fn_args.get("source", "")
-        content = f"{msg.strip()}\n[source: {src.strip()}]" if src and src.strip() else msg
-        return content, [FallThrough()]
+        source = None if self.write_succeeded_this_turn else fn_args.get("source")
+        return format_reply(fn_args.get("message", ""), source), [FallThrough()]
 
     async def _handle_select_or_switch_workflow(
         self, fn_name: str, fn_args: dict, mcp_client, messages: list | None = None

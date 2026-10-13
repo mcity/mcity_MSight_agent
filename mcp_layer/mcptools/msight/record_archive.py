@@ -7,7 +7,6 @@
 The annotator/aggregator are shared parents: started before either sink and
 kept alive while any sink still needs them.
 """
-import asyncio
 import os
 import shutil
 import time
@@ -15,12 +14,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from dotenv import dotenv_values
+
 from mcp_layer.mcptools import mcp
 from mcp_layer.mcptools.mcp_json import error_json, ok_json
-from mcp_layer.mcptools.msight.docker import _control_plane, _get_msight_path
-
-# Sensor of the latest recording session, so stop can find its segments.
-_LAST_RECORDING_SENSOR: Optional[str] = None
+from mcp_layer.mcptools.msight.control_plane import get_control_plane
+from mcp_layer.mcptools.msight.paths import get_msight_path
+from mcp_layer.mcptools.msight.utils import run_cmd
 
 # Concatenated single-file recordings served by /msight/download_recording.
 DOWNLOAD_DIR = Path("output/msight_downloads")
@@ -36,99 +36,91 @@ DEFAULT_BUFFER_SIZE = 40
 DEFAULT_OVERLAP_SIZE = 0
 DEFAULT_FPS = 20
 
+# Sensor of the latest recording session, so stop can find its segments.
+_last_recording_sensor: Optional[str] = None
 
-def _active_sensor_name(msight_path: Path) -> str:
-    """Sensor name the running pipeline uses (falls back to MSight_Vision's .env).
 
-    A wrong guess leaves the aggregator silently recording nothing.
-    """
-    env_path = msight_path / ".env"
-    if env_path.is_file():
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("SENSOR_NAME=") and not line.startswith("#"):
-                value = line.split("=", 1)[1].strip().strip('"').strip("'")
-                if value:
-                    return value
-    return DEFAULT_SENSOR_NAME
+def _recording_dir() -> Path:
+    return Path(os.environ.get("MSIGHT_RECORDING_SAVE_DIR", "output/msight_recordings"))
+
+
+def _segments(sensor: str) -> list[Path]:
+    """This sensor's recorded clips; name order is chronological."""
+    segment_dir = _recording_dir() / sensor
+    return sorted(segment_dir.glob(f"{sensor}_*.mp4")) if segment_dir.is_dir() else []
+
+
+def active_sensor_name(msight_path: Path) -> str:
+    """Sensor name the running pipeline uses (from MSight_Vision's .env).
+    A wrong guess leaves the aggregator silently recording nothing."""
+    return dotenv_values(msight_path / ".env").get("SENSOR_NAME") or DEFAULT_SENSOR_NAME
 
 
 def recording_segment_status(sensor: str) -> dict:
     """Live on-disk scan of recorded segments."""
-    save_dir = Path(os.environ.get("MSIGHT_RECORDING_SAVE_DIR", "output/msight_recordings"))
-    segment_dir = save_dir / sensor
-    segments = sorted(segment_dir.glob(f"{sensor}_*.mp4")) if segment_dir.is_dir() else []
+    segments = _segments(sensor)
     if not segments:
         return {"segment_count": 0, "seconds_since_last": None}
     last_mtime = max(p.stat().st_mtime for p in segments)
-    return {
-        "segment_count": len(segments),
-        "seconds_since_last": max(0, int(time.time() - last_mtime)),
-    }
+    return {"segment_count": len(segments), "seconds_since_last": max(0, int(time.time() - last_mtime))}
 
 
-async def _ensure_annotator(msight_path: Path, sensor_name: str) -> tuple[bool, str]:
-    """Idempotently start the frame annotator."""
-    cp = _control_plane()
-    if cp.is_tracked(ANNOTATOR_NODE):
-        return True, ""
+async def _ensure_node(name: str, node_type: str, config: dict) -> Optional[str]:
+    """Start `name` unless it's already alive (a pidfile-recovered process counts, so
+    it isn't duplicated after a server restart). Returns an error message or None."""
+    if await get_control_plane().is_alive(name):
+        return None
     try:
-        await cp.add_node("frame_annotator", name=ANNOTATOR_NODE, config={
-            "subscribe_topic": f"detection/{sensor_name}",
-            "publish_topic": f"annotated/{sensor_name}",
-        })
-        return True, ""
+        await get_control_plane().add_node(node_type, name=name, config=config)
     except Exception as e:
-        return False, f"Could not start {ANNOTATOR_NODE}: {e}"
+        return f"Could not start {name}: {e}"
+    return None
 
 
-async def _ensure_aggregator(msight_path: Path, sensor_name: str) -> tuple[bool, str]:
-    """Idempotently start the aggregator (needed by both recording and archiving).
-
-    Known gap: an already-running aggregator isn't checked for a sensor_name mismatch.
-    """
-    cp = _control_plane()
-    if cp.is_tracked(AGGREGATOR_NODE):
-        return True, ""
-    ok, msg = await _ensure_annotator(msight_path, sensor_name)
-    if not ok:
-        return False, msg
-    try:
-        await cp.add_node("video_aggregator", name=AGGREGATOR_NODE, config={
-            "subscribe_topic": f"annotated/{sensor_name}",
-            "publish_topic": f"video/{sensor_name}",
+async def _ensure_aggregator(sensor: str) -> Optional[str]:
+    """Annotator + aggregator, shared by recording and archiving.
+    Known gap: an already-running aggregator isn't checked for a sensor mismatch."""
+    return (
+        await _ensure_node(ANNOTATOR_NODE, "frame_annotator", {
+            "subscribe_topic": f"detection/{sensor}",
+            "publish_topic": f"annotated/{sensor}",
+        })
+        or await _ensure_node(AGGREGATOR_NODE, "video_aggregator", {
+            "subscribe_topic": f"annotated/{sensor}",
+            "publish_topic": f"video/{sensor}",
             "buffer_size": DEFAULT_BUFFER_SIZE,
             "overlap_size": DEFAULT_OVERLAP_SIZE,
             "fps": DEFAULT_FPS,
         })
-        return True, ""
-    except Exception as e:
-        return False, f"Could not start {AGGREGATOR_NODE}: {e}"
+    )
+
+
+async def _stop_node(name: str) -> str:
+    was_up = get_control_plane().is_tracked(name)
+    await get_control_plane().delete_node(name)
+    return f"{name} stopped." if was_up else f"{name} was not running."
+
+
+async def _stop_aggregator_chain() -> str:
+    return f"{await _stop_node(AGGREGATOR_NODE)} {await _stop_node(ANNOTATOR_NODE)}"
 
 
 @mcp.tool()
 async def start_msight_recording(sensor_name: Optional[str] = None) -> str:
     """Start local recording of the annotated feed: frame annotator + aggregator + local disk dumper."""
-    msight_path, err = _get_msight_path()
+    global _last_recording_sensor
+    msight_path, err = get_msight_path()
     if err:
         return error_json(err)
-    sensor = sensor_name or _active_sensor_name(msight_path)
-
-    ok, msg = await _ensure_aggregator(msight_path, sensor)
-    if not ok:
-        return error_json(msg)
-
-    save_dir = os.environ.get("MSIGHT_RECORDING_SAVE_DIR", "output/msight_recordings")
-    Path(save_dir).mkdir(parents=True, exist_ok=True)
-    try:
-        await _control_plane().add_node("video_local_dumper", name=DUMPER_NODE, config={
-            "subscribe_topic": f"video/{sensor}",
-            "save_dir": str(Path(save_dir).resolve()),
-        })
-    except Exception as e:
-        return error_json(f"Could not start {DUMPER_NODE}: {e}")
-    global _LAST_RECORDING_SENSOR
-    _LAST_RECORDING_SENSOR = sensor
+    sensor = sensor_name or active_sensor_name(msight_path)
+    save_dir = _recording_dir()
+    save_dir.mkdir(parents=True, exist_ok=True)
+    if err := await _ensure_aggregator(sensor) or await _ensure_node(DUMPER_NODE, "video_local_dumper", {
+        "subscribe_topic": f"video/{sensor}",
+        "save_dir": str(save_dir.resolve()),
+    }):
+        return error_json(err)
+    _last_recording_sensor = sensor
     return ok_json(
         "Recording is set up. It writes video in chunks — nothing is saved to disk "
         f"until it has buffered {DEFAULT_BUFFER_SIZE} frames from the pipeline, so if "
@@ -138,10 +130,28 @@ async def start_msight_recording(sensor_name: Optional[str] = None) -> str:
     )
 
 
-async def _concat_recording_segments(save_dir: Path, sensor: str) -> tuple[Optional[Path], Optional[str]]:
-    """Concat this session's segments (name order is chronological) with ffmpeg, then delete them."""
-    segment_dir = save_dir / sensor
-    segments = sorted(segment_dir.glob(f"{sensor}_*.mp4"))
+@mcp.tool()
+async def start_msight_archiving(s3_bucket: str, s3_prefix: Optional[str] = None) -> str:
+    """Start S3 archiving of the annotated feed: frame annotator + aggregator + S3 pusher. Needs AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY."""
+    msight_path, err = get_msight_path()
+    if err:
+        return error_json(err)
+    if not os.environ.get("AWS_ACCESS_KEY_ID") or not os.environ.get("AWS_SECRET_ACCESS_KEY"):
+        return error_json("AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are not set in .env — "
+                          "archiving needs AWS credentials to write to S3.")
+    sensor = active_sensor_name(msight_path)
+    if err := await _ensure_aggregator(sensor) or await _ensure_node(PUSHER_NODE, "aws_video_pusher", {
+        "subscribe_topic": f"video/{sensor}",
+        "bucket_name": s3_bucket,
+        "prefix": s3_prefix or "",
+    }):
+        return error_json(err)
+    return ok_json(f"Archiving started — video files will be pushed to s3://{s3_bucket}/{s3_prefix or ''}.")
+
+
+async def _concat_recording_segments(sensor: str) -> tuple[Optional[Path], Optional[str]]:
+    """Concat this session's segments into one .mp4 with ffmpeg, then delete them."""
+    segments = _segments(sensor)
     if not segments:
         return None, (
             f"No recorded video segments were found — recording only writes a chunk "
@@ -151,126 +161,62 @@ async def _concat_recording_segments(save_dir: Path, sensor: str) -> tuple[Optio
             f"or confirm the pipeline was actually running and producing frames the "
             f"whole time recording was on."
         )
-
+    segment_dir = segments[0].parent
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
-        return None, (
-            "ffmpeg is not installed on this host — the recorded segments are still on "
-            f"disk at {segment_dir}, but they could not be combined into one file."
-        )
+        return None, ("ffmpeg is not installed on this host — the recorded segments are still on "
+                      f"disk at {segment_dir}, but they could not be combined into one file.")
 
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
-    out_path = DOWNLOAD_DIR / f"{sensor}_recording_{timestamp}.mp4"
-
+    out_path = DOWNLOAD_DIR / f"{sensor}_recording_{datetime.now().strftime('%Y%m%dT%H%M%S')}.mp4"
     list_path = segment_dir / "_concat_list.txt"
     list_path.write_text("\n".join(f"file '{p.resolve()}'" for p in segments))
-
-    proc = await asyncio.create_subprocess_exec(
-        ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
-        "-c", "copy", str(out_path),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-    )
-    stdout, _ = await proc.communicate()
+    code, out = await run_cmd(ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
+                              "-c", "copy", str(out_path))
     list_path.unlink(missing_ok=True)
-
-    if proc.returncode != 0 or not out_path.is_file():
-        tail = stdout.decode(errors="replace")[-1000:] if stdout else ""
-        return None, f"ffmpeg failed to combine the recorded segments:\n{tail}"
+    if code != 0 or not out_path.is_file():
+        return None, f"ffmpeg failed to combine the recorded segments:\n{out[-1000:]}"
 
     for p in segments:
         p.unlink(missing_ok=True)
         p.with_name(f"{p.stem}_metadata.json").unlink(missing_ok=True)
-
     return out_path, None
-
-
-@mcp.tool()
-async def start_msight_archiving(s3_bucket: str, s3_prefix: Optional[str] = None) -> str:
-    """Start S3 archiving of the annotated feed: frame annotator + aggregator + S3 pusher. Needs AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY."""
-    msight_path, err = _get_msight_path()
-    if err:
-        return error_json(err)
-    if not os.environ.get("AWS_ACCESS_KEY_ID") or not os.environ.get("AWS_SECRET_ACCESS_KEY"):
-        return error_json(
-            "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are not set in .env — "
-            "archiving needs AWS credentials to write to S3."
-        )
-    sensor = _active_sensor_name(msight_path)
-
-    ok, msg = await _ensure_aggregator(msight_path, sensor)
-    if not ok:
-        return error_json(msg)
-
-    try:
-        await _control_plane().add_node("aws_video_pusher", name=PUSHER_NODE, config={
-            "subscribe_topic": f"video/{sensor}",
-            "bucket_name": s3_bucket,
-            "prefix": s3_prefix or "",
-        })
-    except Exception as e:
-        return error_json(f"Could not start {PUSHER_NODE}: {e}")
-    return ok_json(f"Archiving started — video files will be pushed to s3://{s3_bucket}/{s3_prefix or ''}.")
-
-
-async def _stop_aggregator_chain() -> str:
-    """Stop the aggregator and its upstream annotator together."""
-    cp = _control_plane()
-    agg_was_up = cp.is_tracked(AGGREGATOR_NODE)
-    ann_was_up = cp.is_tracked(ANNOTATOR_NODE)
-    await cp.delete_node(AGGREGATOR_NODE)
-    await cp.delete_node(ANNOTATOR_NODE)
-    agg_msg = f"{AGGREGATOR_NODE} stopped." if agg_was_up else f"{AGGREGATOR_NODE} was not running."
-    ann_msg = f"{ANNOTATOR_NODE} stopped." if ann_was_up else f"{ANNOTATOR_NODE} was not running."
-    return f"{agg_msg} {ann_msg}"
 
 
 @mcp.tool()
 async def stop_msight_recording() -> str:
     """Stop the local dumper (and aggregator/annotator if archiving isn't also active), then combine segments into one downloadable .mp4."""
-    cp = _control_plane()
-    dumper_was_up = cp.is_tracked(DUMPER_NODE)
-    await cp.delete_node(DUMPER_NODE)
-    msg = f"{DUMPER_NODE} stopped." if dumper_was_up else f"{DUMPER_NODE} was not running."
-    agg_msg = ""
-    if not cp.is_tracked(PUSHER_NODE):
-        agg_msg = " " + await _stop_aggregator_chain()
+    global _last_recording_sensor
+    msg = await _stop_node(DUMPER_NODE)
+    if not get_control_plane().is_tracked(PUSHER_NODE):
+        msg += " " + await _stop_aggregator_chain()
 
-    global _LAST_RECORDING_SENSOR
-    sensor = _LAST_RECORDING_SENSOR
-    _LAST_RECORDING_SENSOR = None
+    sensor, _last_recording_sensor = _last_recording_sensor, None
     if not sensor:
-        return ok_json(f"{msg}{agg_msg}")
-
-    save_dir = Path(os.environ.get("MSIGHT_RECORDING_SAVE_DIR", "output/msight_recordings"))
-    out_path, err = await _concat_recording_segments(save_dir, sensor)
+        return ok_json(msg)
+    out_path, err = await _concat_recording_segments(sensor)
     if err:
-        return ok_json(f"{msg}{agg_msg} {err}")
-
-    return ok_json(f"{msg}{agg_msg} Recording saved as {out_path.name}.", download_filename=out_path.name)
+        return ok_json(f"{msg} {err}")
+    return ok_json(f"{msg} Recording saved as {out_path.name}.", download_filename=out_path.name)
 
 
 @mcp.tool()
 async def stop_msight_archiving() -> str:
     """Stop the S3 pusher (and aggregator/annotator if recording isn't also active)."""
-    cp = _control_plane()
-    pusher_was_up = cp.is_tracked(PUSHER_NODE)
-    await cp.delete_node(PUSHER_NODE)
-    msg = f"{PUSHER_NODE} stopped." if pusher_was_up else f"{PUSHER_NODE} was not running."
-    if not cp.is_tracked(DUMPER_NODE):
-        agg_msg = await _stop_aggregator_chain()
-        return ok_json(f"{msg} {agg_msg}")
+    msg = await _stop_node(PUSHER_NODE)
+    if not get_control_plane().is_tracked(DUMPER_NODE):
+        msg += " " + await _stop_aggregator_chain()
     return ok_json(msg)
 
 
 @mcp.tool()
 async def get_msight_record_archive_status() -> str:
-    """Report which record/archive nodes are actually alive right now.
-    Uses is_alive(), not is_tracked() -- presence in memory isn't liveness."""
-    cp = _control_plane()
+    """Which record/archive nodes are actually alive right now (liveness, not tracking)."""
+    snap = await get_control_plane().snapshot(
+        [ANNOTATOR_NODE, AGGREGATOR_NODE, DUMPER_NODE, PUSHER_NODE])
     return ok_json(
-        frame_annotator=await cp.is_alive(ANNOTATOR_NODE),
-        video_aggregator=await cp.is_alive(AGGREGATOR_NODE),
-        local_dumper=await cp.is_alive(DUMPER_NODE),
-        s3_pusher=await cp.is_alive(PUSHER_NODE),
+        frame_annotator=snap[ANNOTATOR_NODE]["alive"],
+        video_aggregator=snap[AGGREGATOR_NODE]["alive"],
+        local_dumper=snap[DUMPER_NODE]["alive"],
+        s3_pusher=snap[PUSHER_NODE]["alive"],
     )

@@ -346,9 +346,16 @@ git add .gitmodules $(git submodule foreach --quiet 'echo $name')
 │  └── install.sh               # Installs msight_base/msight_core into the active venv
 ├── mcp_layer/                   # Agentic (MCP) layer
 │  ├── mcp_server.py            # MCP tool registry (port 8000)
-│  ├── chat_server.py           # FastAPI chat endpoint + MSight uploads/downloads (port 8001)
+│  ├── chat_server.py           # Chat SSE endpoint + MSight file routes (port 8001)
+│  ├── chat/                    # The chat agent behind chat_server.py
+│  │   ├── loop.py              # One user turn: LLM call -> tool calls -> repeat
+│  │   ├── guards.py            # In-code turn rules (grounding, consent, measure-first)
+│  │   ├── prompts.py           # System prompt assembly
+│  │   ├── state_hints.py       # Per-turn SESSION_STATE hint
+│  │   └── msight_routes.py     # Calibration/video upload, recording download
 │  ├── ingest_server.py         # Dataset upload & ingestion (port 8002)
 │  ├── msight_api.py            # REST API + built dashboard for MSight (port 8003)
+│  ├── mcp_connection.py        # Shared MCP client connection (chat server + API)
 │  ├── client_chat.py           # Web/terminal client (port 5225)
 │  ├── chat_pipeline.py         # Tool dispatch, state routing, reply formatting
 │  ├── pipeline_handlers/       # Per-workflow handler mixins for ChatPipeline
@@ -358,7 +365,7 @@ git add .gitmodules $(git submodule foreach --quiet 'echo $name')
 │  ├── progress_relay.py        # Relays MCP log events to the active /chat/stream
 │  ├── validate_workflow_state.py # Pydantic workflow state machine (both workflows)
 │  ├── host_utils.py            # AWS IMDSv2 host/IP resolution for the viewer URL
-│  ├── llm_clients.py           # Multi-LLM support (OpenAI, Claude, Gemini, Groq)
+│  ├── llm_clients.py           # Multi-LLM support (OpenAI, Claude, Gemini, Groq) + provider choice
 │  ├── tool_schema.py           # Tool definitions exposed to the LLM
 │  ├── mcptools/                # MCP tool implementations
 │  │   ├── __init__.py          # Shared FastMCP instance
@@ -373,9 +380,12 @@ git add .gitmodules $(git submodule foreach --quiet 'echo $name')
 │  │   └── msight/              # MSight pipeline workflow
 │  │       ├── paths.py         # The single MSIGHT_VISION_PATH lookup
 │  │       ├── control_plane.py # Owns tracked nodes; status from Redis MSIGHT:NODES
-│  │       ├── executors.py     # Docker / supervisor execution backends
+│  │       ├── diagnosis.py     # Graph root-cause analysis + topic-rate probe
+│  │       ├── executors.py     # Docker / supervisor backends, GPU + container facts
 │  │       ├── node_catalog.py  # Data-driven msight_core node specs
-│  │       ├── docker.py        # start/stop/status/logs/diagnose tools
+│  │       ├── pipeline.py      # start/stop/status/logs/diagnose tools
+│  │       ├── calibration.py   # Calibration status/reset + check tool
+│  │       ├── utils.py         # run_cmd, Redis settings, small shared helpers
 │  │       ├── host_inspect.py  # Read-only, allowlisted host commands (inspect_host tool)
 │  │       ├── nodes.py         # Generic add/remove node tools
 │  │       ├── record_archive.py # Local recording + S3 archiving

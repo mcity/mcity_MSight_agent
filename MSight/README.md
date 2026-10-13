@@ -110,7 +110,7 @@ Each `.npz` must contain two arrays of shape `(H, W)` matching the camera resolu
 | `lon_map` | float64 | Longitude at each pixel (non-calibrated pixels are `-inf`) |
 
 **This is a different key convention than the live MSight_Vision pipeline's calibration
-files**, which use `x_map`/`y_map` (see `mcp_layer/mcptools/msight/docker.py`'s
+files**, which use `x_map`/`y_map` (see `mcp_layer/mcptools/msight/calibration.py`'s
 `check_msight_calibration_status`). The two are not interchangeable — `set_msight_localization_config`
 validates the `.npz` contains `lat_map`/`lon_map` before writing anything, and rejects
 with a message naming the mismatch if it looks like the other format instead.

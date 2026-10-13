@@ -4,66 +4,85 @@ import logging
 import time
 
 from mcp_layer.host_utils import resolve_host
-from mcp_layer.mcptools.msight.docker import (
-    _calibration_status, _get_msight_path, _reset_calibration_to_default,
-    calibration_state_label,
+from mcp_layer.mcptools.msight.calibration import calibration_label, reset_calibration_to_default
+from mcp_layer.mcptools.msight.paths import get_msight_path
+from mcp_layer.pipeline_common import (
+    Sentinels, HardStop, Injection, FallThrough, ToolRouting, tool_status, unwrap_tool_output,
 )
-from mcp_layer.pipeline_common import Sentinels, HardStop, Injection, FallThrough, ToolRouting, unwrap_tool_output
 from mcp_layer.progress_relay import clear_active_progress_cb, set_active_progress_cb
 from mcp_layer.validate_workflow_state import MsightPipelineState
+
+_PENDING_LABEL = "will start automatically once the pipeline starts"
+
+
+def _response(status: str, message: str) -> str:
+    return json.dumps({"status": status, "message": message})
+
+
+def _source_label(mp: MsightPipelineState) -> str:
+    return f"rtsp_url={mp.rtsp_url!r}" if mp.rtsp_url else f"video_input={mp.video_input!r}"
+
+
+def _arg(value) -> str:
+    """A Python-call rendering of an optional argument for injected instructions."""
+    return repr(value) if value else "None"
+
+
+def _clear_recording(mp: MsightPipelineState, active: bool) -> None:
+    mp.recording_active = active
+    mp.recording_pending = False
+    mp.recording_pending_since = 0.0
+
+
+def _clear_archiving(mp: MsightPipelineState, active: bool) -> None:
+    mp.archiving_active = active
+    mp.archiving_pending = False
+    mp.archiving_pending_since = 0.0
+    mp.archiving_pending_bucket = ""
+    mp.archiving_pending_prefix = ""
 
 
 class MsightPipelineHandlers:
     """Mixin: all msight_pipeline-workflow tool handlers. See chat_pipeline.ChatPipeline."""
 
+    def _msight_state(self) -> MsightPipelineState:
+        if self.state.msight_pipeline is None:
+            self.state.msight_pipeline = MsightPipelineState()
+        return self.state.msight_pipeline
+
     def _maybe_reset_msight_calibration(self, workflow_name: str) -> None:
         """Reset calibration to the default on fresh entry, so uploads don't carry over."""
         if workflow_name != "msight_pipeline":
             return
-        msight_path, err = _get_msight_path()
+        msight_path, err = get_msight_path()
         if err:
             return
         try:
-            _reset_calibration_to_default(msight_path)
+            reset_calibration_to_default(msight_path)
             logging.warning("[PIPELINE] msight_pipeline entry: calibration reset to shipped default")
         except Exception as e:
             logging.warning(f"[PIPELINE] Failed to reset calibration to default: {e}")
 
     async def _handle_confirm_msight_run(self) -> tuple[str, list[ToolRouting]]:
-        if self.state.msight_pipeline is None:
-            self.state.msight_pipeline = MsightPipelineState()
-        mp = self.state.msight_pipeline
+        mp = self._msight_state()
         mp.run_confirmed = True
         mp.run_awaiting_confirmation = False
         mp.run_confirmation_requested_at = 0.0
         self.state.save()
 
-        source = f"rtsp_url={mp.rtsp_url!r}" if mp.rtsp_url else f"video_input={mp.video_input!r}"
-        logging.warning(f"[PIPELINE] confirm_run (msight_pipeline): run_confirmed=True {source}")
-
-        video_input_arg = repr(mp.video_input) if mp.video_input else "None"
-        rtsp_url_arg    = repr(mp.rtsp_url) if mp.rtsp_url else "None"
-        sensor_name_arg = repr(mp.sensor_name) if mp.sensor_name else "None"
+        logging.warning(f"[PIPELINE] confirm_run (msight_pipeline): run_confirmed=True {_source_label(mp)}")
         result = "Run consent recorded. Call start_msight_pipeline() now with the previously-stated source."
         return result, [Injection(
             f"RUN_CONFIRMED: Consent recorded. Call "
-            f"start_msight_pipeline(video_input={video_input_arg}, rtsp_url={rtsp_url_arg}, "
-            f"sensor_name={sensor_name_arg}) immediately — do not ask the user anything else first."
+            f"start_msight_pipeline(video_input={_arg(mp.video_input)}, rtsp_url={_arg(mp.rtsp_url)}, "
+            f"sensor_name={_arg(mp.sensor_name)}) immediately — do not ask the user anything else first."
         )]
 
-    def _msight_calibration_summary_line(self) -> str:
-        """Calibration status line for the consent summary (same check as the state hint)."""
-        msight_path, err = _get_msight_path()
-        if err:
-            return "not available (MSIGHT_VISION_PATH not configured on this host)"
-        return calibration_state_label(_calibration_status(msight_path)["state"], prefixed=False)
-
     def _build_msight_run_needs_confirmation_sentinel(self, mp: MsightPipelineState) -> str:
-        source = f"rtsp_url={mp.rtsp_url!r}" if mp.rtsp_url else f"video_input={mp.video_input!r}"
         return (
             f"{Sentinels.RUN_NEEDS_CONFIRMATION} "
-            f"{source} sensor_name={mp.sensor_name!r} "
-            f"calibration={self._msight_calibration_summary_line()!r} "
+            f"{_source_label(mp)} sensor_name={mp.sensor_name!r} "
+            f"calibration={calibration_label(prefixed=False)!r} "
             f"recording={mp.recording_active} recording_pending={mp.recording_pending} "
             f"archiving={mp.archiving_active} archiving_pending={mp.archiving_pending}"
         )
@@ -73,16 +92,8 @@ class MsightPipelineHandlers:
     ) -> str:
         """Pre-run consent summary; replacing_running notes a source swap on a live pipeline."""
         source_label = f"RTSP stream: {mp.rtsp_url}" if mp.rtsp_url else f"Video file/folder: {mp.video_input}"
-        recording = (
-            "enabled" if mp.recording_active else
-            "will start automatically once the pipeline starts" if mp.recording_pending else
-            "not enabled"
-        )
-        archiving = (
-            "enabled" if mp.archiving_active else
-            "will start automatically once the pipeline starts" if mp.archiving_pending else
-            "not enabled"
-        )
+        recording = "enabled" if mp.recording_active else _PENDING_LABEL if mp.recording_pending else "not enabled"
+        archiving = "enabled" if mp.archiving_active else _PENDING_LABEL if mp.archiving_pending else "not enabled"
         prefix = (
             "A pipeline is already running — starting this will stop and replace it.\n\n"
             if replacing_running else ""
@@ -96,7 +107,7 @@ class MsightPipelineHandlers:
             f"{prefix}Here's a summary of what will be run:\n\n"
             f"- **Source:** {source_label}\n"
             f"- **Sensor name:** {mp.sensor_name or '(default)'}\n"
-            f"- **Calibration:** {self._msight_calibration_summary_line()}\n"
+            f"- **Calibration:** {calibration_label(prefixed=False)}\n"
             f"- **Recording:** {recording}\n"
             f"- **Archiving:** {archiving}\n\n"
             f"{question}"
@@ -108,20 +119,18 @@ class MsightPipelineHandlers:
         if not mp.pipeline_running:
             return routings
         if mp.recording_pending:
-            sensor_arg = repr(mp.sensor_name) if mp.sensor_name else "None"
             routings.append(Injection(
                 "RECORDING_WAS_PENDING: The user asked to start recording before "
                 "the pipeline was running. It's running now — call "
-                f"start_msight_recording(sensor_name={sensor_arg}) immediately, in "
+                f"start_msight_recording(sensor_name={_arg(mp.sensor_name)}) immediately, in "
                 "this same reply, before telling the user the pipeline has started."
             ))
         if mp.archiving_pending:
-            bucket_arg = repr(mp.archiving_pending_bucket)
-            prefix_arg = repr(mp.archiving_pending_prefix) if mp.archiving_pending_prefix else "None"
             routings.append(Injection(
                 "ARCHIVING_WAS_PENDING: The user asked to start archiving before "
                 "the pipeline was running. It's running now — call "
-                f"start_msight_archiving(s3_bucket={bucket_arg}, s3_prefix={prefix_arg}) "
+                f"start_msight_archiving(s3_bucket={mp.archiving_pending_bucket!r}, "
+                f"s3_prefix={_arg(mp.archiving_pending_prefix)}) "
                 "immediately, in this same reply, before telling the user the pipeline has started."
             ))
         return routings
@@ -142,9 +151,7 @@ class MsightPipelineHandlers:
             return (
                 f"MSIGHT_MODE_INVALID: '{mode}' — must be 'demo' or 'custom'."
             ), [FallThrough()]
-        if self.state.msight_pipeline is None:
-            self.state.msight_pipeline = MsightPipelineState()
-        mp = self.state.msight_pipeline
+        mp = self._msight_state()
         if mp.mode != mode:
             mp.video_input = ""
             mp.rtsp_url = ""
@@ -180,9 +187,7 @@ class MsightPipelineHandlers:
                 "given one."
             ), [FallThrough()]
 
-        if self.state.msight_pipeline is None:
-            self.state.msight_pipeline = MsightPipelineState()
-        mp = self.state.msight_pipeline
+        mp = self._msight_state()
 
         # True if a consent summary was already shown on a previous turn.
         run_confirmed_at_entry = mp.run_confirmed
@@ -225,10 +230,7 @@ class MsightPipelineHandlers:
         finally:
             if self._progress_cb:
                 clear_active_progress_cb()
-        try:
-            mp.pipeline_running = json.loads(result).get("status") == "ok"
-        except Exception:
-            mp.pipeline_running = False
+        mp.pipeline_running = tool_status(result) == "ok"
         # Reset regardless of outcome, so the next start asks for consent again.
         mp.run_confirmed = False
         mp.run_awaiting_confirmation = False
@@ -243,14 +245,8 @@ class MsightPipelineHandlers:
     ) -> tuple[str, list[ToolRouting]]:
         """Clears pipeline_running on success"""
         result = unwrap_tool_output(await mcp_client.call_tool("stop_msight_pipeline", fn_args))
-        try:
-            ok = json.loads(result).get("status") == "ok"
-        except Exception:
-            ok = False
-        if ok:
-            if self.state.msight_pipeline is None:
-                self.state.msight_pipeline = MsightPipelineState()
-            mp = self.state.msight_pipeline
+        if tool_status(result) == "ok":
+            mp = self._msight_state()
             mp.pipeline_running = False
             if mp.mode == "demo":
                 mp.video_input = ""
@@ -261,87 +257,44 @@ class MsightPipelineHandlers:
     async def _handle_msight_record_archive(
         self, fn_name: str, fn_args: dict, mcp_client
     ) -> tuple[str, list[ToolRouting]]:
-        """Persist recording/archiving flags; defers start until the pipeline runs."""
-        if self.state.msight_pipeline is None:
-            self.state.msight_pipeline = MsightPipelineState()
-        mp = self.state.msight_pipeline
+        """Persist recording/archiving flags; defers a start until the pipeline runs."""
+        mp = self._msight_state()
+        recording = fn_name.endswith("_recording")
+        starting = fn_name.startswith("start_")
 
         # Demo is watch-only; enforced in code, not just the prompt.
-        if fn_name in ("start_msight_recording", "start_msight_archiving") and mp.mode == "demo":
-            return json.dumps({
-                "status": "error",
-                "message": "Recording/archiving isn't available in Demo mode. Switch to \"run your own pipeline\" (select_msight_mode(mode=\"custom\")) to use it.",
-            }), [FallThrough()]
+        if starting and mp.mode == "demo":
+            return _response("error", "Recording/archiving isn't available in Demo mode. Switch to \"run your "
+                             "own pipeline\" (select_msight_mode(mode=\"custom\")) to use it."), [FallThrough()]
 
-        if fn_name == "start_msight_recording" and not mp.pipeline_running:
-            mp.recording_pending = True
-            mp.recording_pending_since = time.time()
+        what = "recording" if recording else "archiving"
+        if starting and not mp.pipeline_running:
+            if recording:
+                mp.recording_pending, mp.recording_pending_since = True, time.time()
+            else:
+                mp.archiving_pending, mp.archiving_pending_since = True, time.time()
+                mp.archiving_pending_bucket = fn_args.get("s3_bucket", "")
+                mp.archiving_pending_prefix = fn_args.get("s3_prefix") or ""
             self.state.save()
-            logging.warning("[PIPELINE] start_msight_recording deferred -- pipeline not running yet")
-            return json.dumps({
-                "status": "deferred",
-                "message": "Got it — recording will start automatically as soon as the pipeline is running.",
-            }), [FallThrough()]
-
-        if fn_name == "start_msight_archiving" and not mp.pipeline_running:
-            mp.archiving_pending = True
-            mp.archiving_pending_since = time.time()
-            mp.archiving_pending_bucket = fn_args.get("s3_bucket", "")
-            mp.archiving_pending_prefix = fn_args.get("s3_prefix") or ""
-            self.state.save()
-            logging.warning("[PIPELINE] start_msight_archiving deferred -- pipeline not running yet")
-            return json.dumps({
-                "status": "deferred",
-                "message": "Got it — archiving will start automatically as soon as the pipeline is running.",
-            }), [FallThrough()]
+            logging.warning(f"[PIPELINE] {fn_name} deferred -- pipeline not running yet")
+            return _response("deferred", f"Got it — {what} will start automatically as soon as the "
+                             "pipeline is running."), [FallThrough()]
 
         # Deferred but never launched -- nothing running, so no MCP call needed.
-        if fn_name == "stop_msight_recording" and mp.recording_pending and not mp.recording_active:
-            mp.recording_pending = False
-            mp.recording_pending_since = 0.0
+        pending, active = ((mp.recording_pending, mp.recording_active) if recording
+                           else (mp.archiving_pending, mp.archiving_active))
+        if not starting and pending and not active:
+            (_clear_recording if recording else _clear_archiving)(mp, active=False)
             self.state.save()
-            return json.dumps({"status": "ok", "message": "Cancelled — recording had not started yet."}), [FallThrough()]
-        if fn_name == "stop_msight_archiving" and mp.archiving_pending and not mp.archiving_active:
-            mp.archiving_pending = False
-            mp.archiving_pending_since = 0.0
-            mp.archiving_pending_bucket = ""
-            mp.archiving_pending_prefix = ""
-            self.state.save()
-            return json.dumps({"status": "ok", "message": "Cancelled — archiving had not started yet."}), [FallThrough()]
+            return _response("ok", f"Cancelled — {what} had not started yet."), [FallThrough()]
 
         result = unwrap_tool_output(await mcp_client.call_tool(fn_name, fn_args))
-        try:
-            result_data = json.loads(result)
-        except Exception:
-            result_data = {}
-        ok = result_data.get("status") == "ok"
-        if ok:
-            if fn_name == "start_msight_recording":
-                mp.recording_active = True
-                mp.recording_pending = False
-                mp.recording_pending_since = 0.0
-            elif fn_name == "start_msight_archiving":
-                mp.archiving_active = True
-                mp.archiving_pending = False
-                mp.archiving_pending_since = 0.0
-                mp.archiving_pending_bucket = ""
-                mp.archiving_pending_prefix = ""
-            elif fn_name == "stop_msight_recording":
-                mp.recording_active = False
-                mp.recording_pending = False
-                mp.recording_pending_since = 0.0
-                # Resolve into a ready-to-share download URL for the LLM.
-                filename = result_data.get("download_filename")
-                if filename:
-                    result_data["download_url"] = (
-                        f"http://{resolve_host()}:8001/msight/download_recording/{filename}"
-                    )
-                    result = json.dumps(result_data)
-            elif fn_name == "stop_msight_archiving":
-                mp.archiving_active = False
-                mp.archiving_pending = False
-                mp.archiving_pending_since = 0.0
-                mp.archiving_pending_bucket = ""
-                mp.archiving_pending_prefix = ""
-            self.state.save()
+        if tool_status(result) != "ok":
+            return result, [FallThrough()]
+        (_clear_recording if recording else _clear_archiving)(mp, active=starting)
+        if fn_name == "stop_msight_recording" and (filename := json.loads(result).get("download_filename")):
+            # Resolve into a ready-to-share download URL for the LLM.
+            result = json.dumps({**json.loads(result),
+                                 "download_url": f"http://{resolve_host()}:8001/msight/download_recording/{filename}"})
+        self.state.save()
         return result, [FallThrough()]

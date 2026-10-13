@@ -85,7 +85,7 @@ Resources:
           FromPort: 5151
           ToPort: 5151
           CidrIp: 0.0.0.0/0
-        # MSight_Vision's web viewer (msight/docker.py's VIEWER_PORT).
+        # MSight_Vision's web viewer (msight/pipeline.py's VIEWER_PORT).
         - IpProtocol: tcp
           FromPort: 9010
           ToPort: 9010

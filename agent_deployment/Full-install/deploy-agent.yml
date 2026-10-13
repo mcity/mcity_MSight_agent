@@ -64,7 +64,7 @@ Parameters:
     Type: String
     Default: rf-detr-detector
     Description: Branch of MsightVisionRepoURL to clone -- not yet on main
-  # Confirmed: r5 family, no GPU. msight/docker.py auto-detects this and applies this repo's own CPU compose override (MSight_Vision's own docker-compose.cpu.yml doesn't actually work -- Compose merge quirk).
+  # Confirmed: r5 family, no GPU. msight/executors.py auto-detects this and runs RF-DETR on a CPU-only image.
   InstanceType:
     Type: String
     Default: r5.large
@@ -101,7 +101,7 @@ Resources:
           FromPort: 5151
           ToPort: 5151
           CidrIp: 0.0.0.0/0
-        # MSight_Vision's web viewer (msight/docker.py's VIEWER_PORT).
+        # MSight_Vision's web viewer (msight/pipeline.py's VIEWER_PORT).
         - IpProtocol: tcp
           FromPort: 9010
           ToPort: 9010
@@ -131,7 +131,7 @@ Resources:
           apt-get update -y
           apt-get install -y git python3-pip python3-venv curl ffmpeg ca-certificates gnupg
 
-          # ---- Docker Engine + Compose plugin (msight/docker.py shells out to `docker compose` locally) ----
+          # ---- Docker Engine + Compose plugin (msight/executors.py runs each node with `docker run`) ----
           install -m 0755 -d /etc/apt/keyrings
           curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
           chmod a+r /etc/apt/keyrings/docker.asc
@@ -142,7 +142,7 @@ Resources:
           apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
           usermod -aG docker ubuntu
 
-          # No GPU on this instance family -- no NVIDIA driver/Container Toolkit step. msight/docker.py auto-detects and applies this repo's own CPU compose override instead.
+          # No GPU on this instance family -- no NVIDIA driver/Container Toolkit step. msight/executors.py auto-detects this and uses a CPU-only image instead.
 
           # ---- MSight_Vision checkout (never modified in place, only shelled out to) ----
           cd /home/ubuntu

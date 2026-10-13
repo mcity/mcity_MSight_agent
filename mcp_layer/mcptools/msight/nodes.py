@@ -8,7 +8,8 @@ from typing import Optional
 from mcp_layer.mcptools import mcp
 from mcp_layer.mcptools.mcp_json import error_json, ok_json
 from mcp_layer.mcptools.msight.node_catalog import NODE_CATALOG
-from mcp_layer.mcptools.msight.docker import _control_plane, _get_msight_path
+from mcp_layer.mcptools.msight.control_plane import get_control_plane
+from mcp_layer.mcptools.msight.paths import get_msight_path
 
 _NODE_TYPE_DESCRIPTIONS: dict[str, str] = {
     "video_source_rtsp": "Publishes frames from a live RTSP stream (or a local video file path passed as rtsp_url).",
@@ -61,15 +62,14 @@ def list_msight_node_types() -> str:
 
 @mcp.tool()
 async def add_msight_node(node_type: str, name: Optional[str] = None, config: Optional[dict] = None) -> str:
-    msight_path, err = _get_msight_path()
-    if err:
+    if err := get_msight_path()[1]:
         return error_json(err)
     if node_type not in NODE_CATALOG:
         return error_json(f"Unknown node_type '{node_type}'. Call list_msight_node_types() first.")
 
     spec = NODE_CATALOG[node_type]
     resolved_name = name or spec.default_name or node_type
-    cp = _control_plane()
+    cp = get_control_plane()
 
     # Without a `name`, a live node with the default name is reused; say so.
     already_running = await cp.is_alive(resolved_name)
@@ -94,16 +94,12 @@ async def add_msight_node(node_type: str, name: Optional[str] = None, config: Op
 
 @mcp.tool()
 async def remove_msight_node(name: str) -> str:
-    msight_path, err = _get_msight_path()
-    if err:
+    if err := get_msight_path()[1]:
         return error_json(err)
-
-    cp = _control_plane()
-    was_tracked = cp.is_tracked(name)
+    cp = get_control_plane()
+    existed = cp.is_tracked(name) or await cp.is_alive(name)
     try:
         await cp.delete_node(name)
     except Exception as e:
         return error_json(f"Could not stop '{name}': {e}")
-
-    msg = f"'{name}' stopped." if was_tracked else f"'{name}' was not tracked; nothing to stop."
-    return ok_json(msg, name=name)
+    return ok_json(f"'{name}' stopped." if existed else f"'{name}' wasn't running; nothing to stop.", name=name)

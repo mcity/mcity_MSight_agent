@@ -1,7 +1,7 @@
 """diagnose_from_health over synthetic node_health() rows (no Docker/Redis)."""
 import pytest
 
-from mcp_layer.mcptools.msight.control_plane import diagnose_from_health, structural_findings
+from mcp_layer.mcptools.msight.diagnosis import diagnose_from_health, structural_findings
 
 
 def node(name, health, pub=(), sub=(), in_rate=None, out_rate=None):

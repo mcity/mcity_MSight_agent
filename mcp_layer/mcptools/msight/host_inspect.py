@@ -4,13 +4,13 @@
 Commands run without a shell, only if the program AND its arguments match the
 allowlist below; nothing here can change host state or read arbitrary files.
 """
-import asyncio
 import re
 import shlex
 from typing import Callable, Optional
 
 from mcp_layer.mcptools import mcp
 from mcp_layer.mcptools.mcp_json import error_json, ok_json
+from mcp_layer.mcptools.msight.utils import run_cmd
 
 _TIMEOUT_SECONDS = 10
 _MAX_OUTPUT_CHARS = 8000
@@ -161,24 +161,10 @@ async def run_inspection(command: str) -> dict:
     argv, reason = validate(command)
     if reason:
         return {"allowed": False, "reason": reason}
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        )
-    except FileNotFoundError:
-        return {"allowed": True, "command": shlex.join(argv), "exit_code": 127,
-                "output": f"'{argv[0]}' is not installed on this host.", "truncated": False}
-    try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        return {"allowed": True, "command": shlex.join(argv), "exit_code": None,
-                "output": f"timed out after {_TIMEOUT_SECONDS}s", "truncated": False}
-    text = redact(out.decode(errors="replace"))
-    truncated = len(text) > _MAX_OUTPUT_CHARS
-    return {"allowed": True, "command": shlex.join(argv), "exit_code": proc.returncode,
-            "output": text[-_MAX_OUTPUT_CHARS:], "truncated": truncated}
+    code, out = await run_cmd(*argv, timeout=_TIMEOUT_SECONDS)
+    text = redact(out)
+    return {"allowed": True, "command": shlex.join(argv), "exit_code": code,
+            "output": text[-_MAX_OUTPUT_CHARS:], "truncated": len(text) > _MAX_OUTPUT_CHARS}
 
 
 @mcp.tool()

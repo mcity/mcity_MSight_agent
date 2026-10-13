@@ -11,18 +11,29 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
+import redis
 
-from mcp_layer.mcptools.msight.paths import get_msight_path
-from mcp_layer.mcptools.msight.node_catalog import NODE_CATALOG, resolve_cmd
+from mcp_layer.mcptools.msight.diagnosis import diagnose_from_health, sample_topic_rates, structural_findings
 from mcp_layer.mcptools.msight.executors import (
-    DockerHandle, Executor, ExecutorHandle, gpu_report, inspect_containers,
+    DockerHandle, Executor, ExecutorHandle, container_name, gpu_report, inspect_containers,
     recover_supervisor_handle, resolve_executor,
 )
+from mcp_layer.mcptools.msight.node_catalog import NODE_CATALOG, resolve_cmd
+from mcp_layer.mcptools.msight.paths import get_msight_path
+from mcp_layer.mcptools.msight.utils import ago, redis_kwargs, run_cmd, topic_list
 
 NODES_REDIS_KEY = "MSIGHT:NODES"  # matches msight_core.nodes.REDIS_NODES_FIELD
 _URL_SCHEMES = ("rtsp://", "rtsps://", "http://", "https://", "rtmp://")
+_HOST_PROCESS = {"device": "cpu", "note": "host process"}
+
+
+@dataclass
+class _TrackedNode:
+    handle: ExecutorHandle
+    node_type: str
+    invocation: str
 
 
 def _resolve_msight_path() -> Path:
@@ -36,260 +47,51 @@ def _venv_bin(msight_path: Path, name: str) -> Path:
     candidate = msight_path / "venv" / "bin" / name
     if not candidate.is_file():
         raise RuntimeError(
-            f"'{name}' not found in {msight_path / 'venv' / 'bin'} -- "
+            f"'{name}' not found in {candidate.parent} -- "
             "has MSight_Vision's venv been installed (see its install.sh)?"
         )
     return candidate
 
 
-@dataclass
-class _TrackedNode:
-    handle: ExecutorHandle
-    node_type: str
-    invocation: str
-
-
-def _topic_list(value) -> list[str]:
-    """msight_core registers publish_topic as a string, a list, or null."""
-    if not value:
-        return []
-    return [value] if isinstance(value, str) else [t for t in value if t]
-
-
-_BROKEN = {"DEAD", "STALLED", "UNREGISTERED"}
-
-
-def _publishers(rows: list[dict]) -> dict[str, list[dict]]:
-    by_topic: dict[str, list[dict]] = {}
-    for r in rows:
-        for t in r.get("publish_topics", []):
-            by_topic.setdefault(t, []).append(r)
-    return by_topic
-
-
-def structural_findings(rows: list[dict]) -> list[dict]:
-    """Cheap graph checks (registry + liveness, no rate probe).
-
-    DEAD               tracked node isn't running
-    MISSING_PUBLISHER  a running node subscribes to a topic nobody publishes
-    TOPIC_MISMATCH     same, but a published topic is a near-match
-    """
-    import difflib
-    pubs = _publishers(rows)
-    findings = []
-    for r in rows:
-        if not r["alive"]:
-            findings.append({
-                "kind": "DEAD", "node": r["name"],
-                "evidence": f"'{r['name']}' is registered/tracked but its process/container is not running.",
-            })
-    for r in rows:
-        if not r["alive"]:
-            continue
-        for t in r.get("subscribe_topics", []):
-            if pubs.get(t):
-                continue  # has a publisher (alive or dead -- a dead one is its own finding)
-            close = difflib.get_close_matches(t, list(pubs), n=1, cutoff=0.75)
-            if close:
-                findings.append({
-                    "kind": "TOPIC_MISMATCH", "node": r["name"], "topic": t,
-                    "evidence": (f"'{r['name']}' subscribes to '{t}', which nothing publishes; "
-                                 f"the closest published topic is '{close[0]}'."),
-                })
-            else:
-                findings.append({
-                    "kind": "MISSING_PUBLISHER", "node": r["name"], "topic": t,
-                    "evidence": (f"'{r['name']}' subscribes to '{t}', but no registered node publishes "
-                                 "it -- its upstream node was removed, crashed and deregistered, "
-                                 "or was never started."),
-                })
-    return findings
-
-
-# User-facing wording: no tool names (base_prompt.txt forbids showing them).
-_FIXES = {
-    "DEAD": "Restart that node with the same settings (or restart the whole pipeline "
-            "if it's one of the standard pipeline's nodes).",
-    "STALLED": "It's receiving input but producing nothing -- check its logs for an error, "
-               "then restart it.",
-    "UNREGISTERED": "It's running but never finished registering -- check its logs, and "
-                    "restart it if it's stuck starting up.",
-    "MISSING_PUBLISHER": "Add back the node that should publish this topic, or restart the "
-                         "pipeline if it was one of the standard pipeline's nodes.",
-    "TOPIC_MISMATCH": "Remove that node and add it back with the corrected input topic.",
-}
-
-
-def _last_removed_publisher(topic: str, changes: list[dict]) -> Optional[dict]:
-    for c in reversed(changes):
-        if c["change"] == "removed" and topic in c.get("publish_topics", []):
-            return c
-    return None
-
-
-def _ago(seconds: float) -> str:
-    seconds = int(seconds)
-    return f"{seconds}s ago" if seconds < 120 else f"{seconds // 60} min ago"
-
-
-def diagnose_from_health(rows: list[dict], changes: Optional[list[dict]] = None) -> dict:
-    """Rank root causes vs downstream effects from node_health() rows.
-
-    A broken node is a root cause only if nothing upstream is broken, since
-    msight_core nodes exit after ~15s without input and failures cascade.
-    `changes` (oldest first) lets an orphaned topic name the node whose
-    removal orphaned it.
-    """
-    changes = changes or []
-    if not rows:
-        return {"verdict": "empty", "summary": "No MSight nodes are registered or tracked.",
-                "root_causes": [], "affected": [], "nodes": []}
-
-    by_name = {r["name"]: r for r in rows}
-    pubs = _publishers(rows)
-
-    def upstream_broken(r: dict, seen: set) -> Optional[str]:
-        for t in r.get("subscribe_topics", []):
-            for p in pubs.get(t, []):
-                if p["name"] in seen:
-                    continue
-                seen.add(p["name"])
-                deeper = upstream_broken(p, seen)
-                if deeper:
-                    return deeper
-                if p["health"] in _BROKEN:
-                    return p["name"]
-        return None
-
-    def depth(r: dict, seen: set) -> int:
-        ups = [p for t in r.get("subscribe_topics", []) for p in pubs.get(t, []) if p["name"] not in seen]
-        return 0 if not ups else 1 + max(depth(p, seen | {p["name"]}) for p in ups)
-
-    root_causes, affected = [], []
-    for r in rows:
-        if r["health"] in _BROKEN:
-            culprit = upstream_broken(r, {r["name"]})
-            if culprit:
-                affected.append({"node": r["name"], "health": r["health"], "caused_by": culprit})
-            else:
-                evidence = {
-                    "DEAD": f"'{r['name']}' is not running.",
-                    "UNREGISTERED": f"'{r['name']}' is running but missing from the node registry.",
-                    "STALLED": (f"'{r['name']}' is running and receiving "
-                                f"{r['in_rate_hz'] if r['in_rate_hz'] is not None else 'n/a (source)'} msg/s, "
-                                "but published nothing during the sample."),
-                }[r["health"]]
-                root_causes.append({"kind": r["health"], "node": r["name"], "evidence": evidence,
-                                    "_depth": depth(r, {r["name"]})})
-
-    for f in structural_findings(rows):
-        if f["kind"] in ("MISSING_PUBLISHER", "TOPIC_MISMATCH"):
-            cause = {**f, "_depth": depth(by_name[f["node"]], {f["node"]})}
-            removed = _last_removed_publisher(f["topic"], changes) if f["kind"] == "MISSING_PUBLISHER" else None
-            if removed:
-                cause["evidence"] = (f"'{f['node']}' subscribes to '{f['topic']}', which was published by "
-                                     f"'{removed['node']}' -- removed {_ago(time.time() - removed['at'])}.")
-                cause["removed_publisher"] = removed["node"]
-            root_causes.append(cause)
-
-    for r in rows:
-        if r["health"] != "STARVED":
-            continue
-        culprit = upstream_broken(r, {r["name"]})
-        if not culprit:
-            if any(c["node"] == r["name"] for c in root_causes):
-                continue  # its own missing/mismatched publisher is already the root cause
-            culprit = "unknown -- see nodes"
-        affected.append({"node": r["name"], "health": "STARVED", "caused_by": culprit})
-
-    root_causes.sort(key=lambda c: c.pop("_depth"))
-    for c in root_causes:
-        c["suggested_fix"] = (
-            f"Add '{c['removed_publisher']}' back (or restart the pipeline if it was one of the "
-            "standard pipeline's nodes)." if c.get("removed_publisher") else _FIXES[c["kind"]]
-        )
-
-    if not root_causes and not affected:
-        summary = f"All {len(rows)} nodes are running and data is flowing."
-    elif root_causes:
-        top = root_causes[0]
-        summary = f"Most likely root cause: {top['evidence']}"
-        if affected:
-            summary += (f" {len(affected)} downstream node(s) are affected as a consequence: "
-                        f"{', '.join(a['node'] for a in affected)}.")
-    else:
-        summary = "Some nodes are starved of input but no root cause was identified -- see nodes."
-
-    return {
-        "verdict": "healthy" if not root_causes and not affected else "degraded",
-        "summary": summary,
-        "root_causes": root_causes,
-        "affected": affected,
-        "nodes": rows,
-    }
-
-
-def _sample_topic_rates(topics: list[str], max_window: float) -> dict[str, dict]:
-    """Per-topic message rate, measured by subscribing to each topic's Redis channel.
-
-    Stops once every topic has delivered, else at max_window, which must exceed
-    the slowest healthy interval (RF-DETR on CPU: ~4.5s).
-    """
-    import time
-    import redis
-    if not topics:
-        return {}
-    client = redis.Redis(
-        host=os.environ.get("MSIGHT_REDIS_MESSAGE_BROKER_HOST", "localhost"),
-        port=int(os.environ.get("MSIGHT_REDIS_MESSAGE_BROKER_PORT", 6379)),
-        db=int(os.environ.get("MSIGHT_REDIS_MESSAGE_BROKER_DB", 0)),
-    )
-    pubsub = client.pubsub(ignore_subscribe_messages=True)
-    counts = dict.fromkeys(topics, 0)
-    start = time.monotonic()
+def _redis_reachable() -> bool:
     try:
-        pubsub.subscribe(*topics)
-        deadline = start + max_window
-        while (remaining := deadline - time.monotonic()) > 0:
-            msg = pubsub.get_message(timeout=remaining)
-            if msg and msg["type"] == "message":
-                channel = msg["channel"].decode(errors="replace")
-                if channel in counts:
-                    counts[channel] += 1
-                    if all(counts.values()):
-                        # Listen >=1s so one early message doesn't inflate the rate.
-                        deadline = min(deadline, max(start + 1.0, time.monotonic()))
-    finally:
-        pubsub.close()
-        client.close()
-    elapsed = max(time.monotonic() - start, 1e-6)
-    return {
-        t: {"messages": c, "rate_hz": round(c / elapsed, 2), "window_s": round(elapsed, 1)}
-        for t, c in counts.items()
-    }
+        redis.Redis(**redis_kwargs(), socket_connect_timeout=1).ping()
+        return True
+    except redis.RedisError:
+        return False
+
+
+def _cpu_fallback_reason(gpu: dict) -> str:
+    if gpu["usable"]:
+        return "the GPU wasn't usable when it started but is now -- restarting it would use the GPU"
+    if gpu["hardware"]:
+        return (f"{gpu['reason'].rstrip('.')}. NVIDIA hardware IS present ({', '.join(gpu['hardware'])}), "
+                "so the driver is the problem, not the machine")
+    return gpu["reason"] or "no NVIDIA GPU was found"
 
 
 class MSightControlPlane:
     def __init__(self):
         self._nodes: dict[str, _TrackedNode] = {}
         self._executors: dict[str, Executor] = {}
-        self._redis = None
+        self._redis: Optional[redis.Redis] = None
         # In-memory: lost on mcp_server restart. Every add/remove (chat, dashboard,
         # API) goes through this process, so nothing else needs to write here.
         self._changes: deque[dict] = deque(maxlen=50)
+
+    # --- change log -----------------------------------------------------------
 
     def _record_change(self, change: str, name: str, node_type: Optional[str] = None,
                        publish_topics: Optional[list[str]] = None) -> None:
         self._changes.append({"at": time.time(), "change": change, "node": name,
                               "node_type": node_type, "publish_topics": publish_topics or []})
 
-    def changes(self) -> list[dict]:
-        return list(self._changes)
-
     def recent_changes(self, limit: int = 10) -> list[dict]:
         now = time.time()
         return [{"change": c["change"], "node": c["node"], "node_type": c["node_type"],
-                 "when": _ago(now - c["at"])} for c in list(self._changes)[-limit:]]
+                 "when": ago(now - c["at"])} for c in list(self._changes)[-limit:]]
+
+    # --- lifecycle --------------------------------------------------------------
 
     def _executor_for(self, invocation: str) -> Executor:
         if invocation not in self._executors:
@@ -297,33 +99,30 @@ class MSightControlPlane:
         return self._executors[invocation]
 
     async def add_node(self, node_type: str, name: Optional[str] = None,
-                        config: Optional[dict] = None) -> ExecutorHandle:
+                       config: Optional[dict] = None) -> ExecutorHandle:
         if node_type not in NODE_CATALOG:
             raise ValueError(f"Unknown node_type '{node_type}'. Known: {sorted(NODE_CATALOG)}")
         spec = NODE_CATALOG[node_type]
         name = name or spec.default_name or node_type
-        config = config or {}
 
-        if name in self._nodes:
-            tracked = self._nodes[name]
+        tracked = self._nodes.get(name)
+        if tracked is not None:
             # Check liveness, not tracking, so an externally-killed node gets restarted.
             if await self._executor_for(tracked.invocation).is_alive(tracked.handle):
                 return tracked.handle
             del self._nodes[name]
 
         msight_path = _resolve_msight_path()
+        config = dict(config or {})
         mounts: list[tuple[str, str, str]] = []
-        effective_config = dict(config)
-        if spec.mount_config_key and spec.invocation == "docker":
-            raw_value = effective_config.get(spec.mount_config_key)
+        if spec.invocation == "docker":
+            raw_value = config.get(spec.mount_config_key) if spec.mount_config_key else None
             if raw_value and not str(raw_value).startswith(_URL_SCHEMES):
                 mounts.append((str(raw_value), spec.mount_container_path, "ro"))
-                effective_config[spec.mount_config_key] = spec.mount_container_path
-        if spec.invocation == "docker":
-            for rel_path, container_path, mode in spec.fixed_mounts:
-                mounts.append((str(msight_path / rel_path), container_path, mode))
+                config[spec.mount_config_key] = spec.mount_container_path
+            mounts += [(str(msight_path / rel), dest, mode) for rel, dest, mode in spec.fixed_mounts]
 
-        cmd = resolve_cmd(spec, name, effective_config)
+        cmd = resolve_cmd(spec, name, config)
         if spec.invocation == "supervisor":
             cmd[0] = str(_venv_bin(msight_path, spec.binary))
             if spec.script_path is not None:
@@ -332,158 +131,87 @@ class MSightControlPlane:
         env = {"MSIGHT_EDGE_DEVICE_NAME": os.environ.get("MSIGHT_EDGE_DEVICE_NAME", "mcity_edge")}
 
         await self._ensure_redis()
-        executor = self._executor_for(spec.invocation)
-        handle = await executor.start(name, cmd, msight_path, env, needs_gpu=spec.needs_gpu, mounts=mounts)
+        handle = await self._executor_for(spec.invocation).start(
+            name, cmd, msight_path, env, needs_gpu=spec.needs_gpu, mounts=mounts)
         self._nodes[name] = _TrackedNode(handle=handle, node_type=node_type, invocation=spec.invocation)
         self._record_change("added", name, node_type)
         return handle
-
-    def is_tracked(self, name: str) -> bool:
-        """In-memory tracking, with a pidfile fallback for supervisor nodes."""
-        if name in self._nodes:
-            return True
-        return recover_supervisor_handle(name) is not None
-
-    async def snapshot(self, names) -> dict[str, dict]:
-        """{name: {"alive", "device"}} for many nodes -- one docker call for all
-        containers instead of one per node; same resolution order as is_alive."""
-        names = list(names)
-        containers = await inspect_containers([f"msight-{n}" for n in names])
-        out = {}
-        for name in names:
-            tracked = self._nodes.get(name)
-            info = containers.get(f"msight-{name}")
-            if tracked is not None and tracked.invocation != "docker":
-                alive = await self._executor_for(tracked.invocation).is_alive(tracked.handle)
-                out[name] = {"alive": alive, "device": {"device": "cpu", "note": "host process"}}
-            elif info is not None:
-                device = {k: info[k] for k in ("device", "image", "gpu_fallback")}
-                out[name] = {"alive": info["running"], "device": device}
-            elif tracked is None and (recovered := recover_supervisor_handle(name)) is not None:
-                alive = await self._executor_for("supervisor").is_alive(recovered)
-                out[name] = {"alive": alive, "device": {"device": "cpu", "note": "host process"}}
-            else:
-                out[name] = {"alive": False, "device": None}
-        return out
-
-    async def is_alive(self, name: str) -> bool:
-        """Real liveness; survives restarts via container name or pidfile."""
-        tracked = self._nodes.get(name)
-        if tracked is not None:
-            return await self._executor_for(tracked.invocation).is_alive(tracked.handle)
-        if await self._executor_for("docker").is_alive(DockerHandle(f"msight-{name}")):
-            return True
-        recovered = recover_supervisor_handle(name)
-        if recovered is not None:
-            return await self._executor_for("supervisor").is_alive(recovered)
-        return False
 
     async def delete_node(self, name: str) -> None:
         registered = self._redis_client().hget(NODES_REDIS_KEY, name)
         existed = registered is not None or await self.is_alive(name)
         try:
-            publish_topics = _topic_list(json.loads(registered).get("publish_topic")) if registered else []
+            publish_topics = topic_list(json.loads(registered).get("publish_topic")) if registered else []
         except (TypeError, ValueError):
             publish_topics = []
+
         tracked = self._nodes.pop(name, None)
         if tracked is not None:
-            executor = self._executor_for(tracked.invocation)
-            await executor.stop(tracked.handle)
+            await self._executor_for(tracked.invocation).stop(tracked.handle)
         else:
             # Not tracked (e.g. server restarted): try both recovery paths.
-            try:
-                await self._executor_for("docker").stop(DockerHandle(f"msight-{name}"))
-            except Exception:
-                pass
+            await self._executor_for("docker").stop(DockerHandle(container_name(name)))
             recovered = recover_supervisor_handle(name)
             if recovered is not None:
-                try:
-                    await self._executor_for("supervisor").stop(recovered)
-                except Exception:
-                    pass
+                await self._executor_for("supervisor").stop(recovered)
+
         # Nodes don't reliably deregister on shutdown; clear Redis to avoid ghosts.
         self._redis_client().hdel(NODES_REDIS_KEY, name)
         if existed or tracked is not None:
             self._record_change("removed", name, tracked.node_type if tracked else None, publish_topics)
 
-    async def recompose(self, desired: list[dict]) -> dict:
-        """desired: list of {"node_type": str, "name": str | None, "config": dict | None}."""
-        desired_by_name: dict[str, dict] = {}
-        for d in desired:
-            spec = NODE_CATALOG[d["node_type"]]
-            name = d.get("name") or spec.default_name or d["node_type"]
-            desired_by_name[name] = d
-
-        removed, added, unchanged = [], [], []
-
+    async def recompose(self, desired: list[dict]) -> None:
+        """Make the tracked set match `desired`: [{"node_type", "name"?, "config"?}]."""
+        desired_by_name = {
+            d.get("name") or NODE_CATALOG[d["node_type"]].default_name or d["node_type"]: d
+            for d in desired
+        }
         for name in list(self._nodes):
             if name not in desired_by_name:
                 await self.delete_node(name)
-                removed.append(name)
 
         for name, d in desired_by_name.items():
             tracked = self._nodes.get(name)
-            if tracked is not None and tracked.node_type == d["node_type"]:
-                # Check liveness, not tracking, so dead nodes aren't kept as "unchanged".
-                executor = self._executor_for(tracked.invocation)
-                if await executor.is_alive(tracked.handle):
-                    unchanged.append(name)
-                    continue
             if tracked is not None:
+                # Keep only a live node of the same type; dead or retyped ones are replaced.
+                if (tracked.node_type == d["node_type"]
+                        and await self._executor_for(tracked.invocation).is_alive(tracked.handle)):
+                    continue
                 await self.delete_node(name)
-                removed.append(name)
             await self.add_node(d["node_type"], name=name, config=d.get("config"))
-            added.append(name)
-
-        return {"added": added, "removed": removed, "unchanged": unchanged}
 
     async def _ensure_redis(self) -> None:
         """Start a Redis container only if nothing is listening (Redis isn't in NODE_CATALOG)."""
-        import redis as redis_lib
-        host = os.environ.get("MSIGHT_REDIS_MESSAGE_BROKER_HOST", "localhost")
-        port = int(os.environ.get("MSIGHT_REDIS_MESSAGE_BROKER_PORT", 6379))
-        try:
-            redis_lib.Redis(host=host, port=port, socket_connect_timeout=1).ping()
+        if _redis_reachable():
             return
-        except Exception:
-            pass
-
+        host, port = redis_kwargs()["host"], redis_kwargs()["port"]
         if host not in ("localhost", "127.0.0.1"):
             raise RuntimeError(f"Redis at {host}:{port} is not reachable, and it isn't a local host to auto-start.")
 
-        proc = await asyncio.create_subprocess_exec(
-            "docker", "run", "-d", "--name", "msight-redis",
-            "--network", "host", "--restart", "on-failure:3",
-            "redis:7-alpine",
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0 and b"already in use" not in stderr:
-            raise RuntimeError(f"Could not start msight-redis: {stderr.decode(errors='replace').strip()}")
+        code, out = await run_cmd("docker", "run", "-d", "--name", "msight-redis", "--network", "host",
+                                  "--restart", "on-failure:3", "redis:7-alpine")
+        if code != 0 and "already in use" in out:
+            code, out = await run_cmd("docker", "start", "msight-redis")  # left over, stopped
+        if code != 0:
+            raise RuntimeError(f"Could not start msight-redis: {out.strip()}")
 
         for _ in range(10):
-            try:
-                redis_lib.Redis(host=host, port=port, socket_connect_timeout=1).ping()
+            if _redis_reachable():
                 return
-            except Exception:
-                await asyncio.sleep(0.3)
+            await asyncio.sleep(0.3)
         raise RuntimeError("Started msight-redis but it never became reachable.")
 
-    def _redis_client(self):
+    # --- status -------------------------------------------------------------------
+
+    def _redis_client(self) -> redis.Redis:
         if self._redis is None:
-            import redis
-            self._redis = redis.Redis(
-                host=os.environ.get("MSIGHT_REDIS_MESSAGE_BROKER_HOST", "localhost"),
-                port=int(os.environ.get("MSIGHT_REDIS_MESSAGE_BROKER_PORT", 6379)),
-                db=int(os.environ.get("MSIGHT_REDIS_MESSAGE_BROKER_DB", 0)),
-                decode_responses=True,
-            )
+            self._redis = redis.Redis(**redis_kwargs(), decode_responses=True)
         return self._redis
 
     def get_status(self) -> list[dict]:
-        raw = self._redis_client().hgetall(NODES_REDIS_KEY)
+        """Registry entries from MSIGHT:NODES (self-reported, so they can be stale)."""
         nodes = []
-        for name, value in raw.items():
+        for name, value in self._redis_client().hgetall(NODES_REDIS_KEY).items():
             try:
                 parsed = json.loads(value)
             except (TypeError, ValueError):
@@ -491,100 +219,34 @@ class MSightControlPlane:
             nodes.append({"name": name, **parsed})
         return sorted(nodes, key=lambda n: n["name"])
 
-    async def node_health(self, max_window: float = 10.0) -> list[dict]:
-        """One verdict per node from liveness + measured topic rates (heartbeats
-        alone can't tell starved from dead).
+    def is_tracked(self, name: str) -> bool:
+        """In-memory tracking, with a pidfile fallback for supervisor nodes."""
+        return name in self._nodes or recover_supervisor_handle(name) is not None
 
-          DEAD          not running
-          UNREGISTERED  running, missing from the Redis registry
-          STARVED       running, no input arriving (upstream problem)
-          STALLED       input arriving (or a source), publishes nothing
-          OK            otherwise
-        """
-        import time
-        registry = {n["name"]: n for n in self.get_status()}
-        names = sorted(set(registry) | set(self._nodes))
-        snap = await self.snapshot(names)
-
-        topics: set[str] = set()
-        for info in registry.values():
-            topics.update(_topic_list(info.get("publish_topic")))
-            topics.update(_topic_list(info.get("subscribe_topic")))
-        samples = await asyncio.to_thread(_sample_topic_rates, sorted(topics), max_window)
-
-        def _sum(topic_names: list[str], key: str):
-            if not topic_names:
-                return None
-            return round(sum(samples.get(t, {}).get(key, 0) for t in topic_names), 2)
-
-        now = time.time()
-        out = []
+    async def snapshot(self, names: Iterable[str]) -> dict[str, dict]:
+        """{name: {"alive", "device"}} -- one docker call for all containers.
+        Survives restarts via container name or pidfile."""
+        names = list(names)
+        containers = await inspect_containers([container_name(n) for n in names])
+        out = {}
         for name in names:
-            info = registry.get(name)
-            alive = snap[name]["alive"]
-            pub = _topic_list(info.get("publish_topic")) if info else []
-            sub = _topic_list(info.get("subscribe_topic")) if info else []
-            in_msgs, out_msgs = _sum(sub, "messages"), _sum(pub, "messages")
-
-            if not alive:
-                health = "DEAD"
-            elif info is None:
-                health = "UNREGISTERED"
-            elif sub and in_msgs == 0:
-                health = "STARVED"
-            elif pub and out_msgs == 0:
-                health = "STALLED"
+            tracked = self._nodes.get(name)
+            info = containers.get(container_name(name))
+            if tracked is not None and tracked.invocation != "docker":
+                alive = await self._executor_for(tracked.invocation).is_alive(tracked.handle)
+                out[name] = {"alive": alive, "device": _HOST_PROCESS}
+            elif info is not None:
+                out[name] = {"alive": info["running"],
+                             "device": {k: info[k] for k in ("device", "image", "gpu_fallback")}}
+            elif tracked is None and (recovered := recover_supervisor_handle(name)) is not None:
+                alive = await self._executor_for("supervisor").is_alive(recovered)
+                out[name] = {"alive": alive, "device": _HOST_PROCESS}
             else:
-                health = "OK"
-
-            hb = info.get("last_heartbeat") if info else None
-            out.append({
-                "name": name,
-                "health": health,
-                "alive": alive,
-                "self_reported_status": info.get("status") if info else None,
-                "publish_topics": pub,
-                "subscribe_topics": sub,
-                "in_rate_hz": _sum(sub, "rate_hz"),
-                "out_rate_hz": _sum(pub, "rate_hz"),
-                "seconds_since_heartbeat": max(0, int(now - hb)) if isinstance(hb, (int, float)) else None,
-                "_device": snap[name]["device"],
-            })
+                out[name] = {"alive": False, "device": None}
         return out
 
-    async def diagnose(self, max_window: float = 10.0) -> dict:
-        rows = await self.node_health(max_window)
-        devices = {r["name"]: r.pop("_device") for r in rows}
-        result = diagnose_from_health(rows, self.changes())
-        compute = await self.compute_report(devices, include_gpu=True)
-        result["compute"] = compute
-        if compute["warnings"]:
-            result["summary"] += " Performance warning: " + " ".join(compute["warnings"])
-        result["recent_changes"] = self.recent_changes()
-        return result
-
-    async def compute_report(self, devices: dict[str, Optional[dict]], include_gpu: bool = False) -> dict:
-        """The device each node actually got (from snapshot()), with a warning
-        when a GPU node fell back to CPU. The host GPU probe (lspci +
-        nvidia-smi) only runs when it explains a fallback or include_gpu."""
-        nodes = {name: dev for name, dev in devices.items() if dev is not None}
-        fallbacks = [name for name, dev in nodes.items() if dev.get("gpu_fallback")]
-        gpu = await gpu_report() if (fallbacks or include_gpu) else None
-        warnings = []
-        for name in fallbacks:
-            if gpu["usable"]:
-                why = "the GPU wasn't usable when it started but is now -- restarting it would use the GPU"
-            elif gpu["hardware"]:
-                why = (f"{gpu['reason'].rstrip('.')}. NVIDIA hardware IS present ({', '.join(gpu['hardware'])}), "
-                       "so the driver is the problem, not the machine")
-            else:
-                why = gpu["reason"] or "no NVIDIA GPU was found"
-            warnings.append(f"'{name}' needs a GPU but is running on the CPU-only fallback image ({why}); "
-                            "expect it to be many times slower.")
-        report = {"nodes": nodes, "warnings": warnings}
-        if gpu is not None:
-            report["gpu"] = gpu
-        return report
+    async def is_alive(self, name: str) -> bool:
+        return (await self.snapshot([name]))[name]["alive"]
 
     async def structural_check(self, registry: Optional[list[dict]] = None,
                                snap: Optional[dict[str, dict]] = None) -> list[dict]:
@@ -592,25 +254,112 @@ class MSightControlPlane:
         Pass get_status()/snapshot() results to reuse them."""
         registry = self.get_status() if registry is None else registry
         snap = snap or await self.snapshot(info["name"] for info in registry)
-        rows = [{
+        return structural_findings([{
             "name": info["name"],
             "alive": snap[info["name"]]["alive"],
-            "publish_topics": _topic_list(info.get("publish_topic")),
-            "subscribe_topics": _topic_list(info.get("subscribe_topic")),
-        } for info in registry]
-        return structural_findings(rows)
+            "publish_topics": topic_list(info.get("publish_topic")),
+            "subscribe_topics": topic_list(info.get("subscribe_topic")),
+        } for info in registry])
+
+    async def compute_report(self, devices: dict[str, Optional[dict]], include_gpu: bool = False) -> dict:
+        """The device each node actually got (from snapshot()), with a warning
+        when a GPU node fell back to CPU. The host GPU probe (lspci +
+        nvidia-smi) only runs when it explains a fallback or include_gpu."""
+        nodes = {name: dev for name, dev in devices.items() if dev is not None}
+        fallbacks = [name for name, dev in nodes.items() if dev.get("gpu_fallback")]
+        report: dict = {"nodes": nodes, "warnings": []}
+        if fallbacks or include_gpu:
+            report["gpu"] = gpu = await gpu_report()
+            report["warnings"] = [
+                f"'{name}' needs a GPU but is running on the CPU-only fallback image "
+                f"({_cpu_fallback_reason(gpu)}); expect it to be many times slower."
+                for name in fallbacks
+            ]
+        return report
+
+    # --- diagnosis ------------------------------------------------------------------
+
+    async def node_health(self, max_window: float = 10.0) -> tuple[list[dict], dict[str, dict]]:
+        """One verdict per node from liveness + measured topic rates (heartbeats
+        alone can't tell starved from dead), plus the snapshot it used.
+
+          DEAD          not running
+          UNREGISTERED  running, missing from the Redis registry
+          STARVED       running, no input arriving (upstream problem)
+          STALLED       input arriving (or a source), publishes nothing
+          OK            otherwise
+        """
+        registry = {n["name"]: n for n in self.get_status()}
+        names = sorted(set(registry) | set(self._nodes))
+        snap = await self.snapshot(names)
+
+        topics = sorted({t for info in registry.values()
+                         for t in topic_list(info.get("publish_topic")) + topic_list(info.get("subscribe_topic"))})
+        samples = await asyncio.to_thread(sample_topic_rates, topics, max_window)
+
+        def total(topic_names: list[str], key: str):
+            return round(sum(samples.get(t, {}).get(key, 0) for t in topic_names), 2) if topic_names else None
+
+        now = time.time()
+        rows = []
+        for name in names:
+            info = registry.get(name) or {}
+            alive = snap[name]["alive"]
+            pub, sub = topic_list(info.get("publish_topic")), topic_list(info.get("subscribe_topic"))
+            if not alive:
+                health = "DEAD"
+            elif not info:
+                health = "UNREGISTERED"
+            elif sub and total(sub, "messages") == 0:
+                health = "STARVED"
+            elif pub and total(pub, "messages") == 0:
+                health = "STALLED"
+            else:
+                health = "OK"
+            hb = info.get("last_heartbeat")
+            rows.append({
+                "name": name,
+                "health": health,
+                "alive": alive,
+                "self_reported_status": info.get("status"),
+                "publish_topics": pub,
+                "subscribe_topics": sub,
+                "in_rate_hz": total(sub, "rate_hz"),
+                "out_rate_hz": total(pub, "rate_hz"),
+                "seconds_since_heartbeat": max(0, int(now - hb)) if isinstance(hb, (int, float)) else None,
+            })
+        return rows, snap
+
+    async def diagnose(self, max_window: float = 10.0) -> dict:
+        rows, snap = await self.node_health(max_window)
+        result = diagnose_from_health(rows, list(self._changes))
+        # Kept out of `summary` on purpose: a CPU fallback is a performance note,
+        # and mixing it into the root-cause summary made the agent blame the GPU.
+        result["compute"] = await self.compute_report(
+            {name: v["device"] for name, v in snap.items()}, include_gpu=True)
+        result["recent_changes"] = self.recent_changes()
+        return result
 
     async def get_logs(self, name: str, tail: int = 200) -> str:
         tracked = self._nodes.get(name)
         if tracked is not None:
-            executor = self._executor_for(tracked.invocation)
-            return await executor.logs(tracked.handle, tail)
-        # Not tracked (e.g. server restarted): recover via container name or pidfile.
-        try:
-            return await self._executor_for("docker").logs(DockerHandle(f"msight-{name}"), tail)
-        except Exception:
-            pass
+            return await self._executor_for(tracked.invocation).logs(tracked.handle, tail)
+        # Not tracked (e.g. server restarted): pidfile first, since `docker logs`
+        # on a missing container returns an error message rather than failing.
         recovered = recover_supervisor_handle(name)
         if recovered is not None:
             return await self._executor_for("supervisor").logs(recovered, tail)
+        if container_name(name) in await inspect_containers([container_name(name)]):
+            return await self._executor_for("docker").logs(DockerHandle(container_name(name)), tail)
         return f"'{name}' is not tracked by this control plane instance and no matching container or process was found."
+
+
+_instance: Optional[MSightControlPlane] = None
+
+
+def get_control_plane() -> MSightControlPlane:
+    """The process-wide control plane (node tracking must not be split across instances)."""
+    global _instance
+    if _instance is None:
+        _instance = MSightControlPlane()
+    return _instance

@@ -11,9 +11,10 @@ from mcp_layer.mcptools.auto_labeling import (  # noqa: F401
     v51,
 )
 from mcp_layer.mcptools.msight import (  # noqa: F401
-    docker,
+    calibration,
     host_inspect,
     nodes,
+    pipeline,
     record_archive,
     reference,
 )

@@ -37,7 +37,7 @@ export function useMsightApi() {
     // pipeline
     startPipeline: (videoInput, rtspUrl, sensorName, build = false) =>
       post('/pipeline/start', { video_input: videoInput || null, rtsp_url: rtspUrl || null, sensor_name: sensorName || null, build }),
-    stopPipeline: (removeVolumes = false) => post('/pipeline/stop', { remove_volumes: removeVolumes }),
+    stopPipeline: () => post('/pipeline/stop', {}),
 
     // recording / archiving
     startRecording: (sensorName) => post('/recording/start', { sensor_name: sensorName || null }),

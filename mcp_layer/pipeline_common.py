@@ -1,4 +1,5 @@
 """Routing/sentinel primitives shared by ChatPipeline and its handler mixins (avoids a circular import)."""
+import json
 import re
 from dataclasses import dataclass as _dc
 from pathlib import Path
@@ -45,28 +46,48 @@ WRITE_TOOLS: frozenset[str] = frozenset({
 })
 
 
-def unwrap_tool_output(raw) -> str:
-    """Normalize any LLM/MCP output type to a plain string."""
+def unwrap_tool_output(raw, unescape_newlines: bool = True) -> str:
+    """Normalize any LLM/MCP output type to a plain string. Pass
+    unescape_newlines=False when the result will be re-parsed as JSON."""
+    def text(value: str) -> str:
+        return (value.replace("\\n", "\n") if unescape_newlines else value).strip()
+
     if raw is None:
         return ""
     if isinstance(raw, str):
         return raw
     if hasattr(raw, "text"):
-        return (raw.text or "").replace("\\n", "\n").strip()
+        return text(raw.text or "")
     if isinstance(raw, list):
-        parts = [unwrap_tool_output(x) for x in raw]
+        parts = [unwrap_tool_output(x, unescape_newlines) for x in raw]
         return "\n".join(p for p in parts if p).strip()
     if isinstance(raw, dict):
-        if "text" in raw and isinstance(raw["text"], str):
-            return raw["text"].replace("\\n", "\n").strip()
-        if "content" in raw and isinstance(raw["content"], list):
-            return unwrap_tool_output(raw["content"])
-        if "data" in raw and isinstance(raw["data"], dict) and "msg" in raw["data"]:
-            return str(raw["data"]["msg"]).replace("\\n", "\n").strip()
+        if isinstance(raw.get("text"), str):
+            return text(raw["text"])
+        if isinstance(raw.get("content"), list):
+            return unwrap_tool_output(raw["content"], unescape_newlines)
+        if isinstance(raw.get("data"), dict) and "msg" in raw["data"]:
+            return text(str(raw["data"]["msg"]))
         for key in ("message", "detail"):
-            if key in raw and isinstance(raw[key], str):
-                return raw[key].replace("\\n", "\n").strip()
+            if isinstance(raw.get(key), str):
+                return text(raw[key])
     return str(raw).strip()
+
+
+def tool_status(result: str) -> str | None:
+    """The "status" of a {"status": ..., ...} tool response, or None if it isn't one."""
+    try:
+        parsed = json.loads(result)
+    except (TypeError, ValueError):
+        return None
+    return parsed.get("status") if isinstance(parsed, dict) else None
+
+
+def format_reply(message: str, source: str | None) -> str:
+    """send_reply's text, with a [source: ...] tag when the model supplied one."""
+    if source and source.strip():
+        return f"{message.strip()}\n[source: {source.strip()}]"
+    return message
 
 
 # _handle_* returns (raw_str, list[ToolRouting]); _orchestrate applies all

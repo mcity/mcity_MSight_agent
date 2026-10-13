@@ -1,8 +1,11 @@
+"""LLM provider clients behind one interface: chat(messages, tools, tool_choice)
+takes OpenAI-format messages and returns an object with .content and .tool_calls."""
 import json
 import logging
 import os
 import uuid
 from abc import ABC, abstractmethod
+from functools import lru_cache
 from typing import List, Optional
 
 from anthropic import AsyncAnthropic
@@ -37,6 +40,22 @@ class _FakeMessage:
         self.tool_calls = tool_calls
 
 
+def _tool_call_fields(tc) -> tuple[str, str, dict]:
+    """(id, name, parsed arguments) from an OpenAI-format tool call, dict or object."""
+    if isinstance(tc, dict):
+        fn = tc.get("function") or {}
+        tc_id, name, raw_args = tc.get("id", ""), fn.get("name", ""), fn.get("arguments", "{}")
+    else:
+        fn = getattr(tc, "function", None)
+        tc_id = getattr(tc, "id", "")
+        name, raw_args = (getattr(fn, "name", ""), getattr(fn, "arguments", "{}")) if fn else ("", "{}")
+    try:
+        args = json.loads(raw_args)
+    except (TypeError, ValueError):
+        args = {}
+    return tc_id, name, args
+
+
 class BaseLLMClient(ABC):
     @abstractmethod
     async def chat(self, messages, tools: Optional[List] = None, tool_choice: Optional[str] = None):
@@ -55,19 +74,22 @@ class BaseLLMClient(ABC):
         """
         return await self._summarize(prompt)
 
-    @abstractmethod
     async def _summarize(self, prompt: str) -> str:
-        raise NotImplementedError
+        response = await self.chat([{"role": "user", "content": prompt}])
+        return getattr(response, "content", "") or ""
 
 
-class OpenAIClient(BaseLLMClient):
-    def __init__(self):
-        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+class _OpenAICompatibleClient(BaseLLMClient):
+    """OpenAI and Groq share the chat-completions API."""
+    client = None
+    model = ""
+
+    def _supports_temperature(self) -> bool:
+        return True
 
     async def chat(self, messages, tools=None, tool_choice=None):
         kwargs = dict(model=self.model, messages=messages)
-        if not self.model.startswith(("gpt-5", "o1", "o3", "o4")):
+        if self._supports_temperature():
             kwargs["temperature"] = 0.1
         if tools:
             kwargs["tools"] = tools
@@ -77,30 +99,21 @@ class OpenAIClient(BaseLLMClient):
         response = await self.client.chat.completions.create(**kwargs)
         return response.choices[0].message
 
-    async def _summarize(self, prompt: str) -> str:
-        response = await self.chat([{"role": "user", "content": prompt}])
-        return getattr(response, "content", "") or ""
+
+class OpenAIClient(_OpenAICompatibleClient):
+    def __init__(self):
+        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    def _supports_temperature(self) -> bool:
+        return not self.model.startswith(("gpt-5", "o1", "o3", "o4"))
 
 
-class GroqClient(BaseLLMClient):
+class GroqClient(_OpenAICompatibleClient):
     def __init__(self):
         self.client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
         # llama3-70b-8192 (former default) was decommissioned by Groq on 2025-05-31.
         self.model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
-
-    async def chat(self, messages, tools=None, tool_choice=None):
-        kwargs = dict(model=self.model, messages=messages, temperature=0.1)
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["parallel_tool_calls"] = False  # prevents missing-field errors with tool_choice="required"
-        if tool_choice:
-            kwargs["tool_choice"] = tool_choice
-        response = await self.client.chat.completions.create(**kwargs)
-        return response.choices[0].message
-
-    async def _summarize(self, prompt: str) -> str:
-        response = await self.chat([{"role": "user", "content": prompt}])
-        return getattr(response, "content", "") or ""
 
 
 class GeminiClient(BaseLLMClient):
@@ -180,20 +193,8 @@ class GeminiClient(BaseLLMClient):
                 if text:
                     _append_part("model", {"text": text})
                 for tc in msg.get("tool_calls") or []:
-                    if isinstance(tc, dict):
-                        fn = tc.get("function") or {}
-                        fn_name = fn.get("name", "")
-                        fn_args_str = fn.get("arguments", "{}")
-                    else:
-                        fn_obj = getattr(tc, "function", None)
-                        fn_name = getattr(fn_obj, "name", "") if fn_obj else ""
-                        fn_args_str = getattr(fn_obj, "arguments", "{}") if fn_obj else "{}"
-                    try:
-                        args = json.loads(fn_args_str)
-                    except Exception:
-                        args = {}
-                    fc_part = protos.Part(function_call=protos.FunctionCall(name=fn_name, args=args))
-                    _append_part("model", fc_part)
+                    _, fn_name, args = _tool_call_fields(tc)
+                    _append_part("model", protos.Part(function_call=protos.FunctionCall(name=fn_name, args=args)))
                 continue
 
             if role == "user":
@@ -273,10 +274,6 @@ class ClaudeClient(BaseLLMClient):
 
         return self._to_fake_message(response)
 
-    async def _summarize(self, prompt: str) -> str:
-        response = await self.chat([{"role": "user", "content": prompt}])
-        return response.content or ""
-
     @staticmethod
     def _convert_tools(tools: list) -> list:
         result = []
@@ -329,22 +326,7 @@ class ClaudeClient(BaseLLMClient):
                     blocks.append({"type": "text", "text": text})
 
                 for tc in tool_calls_raw:
-                    if isinstance(tc, dict):
-                        tc_id = tc.get("id", "")
-                        fn = tc.get("function") or {}
-                        fn_name = fn.get("name", "") if isinstance(fn, dict) else ""
-                        fn_args_str = fn.get("arguments", "{}") if isinstance(fn, dict) else "{}"
-                    else:
-                        tc_id = getattr(tc, "id", "")
-                        fn_obj = getattr(tc, "function", None)
-                        fn_name = getattr(fn_obj, "name", "") if fn_obj else ""
-                        fn_args_str = getattr(fn_obj, "arguments", "{}") if fn_obj else "{}"
-
-                    try:
-                        inp = json.loads(fn_args_str)
-                    except Exception:
-                        inp = {}
-
+                    tc_id, fn_name, inp = _tool_call_fields(tc)
                     blocks.append({"type": "tool_use", "id": tc_id, "name": fn_name, "input": inp})
 
                 if not blocks:
@@ -390,3 +372,38 @@ class ClaudeClient(BaseLLMClient):
                 tool_calls.append(_FakeToolCall(id=block.id, name=block.name, arguments=json.dumps(block.input)))
 
         return _FakeMessage(content="".join(text_parts) or None, tool_calls=tool_calls)
+
+PROVIDERS = {"openai": OpenAIClient, "groq": GroqClient, "gemini": GeminiClient, "claude": ClaudeClient}
+_PROVIDER_KEY_ENV = {"openai": "OPENAI_API_KEY", "claude": "ANTHROPIC_API_KEY",
+                     "gemini": "GEMINI_API_KEY", "groq": "GROQ_API_KEY"}
+
+
+def canonical_provider(name: str) -> str:
+    name = (name or "").lower()
+    return "claude" if name == "anthropic" else name
+
+
+def available_providers() -> list[str]:
+    """Providers whose API key env var is actually set on this server."""
+    return [p for p, env in _PROVIDER_KEY_ENV.items() if os.getenv(env, "").strip()]
+
+
+@lru_cache(maxsize=None)
+def default_provider() -> str:
+    """LLM_PROVIDER from .env (read once), falling back to openai if it's unknown."""
+    name = canonical_provider(os.getenv("LLM_PROVIDER", "openai"))
+    if name not in PROVIDERS:
+        logging.warning(f"[STARTUP] Unknown LLM_PROVIDER '{name}'. Valid values: {list(PROVIDERS)}. "
+                        "Falling back to 'openai'.")
+        return "openai"
+    return name
+
+
+def resolve_provider(requested: str) -> str:
+    """The requested provider if its key is set, else the default, else any configured one.
+    Never a provider whose key is missing (unless none are configured at all)."""
+    avail = available_providers()
+    for candidate in (canonical_provider(requested), default_provider()):
+        if candidate in avail:
+            return candidate
+    return avail[0] if avail else "openai"
