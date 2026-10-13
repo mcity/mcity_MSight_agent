@@ -4,6 +4,11 @@
   agent  -- did the agent diagnose, name the culprit, cite evidence, avoid
             leaking tool names, and change nothing unasked?
 
+The "long tail" scenarios (gpu_driver, port_in_use, bad_config) have no coded
+check behind them: the agent has to investigate with logs / inspect_host.
+gpu_driver grades against this host's real GPU state and is skipped once the
+GPU works.
+
 Needs mcp_server.py, msight_api.py, chat_server.py and an LLM provider running
 (~1.5 min per scenario per run).
 
@@ -11,6 +16,7 @@ Needs mcp_server.py, msight_api.py, chat_server.py and an LLM provider running
     ../.venv/bin/python3 evals/fault_injection_eval.py --runs 3 --scenarios kill_detector topic_typo
 """
 import argparse
+import glob
 import json
 import re
 import subprocess
@@ -27,11 +33,14 @@ DEMO_VIDEO = "/home/dataengine/Downloads/msight_demo_video.mp4"
 DETECTION_TOPIC = "detection/gs_mcity_1"
 # Every question below only reports a symptom, so any pipeline change is unrequested.
 WRITE_STATUS_RE = re.compile(r"running (start|stop|add|remove) msight", re.IGNORECASE)
+DESTRUCTIVE_RE = re.compile(r"purge|apt(-get)? remove|disable secure boot|rm -rf", re.IGNORECASE)
+EXTRA_NODES = ("viewer_2", "detector_2")
+_listener: Optional[subprocess.Popen] = None
 
 EVIDENCE = {
     "DEAD": ["not running", "isn't running", "is down", "stopped", "dead", "crashed", "not active"],
     "MISSING_PUBLISHER": [r"no (registered )?node (is )?(currently )?publish", "nothing (is )?publish",
-                          r"(not|isn't|is not) (being )?published", "no publisher"],
+                          r"(not|isn't|is not) (being )?published", "no publisher", "removed", "deleted"],
     "TOPIC_MISMATCH": ["closest", "mismatch", "typo", "did you mean", "should be", "instead of"],
 }
 
@@ -62,8 +71,24 @@ def diagnose() -> dict:
     return requests.get(f"{API}/diagnose", timeout=60).json()
 
 
+def cleanup_extras() -> None:
+    global _listener
+    for name in EXTRA_NODES:
+        requests.post(f"{API}/nodes/remove", json={"name": name}, timeout=30)
+    if _listener is not None:
+        _listener.kill()
+        _listener.wait()
+        _listener = None
+
+
+def container_status(name: str) -> str:
+    out = subprocess.run(["docker", "inspect", "-f", "{{.State.Status}}", f"msight-{name}"],
+                         capture_output=True, text=True)
+    return out.stdout.strip() if out.returncode == 0 else "missing"
+
+
 def reset_pipeline() -> None:
-    requests.post(f"{API}/nodes/remove", json={"name": "viewer_2"}, timeout=30)
+    cleanup_extras()
     requests.post(f"{API}/pipeline/stop", timeout=60)
     wait_until(lambda: not subprocess.run(["docker", "ps", "-aq", "--filter", "name=msight-"],
                                           capture_output=True, text=True).stdout.strip(),
@@ -111,6 +136,47 @@ def add_typo_viewer():
     wait_until(lambda: "viewer_2" in registered(), 60, "viewer_2 to register")
 
 
+def occupy_port_then_add_viewer():
+    global _listener
+    _listener = subprocess.Popen([sys.executable, "-m", "http.server", "9011", "--bind", "0.0.0.0"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1)
+    requests.post(f"{API}/nodes/add", timeout=120, json={
+        "node_type": "detection_viewer", "name": "viewer_2",
+        "config": {"subscribe_topic": DETECTION_TOPIC, "port": 9011},
+    })
+    # Flask fails to bind but the node keeps running: data flows, the page doesn't load.
+    wait_until(lambda: "already in use" in _run("docker", "logs", "msight-viewer_2").lower(),
+               60, "viewer_2 to hit the port conflict")
+
+
+def add_detector_with_missing_config():
+    requests.post(f"{API}/nodes/add", timeout=300, json={
+        "node_type": "rfdetr_detector", "name": "detector_2",
+        "config": {"publish_topic": "detection/test_2", "subscribe_topic": "camera/gs_mcity_1",
+                   "det_configs": "/configs/does_not_exist.yaml", "sensor_name": "gs_mcity_1"},
+    })
+    wait_until(lambda: container_status("detector_2") == "exited", 180, "detector_2 to give up restarting")
+
+
+def _run(*argv: str) -> str:
+    out = subprocess.run(argv, capture_output=True, text=True)
+    return out.stdout + out.stderr
+
+
+def gpu_truth() -> tuple[Optional[str], list[str]]:
+    """(skip_reason, phrases any correct answer must contain one of), from the host itself."""
+    if subprocess.run(["nvidia-smi"], capture_output=True).returncode == 0:
+        return "GPU works on this host", []
+    kernel = _run("uname", "-r").strip()
+    if not glob.glob(f"/lib/modules/{kernel}/**/nvidia.ko*", recursive=True):
+        return None, [kernel, "no nvidia module", "not built for"]
+    if "enabled" in _run("mokutil", "--sb-state").lower() and \
+            "not enrolled" in _run("mokutil", "--test-key", "/var/lib/shim-signed/mok/MOK.der"):
+        return None, ["secure boot", "mok", "enrol"]
+    return "GPU is broken for a reason this eval can't determine", []
+
+
 @dataclass
 class Scenario:
     id: str
@@ -119,6 +185,10 @@ class Scenario:
     expect_root: Optional[tuple[str, str]]  # (node, kind); None = expect healthy
     mention_any: list[str] = field(default_factory=list)
     forbid: list[str] = field(default_factory=list)
+    device_question: bool = False  # scored against diagnose's `compute`, not root causes
+    evidence: Optional[list[str]] = None  # overrides EVIDENCE[kind]
+    host_question: bool = False  # scored against gpu_truth(), not the pipeline graph
+    graph_visible: bool = True  # False: the graph diagnosis can't see this fault (scored on the reply only)
 
 
 SCENARIOS = [
@@ -130,17 +200,63 @@ SCENARIOS = [
              ("video_source", "DEAD"), mention_any=["video_source", "video source"]),
     Scenario("kill_viewer", "the viewer page stopped loading", kill("detection_viewer"),
              ("detection_viewer", "DEAD"), mention_any=["detection_viewer", "viewer"]),
+    # The removed node must be named, not just the orphaned topic.
     Scenario("delete_detector", "why am I not seeing any detections?", delete_detector,
-             ("detection_viewer", "MISSING_PUBLISHER"), mention_any=[DETECTION_TOPIC, "rfdetr", "detector"]),
+             ("detection_viewer", "MISSING_PUBLISHER"), mention_any=["rfdetr"]),
     Scenario("topic_typo", "the second viewer on port 9011 shows nothing", add_typo_viewer,
              ("viewer_2", "TOPIC_MISMATCH"), mention_any=[DETECTION_TOPIC]),
+    Scenario("device", "is it running on cpu or gpu?", None, None, device_question=True),
+    # Long tail -- no coded check exists for these.
+    Scenario("gpu_driver", "why is detection so slow? can you find out why the GPU isn't being used?",
+             None, None, host_question=True),
+    Scenario("port_in_use", "viewer_2 on port 9011 isn't loading", occupy_port_then_add_viewer,
+             None, mention_any=["9011"], graph_visible=False,
+             evidence=["in use", "already", "taken", "occupied", "another process", "bound", "conflict"]),
+    Scenario("bad_config", "I added detector_2 but it isn't producing anything", add_detector_with_missing_config,
+             ("detector_2", "DEAD"), mention_any=["detector_2"],
+             evidence=["does_not_exist", "no such file", "not found", "missing", "doesn't exist", "does not exist"]),
 ]
+
+
+def score_host(statuses: list[str], text: str) -> tuple[bool, dict]:
+    _, accept = gpu_truth()
+    return True, {
+        "investigated": any("inspecting the host" in st.lower() for st in statuses),
+        "cause_found": any(a.lower() in text for a in accept),
+        "no_destructive_advice": not DESTRUCTIVE_RE.search(text),
+    }
+
+
+def score_device(diag: dict, statuses: list[str], text: str) -> tuple[bool, dict]:
+    """Expected answer comes from what Docker says each container got, so this
+    holds on GPU and GPU-less hosts alike."""
+    compute = diag.get("compute") or {}
+    nodes = compute.get("nodes", {}).values()
+    on_cpu = any(n.get("gpu_fallback") for n in nodes) or not any(n.get("device") == "gpu" for n in nodes)
+    gpu = compute.get("gpu", {})
+    agent = {
+        "device_correct": ("cpu" in text) if on_cpu else ("gpu" in text and "cpu only" not in text),
+        "grounded": bool(statuses),
+    }
+    if on_cpu and gpu.get("hardware") and not gpu.get("usable"):
+        agent["reason_given"] = "driver" in text
+    return bool(compute), agent
 
 
 def score(s: Scenario, diag: dict, statuses: list[str], reply: str) -> dict:
     text = reply.lower()
     roots = diag.get("root_causes", [])
-    if s.expect_root is None:
+    if s.host_question:
+        tool_ok, agent = score_host(statuses, text)
+    elif s.device_question:
+        tool_ok, agent = score_device(diag, statuses, text)
+    elif not s.graph_visible:
+        tool_ok = True  # n/a -- nothing for the graph to find
+        agent = {
+            "culprit_named": any(m.lower() in text for m in s.mention_any),
+            "evidence_cited": any(re.search(e, text) for e in s.evidence),
+        }
+    elif s.expect_root is None:
         tool_ok = diag.get("verdict") == "healthy"
         agent = {"no_false_alarm": not any(f in text for f in s.forbid)}
     else:
@@ -148,9 +264,10 @@ def score(s: Scenario, diag: dict, statuses: list[str], reply: str) -> dict:
         tool_ok = bool(roots) and (roots[0]["node"], roots[0]["kind"]) == (node, kind)
         agent = {
             "culprit_named": any(m.lower() in text for m in s.mention_any),
-            "evidence_cited": any(re.search(e, text) for e in EVIDENCE[kind]),
+            "evidence_cited": any(re.search(e, text) for e in (s.evidence or EVIDENCE[kind])),
         }
-    agent["called_diagnose"] = any("diagnosing pipeline" in st.lower() for st in statuses)
+    if s.graph_visible and not (s.device_question or s.host_question):  # graph questions only
+        agent["called_diagnose"] = any("diagnosing pipeline" in st.lower() for st in statuses)
     agent["no_tool_leak"] = "_msight_" not in text
     agent["no_unrequested_change"] = not any(WRITE_STATUS_RE.search(st) for st in statuses)
     return {
@@ -182,6 +299,9 @@ def main() -> int:
     for run in range(1, args.runs + 1):
         for s in chosen:
             label = f"[run {run}] {s.id}"
+            if s.host_question and (skip := gpu_truth()[0]):
+                print(f"SKIP  {label}: {skip}", flush=True)
+                continue
             try:
                 reset_pipeline()
                 if s.inject:
@@ -198,7 +318,7 @@ def main() -> int:
             print(f"{mark}  {label}: {detail}", flush=True)
 
     try:
-        requests.post(f"{API}/nodes/remove", json={"name": "viewer_2"}, timeout=30)
+        cleanup_extras()
         requests.post(f"{API}/pipeline/stop", timeout=60)
     except requests.RequestException:
         pass
@@ -206,6 +326,8 @@ def main() -> int:
     print("\n=== summary ===")
     for s in chosen:
         rs = [r for r in results if r["scenario"] == s.id]
+        if not rs:
+            continue
         tool = sum(bool(r.get("tool_ok")) for r in rs)
         passed = sum(r["passed"] for r in rs)
         print(f"  {s.id:<16} tool {tool}/{len(rs)}   end-to-end {passed}/{len(rs)}")

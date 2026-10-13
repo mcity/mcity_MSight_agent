@@ -185,10 +185,10 @@ Start all five components one after the other in separate terminals:
 python -m mcp_layer.mcp_server
 
 # Terminal 2: Chat Server (port 8001)
-uvicorn mcp_layer.chat_server:app --port 8001 --reload
+python -m uvicorn mcp_layer.chat_server:app --port 8001 --reload
 
 # Terminal 3: Data Ingestion Server (port 8002)
-uvicorn mcp_layer.ingest_server:app --host 0.0.0.0 --port 8002 --reload
+python -m uvicorn mcp_layer.ingest_server:app --host 0.0.0.0 --port 8002 --reload
 
 # Terminal 4: Launch Web UI (port 5225)
 python -m mcp_layer.client_chat --ui
@@ -376,6 +376,7 @@ git add .gitmodules $(git submodule foreach --quiet 'echo $name')
 │  │       ├── executors.py     # Docker / supervisor execution backends
 │  │       ├── node_catalog.py  # Data-driven msight_core node specs
 │  │       ├── docker.py        # start/stop/status/logs/diagnose tools
+│  │       ├── host_inspect.py  # Read-only, allowlisted host commands (inspect_host tool)
 │  │       ├── nodes.py         # Generic add/remove node tools
 │  │       ├── record_archive.py # Local recording + S3 archiving
 │  │       ├── reference.py     # On-demand reference docs tool

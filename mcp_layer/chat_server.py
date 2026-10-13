@@ -357,6 +357,23 @@ _WRITES_BLOCKED_NOTE = (
 def _without_writes(tool_list: list) -> list:
     return [t for t in tool_list if t["function"]["name"] not in WRITE_TOOLS]
 
+
+# Measure-first gate: "is it working?" can't be answered from process state, and a
+# hint in the status result alone stopped being followed once status grew richer.
+_HEALTH_QUESTION_RE = re.compile(
+    r"\b(work|works|working|healthy|health|alive|broken|"
+    r"is (it|the pipeline) (actually |really )?running|"
+    r"running (ok|okay|fine|properly|smoothly|correctly))\b",
+    re.IGNORECASE,
+)
+
+
+def _measure_first(tool_list: list) -> list:
+    """Offer only diagnose on a health question's first step. Removing just the
+    status tool didn't work -- the model fell back to logs and still never measured."""
+    diagnose = [t for t in tool_list if t["function"]["name"] == "diagnose_msight_pipeline"]
+    return diagnose or tool_list
+
 # Keyword check for the default workflow; anything else defaults to msight_pipeline.
 _AUTO_LABELING_TRIGGERS = (
     "auto labeling", "auto-labeling", "auto labelling", "auto-labelling", "autolabeling",
@@ -842,11 +859,14 @@ async def chat_stream(request: Request):
             allow_send_reply_on_iteration_0 = early_pipeline is not None
             change_requested = bool(_CHANGE_REQUEST_RE.search(message))
             writes_blocked_noted = False
+            health_question = bool(_HEALTH_QUESTION_RE.search(message))
 
             for iteration in range(MAX_AGENTIC_ITERATIONS):
                 tool_choice, force_grounded, iteration_tools = _iteration_tool_choice(
                     iteration, force_ground_next, allow_send_reply_on_iteration_0, current_tools
                 )
+                if iteration == 0 and health_question:
+                    iteration_tools = _measure_first(iteration_tools)
 
                 try:
                     assistant_message = await _chat_with_retry(

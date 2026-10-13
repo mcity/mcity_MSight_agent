@@ -351,7 +351,7 @@ async def stop_msight_pipeline(remove_volumes: bool = False, ctx: Context = None
     return ok_json("MSight_Vision pipeline stopped.")
 
 
-async def _enrich_node_status(cp, nodes: list[dict]) -> list[dict]:
+def _enrich_node_status(nodes: list[dict], snap: dict[str, dict]) -> list[dict]:
     """Add seconds_since_heartbeat and real liveness (Redis status never expires)."""
     now = time.time()
     out = []
@@ -360,7 +360,7 @@ async def _enrich_node_status(cp, nodes: list[dict]) -> list[dict]:
         hb = n.get("last_heartbeat")
         if isinstance(hb, (int, float)):
             n["seconds_since_heartbeat"] = max(0, int(now - hb))
-        n["alive"] = await cp.is_alive(n["name"])
+        n["alive"] = snap[n["name"]]["alive"]
         out.append(n)
     return out
 
@@ -373,7 +373,10 @@ async def get_msight_status(ctx: Context = None) -> str:
 
     try:
         cp = _control_plane()
-        services = await _enrich_node_status(cp, cp.get_status())
+        registry = cp.get_status()
+        # One snapshot (one docker call) shared by liveness, problems and compute.
+        snap = await cp.snapshot(n["name"] for n in registry)
+        services = _enrich_node_status(registry, snap)
     except Exception as e:
         return error_json(f"Could not read MSight_Vision status: {e}")
 
@@ -383,7 +386,7 @@ async def get_msight_status(ctx: Context = None) -> str:
         extra["viewer_url"] = f"http://{resolve_host()}:{VIEWER_PORT}"
 
     # Precomputed structural problems; the LLM is bad at spotting absences in a list.
-    problems = await cp.structural_check()
+    problems = await cp.structural_check(registry, snap)
     if problems:
         extra["problems"] = problems
         extra["next_step"] = (
@@ -396,6 +399,8 @@ async def get_msight_status(ctx: Context = None) -> str:
             "NOT MEASURED -- this only shows processes are up. If the user asked whether "
             "the pipeline is working or healthy, call diagnose_msight_pipeline before answering."
         )
+    extra["compute"] = await cp.compute_report({name: v["device"] for name, v in snap.items()})
+    extra["recent_changes"] = cp.recent_changes()
     return ok_json(**extra)
 
 

@@ -10,6 +10,7 @@ _TOPICS: dict[str, str] = {
     "node_catalog": "node_catalog.md",
     "common_failure_modes": "common_failure_modes.md",
     "diagnosing_stalled_nodes": "diagnosing_stalled_nodes.md",
+    "host_troubleshooting": "host_troubleshooting.md",
 }
 
 

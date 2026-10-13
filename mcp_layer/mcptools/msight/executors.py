@@ -10,6 +10,7 @@ import os
 import shlex
 import shutil
 import signal
+import time
 from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable
 
@@ -19,26 +20,75 @@ DEFAULT_BACKEND = "supervisor"
 LOG_DIR = Path("output/logs/msight_record_archive")
 _STARTUP_GRACE_SECONDS = 0.5
 
-_gpu_available: Optional[bool] = None
+_GPU_CACHE_SECONDS = 60
+_gpu_report_cache: Optional[tuple[float, dict]] = None
+
+
+async def _run(*argv: str, timeout: float = 5) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(
+        *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return -1, f"timed out after {timeout:.0f}s"
+    return proc.returncode, out.decode(errors="replace").strip()
+
+
+async def gpu_report() -> dict:
+    """{"usable", "hardware", "reason"} -- usable means nvidia-smi works.
+    hardware (from lspci) separates "no GPU" from "GPU present, driver broken".
+    Cached briefly so a fixed driver is picked up without a restart."""
+    global _gpu_report_cache
+    if _gpu_report_cache and time.monotonic() - _gpu_report_cache[0] < _GPU_CACHE_SECONDS:
+        return _gpu_report_cache[1]
+
+    hardware: list[str] = []
+    if shutil.which("lspci"):
+        _, out = await _run("lspci")
+        hardware = [line.split(": ", 1)[-1] for line in out.splitlines()
+                    if "NVIDIA" in line and ("VGA" in line or "3D controller" in line)]
+
+    if shutil.which("nvidia-smi") is None:
+        usable, reason = False, "nvidia-smi is not installed"
+    else:
+        code, out = await _run("nvidia-smi", "--query-gpu=name", "--format=csv,noheader")
+        usable = code == 0
+        reason = None if usable else f"nvidia-smi failed: {out.splitlines()[0] if out else f'exit {code}'}"
+
+    report = {"usable": usable, "hardware": hardware, "reason": reason}
+    _gpu_report_cache = (time.monotonic(), report)
+    return report
 
 
 async def has_gpu() -> bool:
-    """Cached nvidia-smi check."""
-    global _gpu_available
-    if _gpu_available is not None:
-        return _gpu_available
-    nvidia_smi = shutil.which("nvidia-smi")
-    if nvidia_smi is None:
-        _gpu_available = False
-        return False
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            nvidia_smi, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        )
-        _gpu_available = await asyncio.wait_for(proc.wait(), timeout=5) == 0
-    except Exception:
-        _gpu_available = False
-    return _gpu_available
+    return (await gpu_report())["usable"]
+
+
+async def inspect_containers(container_names: list[str]) -> dict[str, dict]:
+    """Liveness + device for many containers in ONE docker call (status is
+    polled by the dashboard). Missing containers are simply absent."""
+    if not container_names:
+        return {}
+    proc = await asyncio.create_subprocess_exec(
+        "docker", "inspect", "-f",
+        "{{.Name}}|{{.State.Running}}|{{.Config.Image}}|{{json .HostConfig.DeviceRequests}}",
+        *container_names,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await proc.communicate()  # nonzero exit just means some were missing
+    result = {}
+    for line in out.decode(errors="replace").splitlines():
+        name, running, image, requests = (line.split("|", 3) + ["", "", ""])[:4]
+        result[name.lstrip("/")] = {
+            "running": running == "true",
+            "device": "gpu" if '"gpu"' in requests.lower() else "cpu",
+            "image": image,
+            "gpu_fallback": image.split(":")[0] == CPU_IMAGE_TAG,
+        }
+    return result
 
 
 class ExecutorHandle:
@@ -62,7 +112,7 @@ class DockerHandle(ExecutorHandle):
         self.container_name = container_name
 
 
-_CPU_IMAGE_TAG = "msight-vision-cpu-local"
+CPU_IMAGE_TAG = "msight-vision-cpu-local"
 _CPU_BASE_IMAGE = os.environ.get(
     "MSIGHT_VISION_CPU_BASE_IMAGE", "michigantrafficlab/msight-core:latest-pytorch2.7.1-cpu"
 )
@@ -74,32 +124,32 @@ async def _ensure_cpu_image(msight_path: Path) -> str:
     """Build the CPU image from Dockerfile.cpu once per process (no prebuilt CPU tag exists)."""
     global _cpu_image_ready
     if _cpu_image_ready:
-        return _CPU_IMAGE_TAG
+        return CPU_IMAGE_TAG
 
     inspect = await asyncio.create_subprocess_exec(
-        "docker", "image", "inspect", _CPU_IMAGE_TAG,
+        "docker", "image", "inspect", CPU_IMAGE_TAG,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
     )
     if await inspect.wait() == 0:
         _cpu_image_ready = True
-        return _CPU_IMAGE_TAG
+        return CPU_IMAGE_TAG
 
     build = await asyncio.create_subprocess_exec(
         "docker", "build",
         "-f", str(_CPU_DOCKERFILE),
         "--build-arg", f"BASE_IMAGE={_CPU_BASE_IMAGE}",
-        "-t", _CPU_IMAGE_TAG,
+        "-t", CPU_IMAGE_TAG,
         str(msight_path),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
     out, _ = await build.communicate()
     if build.returncode != 0:
         raise RuntimeError(
-            f"Failed to build the CPU-only image ({_CPU_IMAGE_TAG}): "
+            f"Failed to build the CPU-only image ({CPU_IMAGE_TAG}): "
             f"{out.decode(errors='replace')[-2000:]}"
         )
     _cpu_image_ready = True
-    return _CPU_IMAGE_TAG
+    return CPU_IMAGE_TAG
 
 
 class DockerExecutor:

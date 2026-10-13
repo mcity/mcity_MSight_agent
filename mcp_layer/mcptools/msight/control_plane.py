@@ -7,6 +7,8 @@ node self-registers, so it is backend-agnostic.
 import asyncio
 import json
 import os
+import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -15,7 +17,8 @@ from typing import Optional
 from mcp_layer.mcptools.msight.paths import get_msight_path
 from mcp_layer.mcptools.msight.node_catalog import NODE_CATALOG, resolve_cmd
 from mcp_layer.mcptools.msight.executors import (
-    DockerHandle, Executor, ExecutorHandle, recover_supervisor_handle, resolve_executor,
+    DockerHandle, Executor, ExecutorHandle, gpu_report, inspect_containers,
+    recover_supervisor_handle, resolve_executor,
 )
 
 NODES_REDIS_KEY = "MSIGHT:NODES"  # matches msight_core.nodes.REDIS_NODES_FIELD
@@ -117,12 +120,27 @@ _FIXES = {
 }
 
 
-def diagnose_from_health(rows: list[dict]) -> dict:
+def _last_removed_publisher(topic: str, changes: list[dict]) -> Optional[dict]:
+    for c in reversed(changes):
+        if c["change"] == "removed" and topic in c.get("publish_topics", []):
+            return c
+    return None
+
+
+def _ago(seconds: float) -> str:
+    seconds = int(seconds)
+    return f"{seconds}s ago" if seconds < 120 else f"{seconds // 60} min ago"
+
+
+def diagnose_from_health(rows: list[dict], changes: Optional[list[dict]] = None) -> dict:
     """Rank root causes vs downstream effects from node_health() rows.
 
     A broken node is a root cause only if nothing upstream is broken, since
     msight_core nodes exit after ~15s without input and failures cascade.
+    `changes` (oldest first) lets an orphaned topic name the node whose
+    removal orphaned it.
     """
+    changes = changes or []
     if not rows:
         return {"verdict": "empty", "summary": "No MSight nodes are registered or tracked.",
                 "root_causes": [], "affected": [], "nodes": []}
@@ -166,7 +184,13 @@ def diagnose_from_health(rows: list[dict]) -> dict:
 
     for f in structural_findings(rows):
         if f["kind"] in ("MISSING_PUBLISHER", "TOPIC_MISMATCH"):
-            root_causes.append({**f, "_depth": depth(by_name[f["node"]], {f["node"]})})
+            cause = {**f, "_depth": depth(by_name[f["node"]], {f["node"]})}
+            removed = _last_removed_publisher(f["topic"], changes) if f["kind"] == "MISSING_PUBLISHER" else None
+            if removed:
+                cause["evidence"] = (f"'{f['node']}' subscribes to '{f['topic']}', which was published by "
+                                     f"'{removed['node']}' -- removed {_ago(time.time() - removed['at'])}.")
+                cause["removed_publisher"] = removed["node"]
+            root_causes.append(cause)
 
     for r in rows:
         if r["health"] != "STARVED":
@@ -180,7 +204,10 @@ def diagnose_from_health(rows: list[dict]) -> dict:
 
     root_causes.sort(key=lambda c: c.pop("_depth"))
     for c in root_causes:
-        c["suggested_fix"] = _FIXES[c["kind"]]
+        c["suggested_fix"] = (
+            f"Add '{c['removed_publisher']}' back (or restart the pipeline if it was one of the "
+            "standard pipeline's nodes)." if c.get("removed_publisher") else _FIXES[c["kind"]]
+        )
 
     if not root_causes and not affected:
         summary = f"All {len(rows)} nodes are running and data is flowing."
@@ -247,6 +274,22 @@ class MSightControlPlane:
         self._nodes: dict[str, _TrackedNode] = {}
         self._executors: dict[str, Executor] = {}
         self._redis = None
+        # In-memory: lost on mcp_server restart. Every add/remove (chat, dashboard,
+        # API) goes through this process, so nothing else needs to write here.
+        self._changes: deque[dict] = deque(maxlen=50)
+
+    def _record_change(self, change: str, name: str, node_type: Optional[str] = None,
+                       publish_topics: Optional[list[str]] = None) -> None:
+        self._changes.append({"at": time.time(), "change": change, "node": name,
+                              "node_type": node_type, "publish_topics": publish_topics or []})
+
+    def changes(self) -> list[dict]:
+        return list(self._changes)
+
+    def recent_changes(self, limit: int = 10) -> list[dict]:
+        now = time.time()
+        return [{"change": c["change"], "node": c["node"], "node_type": c["node_type"],
+                 "when": _ago(now - c["at"])} for c in list(self._changes)[-limit:]]
 
     def _executor_for(self, invocation: str) -> Executor:
         if invocation not in self._executors:
@@ -292,6 +335,7 @@ class MSightControlPlane:
         executor = self._executor_for(spec.invocation)
         handle = await executor.start(name, cmd, msight_path, env, needs_gpu=spec.needs_gpu, mounts=mounts)
         self._nodes[name] = _TrackedNode(handle=handle, node_type=node_type, invocation=spec.invocation)
+        self._record_change("added", name, node_type)
         return handle
 
     def is_tracked(self, name: str) -> bool:
@@ -299,6 +343,28 @@ class MSightControlPlane:
         if name in self._nodes:
             return True
         return recover_supervisor_handle(name) is not None
+
+    async def snapshot(self, names) -> dict[str, dict]:
+        """{name: {"alive", "device"}} for many nodes -- one docker call for all
+        containers instead of one per node; same resolution order as is_alive."""
+        names = list(names)
+        containers = await inspect_containers([f"msight-{n}" for n in names])
+        out = {}
+        for name in names:
+            tracked = self._nodes.get(name)
+            info = containers.get(f"msight-{name}")
+            if tracked is not None and tracked.invocation != "docker":
+                alive = await self._executor_for(tracked.invocation).is_alive(tracked.handle)
+                out[name] = {"alive": alive, "device": {"device": "cpu", "note": "host process"}}
+            elif info is not None:
+                device = {k: info[k] for k in ("device", "image", "gpu_fallback")}
+                out[name] = {"alive": info["running"], "device": device}
+            elif tracked is None and (recovered := recover_supervisor_handle(name)) is not None:
+                alive = await self._executor_for("supervisor").is_alive(recovered)
+                out[name] = {"alive": alive, "device": {"device": "cpu", "note": "host process"}}
+            else:
+                out[name] = {"alive": False, "device": None}
+        return out
 
     async def is_alive(self, name: str) -> bool:
         """Real liveness; survives restarts via container name or pidfile."""
@@ -313,6 +379,12 @@ class MSightControlPlane:
         return False
 
     async def delete_node(self, name: str) -> None:
+        registered = self._redis_client().hget(NODES_REDIS_KEY, name)
+        existed = registered is not None or await self.is_alive(name)
+        try:
+            publish_topics = _topic_list(json.loads(registered).get("publish_topic")) if registered else []
+        except (TypeError, ValueError):
+            publish_topics = []
         tracked = self._nodes.pop(name, None)
         if tracked is not None:
             executor = self._executor_for(tracked.invocation)
@@ -331,6 +403,8 @@ class MSightControlPlane:
                     pass
         # Nodes don't reliably deregister on shutdown; clear Redis to avoid ghosts.
         self._redis_client().hdel(NODES_REDIS_KEY, name)
+        if existed or tracked is not None:
+            self._record_change("removed", name, tracked.node_type if tracked else None, publish_topics)
 
     async def recompose(self, desired: list[dict]) -> dict:
         """desired: list of {"node_type": str, "name": str | None, "config": dict | None}."""
@@ -430,6 +504,7 @@ class MSightControlPlane:
         import time
         registry = {n["name"]: n for n in self.get_status()}
         names = sorted(set(registry) | set(self._nodes))
+        snap = await self.snapshot(names)
 
         topics: set[str] = set()
         for info in registry.values():
@@ -446,7 +521,7 @@ class MSightControlPlane:
         out = []
         for name in names:
             info = registry.get(name)
-            alive = await self.is_alive(name)
+            alive = snap[name]["alive"]
             pub = _topic_list(info.get("publish_topic")) if info else []
             sub = _topic_list(info.get("subscribe_topic")) if info else []
             in_msgs, out_msgs = _sum(sub, "messages"), _sum(pub, "messages")
@@ -473,22 +548,56 @@ class MSightControlPlane:
                 "in_rate_hz": _sum(sub, "rate_hz"),
                 "out_rate_hz": _sum(pub, "rate_hz"),
                 "seconds_since_heartbeat": max(0, int(now - hb)) if isinstance(hb, (int, float)) else None,
+                "_device": snap[name]["device"],
             })
         return out
 
     async def diagnose(self, max_window: float = 10.0) -> dict:
-        return diagnose_from_health(await self.node_health(max_window))
+        rows = await self.node_health(max_window)
+        devices = {r["name"]: r.pop("_device") for r in rows}
+        result = diagnose_from_health(rows, self.changes())
+        compute = await self.compute_report(devices, include_gpu=True)
+        result["compute"] = compute
+        if compute["warnings"]:
+            result["summary"] += " Performance warning: " + " ".join(compute["warnings"])
+        result["recent_changes"] = self.recent_changes()
+        return result
 
-    async def structural_check(self) -> list[dict]:
-        """Cheap (no rate probe) -- registry topics + real liveness only."""
-        rows = []
-        for info in self.get_status():
-            rows.append({
-                "name": info["name"],
-                "alive": await self.is_alive(info["name"]),
-                "publish_topics": _topic_list(info.get("publish_topic")),
-                "subscribe_topics": _topic_list(info.get("subscribe_topic")),
-            })
+    async def compute_report(self, devices: dict[str, Optional[dict]], include_gpu: bool = False) -> dict:
+        """The device each node actually got (from snapshot()), with a warning
+        when a GPU node fell back to CPU. The host GPU probe (lspci +
+        nvidia-smi) only runs when it explains a fallback or include_gpu."""
+        nodes = {name: dev for name, dev in devices.items() if dev is not None}
+        fallbacks = [name for name, dev in nodes.items() if dev.get("gpu_fallback")]
+        gpu = await gpu_report() if (fallbacks or include_gpu) else None
+        warnings = []
+        for name in fallbacks:
+            if gpu["usable"]:
+                why = "the GPU wasn't usable when it started but is now -- restarting it would use the GPU"
+            elif gpu["hardware"]:
+                why = (f"{gpu['reason'].rstrip('.')}. NVIDIA hardware IS present ({', '.join(gpu['hardware'])}), "
+                       "so the driver is the problem, not the machine")
+            else:
+                why = gpu["reason"] or "no NVIDIA GPU was found"
+            warnings.append(f"'{name}' needs a GPU but is running on the CPU-only fallback image ({why}); "
+                            "expect it to be many times slower.")
+        report = {"nodes": nodes, "warnings": warnings}
+        if gpu is not None:
+            report["gpu"] = gpu
+        return report
+
+    async def structural_check(self, registry: Optional[list[dict]] = None,
+                               snap: Optional[dict[str, dict]] = None) -> list[dict]:
+        """Cheap (no rate probe) -- registry topics + real liveness only.
+        Pass get_status()/snapshot() results to reuse them."""
+        registry = self.get_status() if registry is None else registry
+        snap = snap or await self.snapshot(info["name"] for info in registry)
+        rows = [{
+            "name": info["name"],
+            "alive": snap[info["name"]]["alive"],
+            "publish_topics": _topic_list(info.get("publish_topic")),
+            "subscribe_topics": _topic_list(info.get("subscribe_topic")),
+        } for info in registry]
         return structural_findings(rows)
 
     async def get_logs(self, name: str, tail: int = 200) -> str:

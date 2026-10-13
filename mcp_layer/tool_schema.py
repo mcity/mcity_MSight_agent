@@ -578,7 +578,7 @@ tools = [
             "type": "function",
             "function": {
                 "name": "get_msight_status",
-                "description": "Report the current state (running/exited/etc.) of each MSight_Vision pipeline container, plus the web viewer URL if reachable. Includes a `problems` list when nodes are dead or a node's input topic has no publisher. Only says which processes are up, NOT whether data is flowing -- for 'is it working / healthy / actually running' questions, call diagnose_msight_pipeline instead.",
+                "description": "Report the current state (running/exited/etc.) of each MSight_Vision pipeline container, plus the web viewer URL if reachable. Includes a `problems` list when nodes are dead or a node's input topic has no publisher. Only says which processes are up, NOT whether data is flowing -- for 'is it working / healthy / actually running' questions, call diagnose_msight_pipeline instead. Also answers 'CPU or GPU?' (`compute`: host GPU state, the device each node actually got, and warnings when a GPU node fell back to CPU) and 'what changed?' (`recent_changes`: nodes added/removed through this agent, the dashboard or the API).",
                 "parameters": {"type": "object", "properties": {}}
             }
         },
@@ -594,7 +594,9 @@ tools = [
                     "evidence and a suggested_fix), `affected` (downstream nodes that are only "
                     "broken as a consequence -- don't present these as causes), and a one-line "
                     "`summary`. Works for any topology, including nodes added with add_msight_node. "
-                    "Lead your answer with root_causes[0]; quote its evidence."
+                    "Lead your answer with root_causes[0]; quote its evidence. Also returns "
+                    "`compute` (CPU/GPU per node, with warnings -- mention any for 'slow' questions) "
+                    "and `recent_changes` (what was added/removed recently)."
                 ),
                 "parameters": {"type": "object", "properties": {}}
             }
@@ -797,6 +799,32 @@ tools = [
         {
             "type": "function",
             "function": {
+                "name": "inspect_host",
+                "description": (
+                    "Run ONE read-only diagnostic command on the host, for problems the MSight "
+                    "tools can't see: GPU drivers/kernel modules, disk space, ports in use, the "
+                    "Docker daemon, system services, Redis. Use it to check a hypothesis after "
+                    "diagnose_msight_pipeline/get_msight_status, then base your answer on its "
+                    "actual output and quote it. Allowed: uname, uptime, nproc, lsmod, lspci, "
+                    "modinfo, mokutil --sb-state, dpkg -l [pattern], nvidia-smi (queries), df, "
+                    "free, ss, docker ps/inspect/logs/images/info/version/stats --no-stream, "
+                    "systemctl status|is-active|is-enabled <unit>, journalctl -u <unit>|-k. No "
+                    "pipes, redirects, sudo or file reads -- run several calls instead of piping. "
+                    "It cannot change anything; for fixes needing sudo/reboot, tell the user the "
+                    "exact command and the evidence behind it."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "e.g. 'uname -r' or 'dpkg -l nvidia*'"},
+                    },
+                    "required": ["command"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "get_msight_reference",
                 "description": (
                     "Fetch reference documentation not already in your instructions. Call this "
@@ -805,7 +833,9 @@ tools = [
                     "known error patterns and fixes when a tool call fails with an unfamiliar "
                     "error; 'diagnosing_stalled_nodes' — how to tell a silently-stuck node "
                     "(status looks fine, but it isn't actually producing data) apart from a "
-                    "genuinely dead one, using get_msight_status/get_msight_logs. Don't call "
+                    "genuinely dead one, using get_msight_status/get_msight_logs; "
+                    "'host_troubleshooting' — how to investigate machine-level causes (drivers, "
+                    "disk, ports, Docker, Redis) with inspect_host. Don't call "
                     "this speculatively for routine flows already covered by your instructions."
                 ),
                 "parameters": {
@@ -813,7 +843,7 @@ tools = [
                     "properties": {
                         "topic": {
                             "type": "string",
-                            "enum": ["node_catalog", "common_failure_modes", "diagnosing_stalled_nodes"],
+                            "enum": ["node_catalog", "common_failure_modes", "diagnosing_stalled_nodes", "host_troubleshooting"],
                         }
                     },
                     "required": ["topic"],

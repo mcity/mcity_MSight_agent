@@ -29,6 +29,7 @@ TOOL_STATUS_MESSAGES: dict[str, str] = {
     "reset_workflow_state":                   "Resetting workflow state...",
     "launch_voxel51_session":                "Launching Voxel51 visualization...",
     "diagnose_msight_pipeline":              "Diagnosing pipeline — sampling live data flow (~5-10s)...",
+    "inspect_host":                          "Inspecting the host...",
 }
 
 # Strip ANSI escape codes and bare CR from subprocess output.

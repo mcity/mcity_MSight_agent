@@ -3,7 +3,9 @@ import asyncio
 
 import pytest
 
-from mcp_layer.chat_server import _CHANGE_REQUEST_RE, _chat_with_retry, _without_writes
+from mcp_layer.chat_server import (
+    _CHANGE_REQUEST_RE, _HEALTH_QUESTION_RE, _chat_with_retry, _measure_first, _without_writes,
+)
 
 
 @pytest.mark.parametrize("message", [
@@ -68,3 +70,23 @@ def test_non_connection_errors_are_not_retried():
     with pytest.raises(ValueError):
         asyncio.run(_chat_with_retry(client, []))
     assert client.calls == 1
+
+
+@pytest.mark.parametrize("message, expected", [
+    ("is the pipeline actually working right now?", True),
+    ("is it running on cpu or gpu ?", True),
+    ("is everything healthy?", True),
+    ("check status", False),
+    ("what nodes are running?", False),
+    ("add a detection viewer on port 9011", False),
+])
+def test_health_questions_are_recognised(message, expected):
+    assert bool(_HEALTH_QUESTION_RE.search(message)) is expected
+
+
+def test_measure_first_offers_only_diagnose_when_available():
+    with_diag = [{"function": {"name": n}} for n in
+                 ("get_msight_status", "get_msight_logs", "diagnose_msight_pipeline")]
+    assert [t["function"]["name"] for t in _measure_first(with_diag)] == ["diagnose_msight_pipeline"]
+    status_only = [{"function": {"name": "get_msight_status"}}]
+    assert _measure_first(status_only) == status_only

@@ -42,6 +42,21 @@ topic name is a near-match, e.g. a sensor-name typo).
   seconds. The diagnosis waits long enough to see one; don't conclude a topic
   is dead from a single quick look at logs.
 
+## CPU vs GPU, and what changed
+
+- `compute.gpu` — whether the host GPU is usable, the NVIDIA hardware found,
+  and the `nvidia-smi` error if not. Hardware present but `nvidia-smi` failing
+  means the driver is broken (e.g. not built for the running kernel), not
+  that the machine has no GPU.
+- `compute.nodes` — the device each container actually got, read from Docker.
+  `gpu_fallback: true` means a GPU node is running on the CPU-only image,
+  typically many times slower (RF-DETR: ~4.5s per frame on CPU).
+- `recent_changes` — nodes added/removed through the control plane (chat,
+  dashboard, API). When a removal orphaned a topic, the `MISSING_PUBLISHER`
+  root cause names the removed node directly. Kept in memory only, so it's
+  empty after the MCP server restarts, and it can't see containers killed
+  outside the control plane (those show up as `DEAD` instead).
+
 ## What it can't see
 
 - A node that crashed *before* registering and was never started through the

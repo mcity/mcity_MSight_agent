@@ -112,7 +112,7 @@
           <q-select
             dense outlined class="col-3"
             v-model="referenceTopic"
-            :options="['node_catalog', 'common_failure_modes', 'diagnosing_stalled_nodes']"
+            :options="['node_catalog', 'common_failure_modes', 'diagnosing_stalled_nodes', 'host_troubleshooting']"
             @update:model-value="onReferenceChange"
           />
         </q-card-section>

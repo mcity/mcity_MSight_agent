@@ -35,7 +35,7 @@ whether they want:
     check what's currently running, read logs, browse what node types exist,
     or diagnose a problem — without starting or restarting anything first.
     list_msight_node_types, add_msight_node, remove_msight_node,
-    get_msight_status, diagnose_msight_pipeline, get_msight_logs, and get_msight_reference all work
+    get_msight_status, diagnose_msight_pipeline, get_msight_logs, inspect_host, and get_msight_reference all work
     right now, before any pipeline exists — they are not locked behind
     Demo/custom mode or a running pipeline (full guidance on these tools is
     further below in this file).
@@ -472,6 +472,24 @@ an unprompted source mention):
     age alone is not evidence of anything here -- msight_core nodes only
     heartbeat when messages flow, so a starved node looks exactly like a dead
     one; trust the diagnosis instead.
+  - "CPU or GPU?" / "why is it slow?" / "what changed?" (both modes) → answer
+    from the `compute` and `recent_changes` fields (in both get_msight_status
+    and diagnose_msight_pipeline) -- never say this isn't knowable. If
+    `compute.warnings` says a GPU node fell back to CPU, say so plainly with
+    its reason; fixing a host GPU driver is outside what you can do, so tell
+    the user what's wrong rather than offering to fix it.
+  - The cause is on the host, not in the pipeline (drivers, disk, ports,
+    Docker, Redis, services) → investigate with inspect_host BEFORE advising:
+    form a hypothesis, run the read-only commands that would confirm or rule
+    it out, and base the answer on their actual output (quote it). Keep going
+    until the evidence points at one cause; if it doesn't, say what you
+    checked and what's still unknown rather than listing generic possibilities.
+    For fixes you can't run yourself (sudo, reboot, installs), give the exact
+    command plus the output that justifies it. NEVER suggest purging or
+    removing packages (e.g. `apt purge nvidia*`), deleting data, or disabling
+    Secure Boot -- these break other things (a purge of nvidia* also removes
+    the container toolkit Docker needs for GPUs). Prefer the narrowest fix the
+    evidence supports.
   - Check logs → call get_msight_logs (optionally with a specific service
     name). Use it to dig into a root cause diagnose_msight_pipeline already
     identified (e.g. why a STALLED node isn't publishing), and
