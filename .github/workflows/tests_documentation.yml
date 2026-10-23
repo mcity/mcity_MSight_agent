@@ -46,19 +46,21 @@ jobs:
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --exclude custom_models
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --exclude auto_labeling/custom_models,archive
         # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
-        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics --exclude custom_models
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics --exclude auto_labeling/custom_models,archive
     - name: Test with pytest
       env: # Or as an environment variable
         HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      run: pytest -s --ignore custom_models/ --ignore tests/workflow_aws_download_test.py --ignore tests/workflow_zero_shot_od_test.py
+      run: |
+        pytest -s msight_agent/tests
+        cd auto_labeling && pytest -s tests --ignore tests/workflow_aws_download_test.py --ignore tests/workflow_zero_shot_od_test.py
 
     - name: Documentation with pdoc
-      run: pdoc ./*.py ./workflows/*.py ./cloud/*.py ./config/*.py ./tests/*.py ./utils/*.py -o docs
+      run: pdoc ./auto_labeling/*.py ./auto_labeling/workflows/*.py ./auto_labeling/config/*.py ./auto_labeling/utils/*.py -o archive/docs
     - uses: actions/upload-pages-artifact@v3
       with:
-        path: docs/
+        path: archive/docs/
 
     # Local availability of docs
     - name: Pull request for updated documentation
@@ -69,7 +71,7 @@ jobs:
         commit-message: Update documentation
         delete-branch: true
         labels: documentation
-        add-paths: docs/*
+        add-paths: archive/docs/*
 
   # Deploy the artifact to GitHub pages PUBLICLY when pushes to main occur
   # https://github.com/mitmproxy/pdoc/blob/main/.github/workflows/docs.yml
