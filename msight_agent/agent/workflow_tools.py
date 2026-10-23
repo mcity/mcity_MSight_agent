@@ -1,11 +1,16 @@
+import asyncio
 import logging
 import re
+import time
 from pathlib import Path
 from typing import List
+from unittest import mock
 
 import fiftyone as fo
 import fiftyone.core.odm as _foodm
+from fastmcp import Context
 from ruamel.yaml import YAML
+from tqdm import tqdm as _tqdm_base
 
 from utils.dataset_loader import load_dataset
 from msight_agent.shared.mcp import mcp
@@ -61,22 +66,8 @@ def _prune_stale_custom_entries() -> None:
         logging.warning(f"[DATASETS] Failed to prune stale entries: {e}")
 
 
-@mcp.tool()
-def set_selected_dataset(dataset_name: str) -> str:
-    """
-    Updates SELECTED_DATASET section in config.py with the given dataset name.
-    Always uses the full dataset (n_samples = None).
-    """
-    _prune_stale_custom_entries()
-    _foodm.get_db_conn()
-    available = fo.list_datasets()
-    if dataset_name not in available:
-        yaml_names = _extract_names_after_line(DEFAULT_DATASETS_YAML, 0)
-        fixed_names = ["fisheye8k", "fisheye8k_mini", "mcity_fisheye_2000", "mcity_fisheye_2100"]
-        all_known = set(available + yaml_names + fixed_names)
-        if dataset_name not in all_known:
-            return f"DATASET_NOT_FOUND: '{dataset_name}' does not exist."
-
+def write_selected_dataset(dataset_name: str) -> None:
+    """Point SELECTED_DATASET in config.py (what main.py runs on) at `dataset_name`."""
     lines = CONFIG_PATH.read_text().split("\n")
     modified = []
     in_dataset_block = False
@@ -107,8 +98,59 @@ def set_selected_dataset(dataset_name: str) -> str:
 
     CONFIG_PATH.write_text("\n".join(modified).rstrip("\n") + "\n")
 
+
+async def _load_dataset_with_progress(dataset_name: str, ctx) -> None:
+    """load_dataset() in a worker thread, relaying ~30s download progress over the MCP
+    log channel. FiftyOne has no progress callback; its HF loader imports tqdm per call,
+    so patching tqdm.tqdm is the only hook that takes effect."""
+    loop = asyncio.get_running_loop()
+    last_emit = 0.0
+
+    class _ProgressTqdm(_tqdm_base):
+        def update(self, n=1):
+            nonlocal last_emit
+            result = super().update(n)
+            if ctx and self.total:
+                now = time.time()
+                is_done = self.n >= self.total
+                if now - last_emit >= 30 or is_done:
+                    last_emit = now
+                    pct = self.n / self.total * 100
+                    msg = f"Downloading {dataset_name}: {self.n}/{self.total} ({pct:.0f}%)"
+                    rate = self.format_dict.get("rate")
+                    if rate and not is_done:
+                        remaining = (self.total - self.n) / rate
+                        msg += f", ~{_tqdm_base.format_interval(remaining)} remaining"
+                    asyncio.run_coroutine_threadsafe(ctx.log(msg), loop)
+            return result
+
+    with mock.patch("tqdm.tqdm", _ProgressTqdm):
+        await asyncio.to_thread(
+            load_dataset,
+            {"name": dataset_name, "n_samples": None, "custom_view": None},
+        )
+
+
+@mcp.tool()
+async def set_selected_dataset(dataset_name: str, ctx: Context = None) -> str:
+    """
+    Updates SELECTED_DATASET section in config.py with the given dataset name.
+    Always uses the full dataset (n_samples = None).
+    """
+    _prune_stale_custom_entries()
+    _foodm.get_db_conn()
+    available = fo.list_datasets()
+    if dataset_name not in available:
+        yaml_names = _extract_names_after_line(DEFAULT_DATASETS_YAML, 0)
+        fixed_names = ["fisheye8k", "fisheye8k_mini", "mcity_fisheye_2000", "mcity_fisheye_2100"]
+        all_known = set(available + yaml_names + fixed_names)
+        if dataset_name not in all_known:
+            return f"DATASET_NOT_FOUND: '{dataset_name}' does not exist."
+
+    write_selected_dataset(dataset_name)
+
     if not dataset_name.startswith("custom"):
-        load_dataset({"name": dataset_name, "n_samples": None, "custom_view": None})
+        await _load_dataset_with_progress(dataset_name, ctx)
 
     return f"Dataset set to `{dataset_name}`."
 

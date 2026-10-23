@@ -1,6 +1,7 @@
 """Pydantic state machine over WORKFLOW_STATE in config.py: schemas, guards, persistence."""
 
 import ast
+import re
 import importlib
 import logging
 from dataclasses import dataclass
@@ -11,6 +12,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 import config.config as _cc
 
 from msight_agent.shared.paths import CONFIG_PATH
+
+
+def config_selected_dataset() -> str:
+    """SELECTED_DATASET["name"] as currently written in config.py (what main.py will use)."""
+    m = re.search(r'SELECTED_DATASET\s*=\s*\{[^}]*?"name":\s*"([^"]*)"', CONFIG_PATH.read_text())
+    return m.group(1) if m else ""
 
 
 @dataclass(frozen=True)
@@ -136,13 +143,15 @@ class AutoLabelingState(BaseModel):
     model_configured: bool = False
     hyperparams_confirmed: bool = False
     auto_labeling_complete: bool = False
-    cvat_task_id: int = 0
+    cvat_task_ids: list[int] = []
     ls_task_ids: list[int] = []
     labels_imported: bool = False
     export_confirmed: bool = False
     run_confirmed: bool = False
     # True while the pre-run confirmation summary is shown; gates confirm_run tool.
     run_awaiting_confirmation: bool = False
+    # True while the pre-export confirmation summary is shown; gates confirm_export.
+    export_awaiting_confirmation: bool = False
     model_source: str = ""
     model_name: str = ""
     # "" = Zone A (mutable), "annotating" = post-export, "training" = post-run, "complete" = terminal
@@ -215,7 +224,7 @@ class AutoLabelingState(BaseModel):
         return True, ""
 
     def can_import_from_cvat(self) -> tuple[bool, str]:
-        if self.cvat_task_id == 0:
+        if not self.cvat_task_ids:
             return False, (
                 "The dataset must be exported to CVAT before importing annotations. "
                 "Please export to CVAT first."
@@ -265,6 +274,17 @@ class MsightPipelineState(BaseModel):
     run_confirmation_requested_at: float = 0.0
 
 
+class LastRun(BaseModel):
+    """Outcome of the most recent run tool call. A failed run leaves the workflow's
+    own flags untouched, so its parameters stay editable and the run can be retried."""
+    model_config = ConfigDict(extra="forbid")
+    workflow: str = ""
+    status: Literal["", "success", "failed"] = ""
+    error: str = ""
+    log_path: str = ""
+    attempts: int = 0
+
+
 class WorkflowState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -276,8 +296,15 @@ class WorkflowState(BaseModel):
     auto_labeling: Optional[AutoLabelingState] = None
     msight_pipeline: Optional[MsightPipelineState] = None
 
+    # Outcome of the last run; drives the failed-run hint.
+    last_run: Optional[LastRun] = None
+
     # Triggers a WORKFLOW_RESET context injection in chat_server on next request.
     workflow_just_reset: bool = False
+
+    # Requests since the session began; caps how much browser-sent history the model
+    # reads, so a reset_workflow_state session's turns stop reaching it.
+    turns_since_reset: int = 0
 
     @model_validator(mode="after")
     def dataset_confirmed_requires_name(self) -> "WorkflowState":
@@ -299,6 +326,27 @@ class WorkflowState(BaseModel):
         if self.auto_labeling is not None:
             self.auto_labeling.reset_from_step(step)
         self.save()
+
+    def record_run(self, workflow: str, failed: bool, error: str = "", log_path: str = "") -> None:
+        """Store a run's outcome and persist the whole state (including the caller's changes).
+        `attempts` counts consecutive runs of the same workflow."""
+        prev = self.last_run
+        previous_attempts = prev.attempts if (prev and prev.workflow == workflow) else 0
+        self.last_run = LastRun(
+            workflow=workflow,
+            status="failed" if failed else "success",
+            error=error[:500],
+            log_path=log_path,
+            attempts=previous_attempts + 1,
+        )
+        self.save()
+
+    def failed_run(self) -> Optional[LastRun]:
+        """The last run record when it is a failure of the active workflow, else None."""
+        lr = self.last_run
+        if lr and lr.status == "failed" and lr.workflow == self.workflow_name:
+            return lr
+        return None
 
     def valid_tool_names(self) -> set[str] | None:
         """Return valid tools for the current step, or None to expose all tools."""
@@ -350,7 +398,7 @@ class WorkflowState(BaseModel):
                     return ALWAYS | {"confirm_export", "set_selected_dataset", "set_labeling_backend", "set_labeling_path"}
                 return ALWAYS | {"set_selected_dataset", "export_to_label_studio", "set_labeling_backend", "set_labeling_path"}
             else:
-                if al.cvat_task_id > 0:
+                if al.cvat_task_ids:
                     return ALWAYS | {"import_from_cvat"}
                 if al.manual_classes and not al.export_confirmed:
                     return ALWAYS | {"confirm_export", "set_selected_dataset", "set_labeling_backend", "set_labeling_path"}
@@ -392,6 +440,9 @@ class WorkflowState(BaseModel):
                     if state.auto_labeling.run_awaiting_confirmation:
                         state.auto_labeling.run_awaiting_confirmation = False
                         logging.warning("[STATE] TTL: cleared stale run_awaiting_confirmation")
+                    if state.auto_labeling.export_awaiting_confirmation:
+                        state.auto_labeling.export_awaiting_confirmation = False
+                        logging.warning("[STATE] TTL: cleared stale export_awaiting_confirmation")
                     if state.auto_labeling.export_confirmed:
                         state.auto_labeling.export_confirmed = False
                         logging.warning("[STATE] TTL: cleared stale export_confirmed")
@@ -432,7 +483,7 @@ class WorkflowState(BaseModel):
 
         old_al_fields = {
             "auto_labeling_complete": "auto_labeling_complete",
-            "cvat_task_id": "cvat_task_id",
+            "cvat_task_id": "cvat_task_ids",
         }
         wf = raw.get("workflow_name", "")
         if wf == "auto_labeling" and "auto_labeling" not in raw:
@@ -440,8 +491,8 @@ class WorkflowState(BaseModel):
             for old_key, new_key in old_al_fields.items():
                 if old_key in raw:
                     val = raw.pop(old_key)
-                    if new_key == "cvat_task_id" and val is None:
-                        val = 0
+                    if new_key == "cvat_task_ids":
+                        val = [val] if val else []
                     substate[new_key] = val
             if substate:
                 raw["auto_labeling"] = substate
@@ -451,20 +502,36 @@ class WorkflowState(BaseModel):
 
         al = raw.get("auto_labeling")
         if isinstance(al, dict):
+            # cvat_task_id (single int) predates multi-task CVAT export chunking;
+            # convert in place so extra="forbid" doesn't reject the old key.
+            if "cvat_task_id" in al:
+                old_val = al.pop("cvat_task_id")
+                al.setdefault("cvat_task_ids", [old_val] if old_val else [])
             al.setdefault("labeling_backend", "")
+            al.setdefault("cvat_task_ids", [])
             al.setdefault("ls_task_ids", [])
             al.setdefault("manual_classes", [])
             al.setdefault("models_listed", False)
             al.setdefault("export_confirmed", False)
             al.setdefault("run_confirmed", False)
             al.setdefault("run_awaiting_confirmation", False)
+            al.setdefault("export_awaiting_confirmation", False)
             al.setdefault("model_source", "")
             al.setdefault("model_name", "")
             al.setdefault("phase", "")
             al.pop("pending_dataset_change", None)
 
+        lr = raw.get("last_run")
+        if isinstance(lr, dict):
+            # extra="forbid" rejects the whole state on one unknown key, which
+            # would drop the live session back to defaults.
+            for key in list(lr.keys()):
+                if key not in LastRun.model_fields:
+                    lr.pop(key)
+
         known = {
             "workflow_name", "dataset_name", "dataset_confirmed", "labeled_dataset_name",
+            "last_run", "turns_since_reset",
         } | set(WORKFLOW_SPECS)
         for key in list(raw.keys()):
             if key not in known:
@@ -484,7 +551,11 @@ class WorkflowState(BaseModel):
                         start = node.lineno - 1
                         end = node.end_lineno
                         lines[start:end] = [f"WORKFLOW_STATE = {repr(state_dict)}"]
-                        CONFIG_PATH.write_text("\n".join(lines).rstrip("\n") + "\n")
+                        new_src = "\n".join(lines).rstrip("\n") + "\n"
+                        # Skip identical writes: the mtime bump restarts uvicorn --reload,
+                        # which saves again, looping forever.
+                        if new_src != src:
+                            CONFIG_PATH.write_text(new_src)
                         return
         raise RuntimeError(
             "WORKFLOW_STATE assignment not found in config.py — save aborted"
@@ -497,7 +568,8 @@ class WorkflowState(BaseModel):
         return fresh
 
     def reset_for_workflow(self, workflow_name: str) -> "WorkflowState":
-        fresh = WorkflowState(workflow_name=workflow_name)
+        # A switch clears parameters but keeps the conversation (only reset() ends the session).
+        fresh = WorkflowState(workflow_name=workflow_name, turns_since_reset=self.turns_since_reset)
         spec = WORKFLOW_SPECS.get(workflow_name)
         substate_cls = _resolve_substate_cls(spec.substate_cls_name) if spec else None
         if substate_cls:

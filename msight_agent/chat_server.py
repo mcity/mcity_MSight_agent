@@ -89,10 +89,33 @@ async def _select_default_workflow(state: WorkflowState | None, message: str, ll
         return state, None
 
 
+def history_for_session(history: list, state: WorkflowState | None,
+                        max_turns: int = MAX_HISTORY_TURNS) -> list:
+    """The turns of browser-sent `history` that belong to the current session.
+
+    The browser resends every turn it has shown, so this trim is what keeps a
+    discarded session out of the prompt: after reset_workflow_state the next request
+    carries no history, and the window grows one turn per request. Without state,
+    the plain `max_turns` window applies.
+    """
+    if not history:
+        return []
+    allowed = max_turns if state is None else min(max_turns, max(0, state.turns_since_reset))
+    return history[-allowed:] if allowed else []
+
+
 async def _build_messages(state: WorkflowState | None, history: list, message: str) -> list[dict]:
     """System prompt, recent history, this turn's state hint, then the user message."""
     messages = [{"role": "system", "content": build_system_prompt(state)}]
-    for user_msg, assistant_msg in history[-MAX_HISTORY_TURNS:]:
+    kept = history_for_session(history, state)
+    if len(kept) < min(len(history), MAX_HISTORY_TURNS):
+        logging.warning(f"[STREAM HISTORY] client sent {len(history)} turn(s), keeping {len(kept)} "
+                        f"(turns_since_reset={state.turns_since_reset if state else 'no state'})")
+    # The browser records this exchange whether it ends in a reply or an error.
+    if state and state.turns_since_reset < MAX_HISTORY_TURNS:
+        state.turns_since_reset += 1
+        state.save()
+    for user_msg, assistant_msg in kept:
         messages += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": assistant_msg}]
     if state and state.workflow_just_reset:
         messages.append({"role": "system", "content": _WORKFLOW_RESET_NOTE})

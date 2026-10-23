@@ -1,8 +1,12 @@
 """One user turn of the agent: call the LLM, run its tool calls, repeat until it replies."""
+import copy
 import logging
+import time
+import uuid
 from typing import Awaitable, Callable, Optional
 
 from msight_agent.agent import guards
+from msight_agent.agent.prompt_log import log_llm_call, provider_and_model
 from msight_agent.agent.prompts import build_system_prompt
 from msight_agent.agent.dispatch import ChatPipeline
 from msight_agent.agent.tool_schema import tools as ALL_TOOLS
@@ -44,6 +48,9 @@ class AgentTurn:
         self.llm = llm_client
         self.mcp_client = mcp_client
         self.emit = emit
+        self.message = message
+        # One id for every iteration of this turn in the prompt log.
+        self.request_id = uuid.uuid4().hex[:12]
         self.all_tool_results: list[dict] = []
         # A pipeline built while picking the default workflow means a fresh session:
         # the model may then ask STEP 1's question instead of guessing.
@@ -68,13 +75,20 @@ class AgentTurn:
             if iteration == 0 and self.health_question:
                 iteration_tools = guards.measure_first(iteration_tools)
 
+            # Snapshot before the call: `messages` grows during the turn.
+            sent_messages = copy.deepcopy(self.messages)
+            started = time.perf_counter()
             try:
                 assistant_message = await guards.chat_with_retry(
                     self.llm, self.messages, tools=iteration_tools, tool_choice=tool_choice)
             except Exception as e:
+                self._log_call(iteration, tool_choice, iteration_tools, sent_messages, started,
+                               error=f"{type(e).__name__}: {e}")
                 logging.warning(f"[STREAM] LLM call failed on iter={iteration}: {type(e).__name__}: {e}")
                 await self.emit("error", {"message": guards.llm_error_message(e)})
                 return
+            self._log_call(iteration, tool_choice, iteration_tools, sent_messages, started,
+                           assistant_message=assistant_message)
 
             tool_calls = getattr(assistant_message, "tool_calls", None)
             if not tool_calls:
@@ -99,6 +113,15 @@ class AgentTurn:
                 return
 
         await self._wrap_up()
+
+    def _log_call(self, iteration, tool_choice, tools, sent_messages, started, **result) -> None:
+        provider, model = provider_and_model(self.llm)
+        log_llm_call(
+            request_id=self.request_id, iteration=iteration, provider=provider, model=model,
+            tool_choice=tool_choice, active_tools=tools, messages=sent_messages,
+            duration_ms=(time.perf_counter() - started) * 1000, user_message=self.message,
+            **result,
+        )
 
     async def _run_tools(self, assistant_message, iteration: int) -> tuple[Optional[str], bool]:
         """Run the tool calls, then refresh tools/prompt for the next iteration.

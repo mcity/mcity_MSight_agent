@@ -1,12 +1,14 @@
 import os
 import json
 import time
+import asyncio
 import logging
 import traceback
 from pathlib import Path
 from dotenv import load_dotenv
 
 import fiftyone as fo
+from fastmcp import Context
 from label_studio_sdk import LabelStudio
 from msight_agent.shared.mcp import mcp
 
@@ -53,7 +55,11 @@ def _save_registry(registry: dict):
 
 
 def _build_label_config(classes: list[str]) -> str:
-    """Label Studio rectangle-label XML config (empty labels for the manual path)."""
+    """
+    Generate a Label Studio XML label config for rectangle labeling.
+    If no classes are provided (manual path), labels are left empty and the
+    annotator adds them manually in the UI.
+    """
     label_tags = "\n    ".join(
         f'<Label value="{c}"/>' for c in classes
     ) if classes else ""
@@ -66,7 +72,10 @@ def _build_label_config(classes: list[str]) -> str:
 
 
 def _upload_image(http, project_id: int, path: Path) -> list[int]:
-    """Upload one image; returns its task IDs."""
+    """
+    Upload a single image to a Label Studio project.
+    Returns a list of task IDs, resolving the async import job if needed.
+    """
     import mimetypes
     mime = mimetypes.guess_type(path)[0] or "image/jpeg"
 
@@ -106,18 +115,30 @@ def _upload_image(http, project_id: int, path: Path) -> list[int]:
     )
 
 
-def _upload_images_concurrent(
-    http, project_id: int, paths: list[Path], max_workers: int = 3
-) -> dict[str, int]:
-    """Upload images one per POST (LS makes one task per POST); returns {filename: task_id}.
-
-    max_workers=3 stays under LS cloud rate limits (429s above ~5).
+async def _upload_images_concurrent(
+    ctx, http, project_id: int, paths: list[Path], max_workers: int = 3
+) -> tuple[dict[str, int], list[str]]:
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    Upload images one-per-POST using a thread pool, return {filename: task_id}.
+
+    LS creates exactly one task per POST regardless of how many files are packed
+    into a single multipart body, so per-file uploads are required for N tasks.
+    Concurrency removes the per-image latency; max_workers=3 stays under LS
+    cloud rate limits (429 appears above ~5 simultaneous uploads).
+
+    Awaits each upload individually instead of blocking on a synchronous
+    as_completed loop, so control returns to the event loop between images and
+    progress can go out over the SSE connection -- a long export previously
+    held the loop with no traffic on it, tripping the client's 300s timeout.
+    """
+    from concurrent.futures import ThreadPoolExecutor
 
     total = len(paths)
     t0 = time.time()
     logging.warning(f"[LS] Uploading {total} image(s) ({max_workers} concurrent)…")
+    if ctx:
+        await ctx.log(f"Uploading {total} image(s) to Label Studio…")
+        await ctx.report_progress(0, total)
 
     def _upload_one(path: Path) -> tuple[str, int]:
         for attempt in range(4):
@@ -137,16 +158,20 @@ def _upload_images_concurrent(
     fname_to_task_id: dict[str, int] = {}
     errors: list[str] = []
 
+    loop = asyncio.get_running_loop()
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_upload_one, p): p for p in paths}
-        for done, future in enumerate(as_completed(futures), 1):
+        futures = [loop.run_in_executor(pool, _upload_one, p) for p in paths]
+        for done, coro in enumerate(asyncio.as_completed(futures), 1):
             try:
-                fname, task_id = future.result()
+                fname, task_id = await coro
                 fname_to_task_id[fname] = task_id
             except Exception as e:
                 errors.append(str(e))
             if done % 10 == 0 or done == total:
                 logging.warning(f"[LS] {done}/{total} uploaded…")
+                if ctx:
+                    await ctx.report_progress(done, total)
+                    await ctx.log(f"{done}/{total} images uploaded…")
 
     if errors:
         logging.warning(f"[LS] {len(errors)} upload error(s): {errors[:3]}")
@@ -154,11 +179,18 @@ def _upload_images_concurrent(
     logging.warning(
         f"[LS] {len(fname_to_task_id)}/{total} images uploaded in {time.time()-t0:.1f}s"
     )
-    return fname_to_task_id
+    if ctx:
+        await ctx.log(
+            f"Uploaded {len(fname_to_task_id)}/{total} images in {time.time()-t0:.1f}s"
+        )
+    return fname_to_task_id, errors
 
 
 def _detections_to_ls_results(detections) -> list:
-    """FiftyOne detections (normalized) -> LS rectanglelabels (percent)."""
+    """
+    Convert FiftyOne detections to Label Studio rectanglelabels result format.
+    FiftyOne bbox: [x, y, w, h] normalized [0,1] -> LS percentages [0,100].
+    """
     results = []
     for det in detections:
         x, y, w, h = det.bounding_box
@@ -178,7 +210,13 @@ def _detections_to_ls_results(detections) -> list:
 
 
 def _attach_as_annotations(http, task_id: int, detections, label_field: str):
-    """Import detections as editable annotations (predictions render blank in the Label view)."""
+    """
+    Import model detections as annotations (not predictions) so they appear
+    as editable boxes in the Label Studio labeling interface.
+
+    Predictions are read-only and cause a blank image when clicking Label.
+    Annotations are editable and become ground truth after the annotator submits.
+    """
     results = _detections_to_ls_results(detections)
     if not results:
         return
@@ -201,7 +239,10 @@ def _attach_as_annotations(http, task_id: int, detections, label_field: str):
 
 
 def _export_snapshot(http, project_id: int) -> list[dict]:
-    """Create an export snapshot, wait for it, and return its task dicts."""
+    """
+    Create an export snapshot, poll until ready, and download as JSON.
+    Returns a list of task dicts.
+    """
     snap_resp = http.request(
         f"/api/projects/{project_id}/exports",
         method="POST",
@@ -241,7 +282,10 @@ def _export_snapshot(http, project_id: int) -> list[dict]:
 
 
 def _ls_result_to_fo_detection(result: dict, img_w: int, img_h: int):
-    """LS rectanglelabels result (percent) -> FiftyOne Detection (normalized)."""
+    """
+    Convert a single Label Studio rectanglelabels result to a FiftyOne Detection.
+    LS value coords are percentages [0,100]; FiftyOne expects normalized [0,1].
+    """
     val = result.get("value", {})
     labels = val.get("rectanglelabels", [])
     if not labels:
@@ -332,10 +376,11 @@ def set_labeling_backend(backend: str) -> str:
 
 
 @mcp.tool()
-def export_to_label_studio(
+async def export_to_label_studio(
     dataset_name: str,
     with_predictions: bool = False,
     classes: list = None,
+    ctx: Context = None,
 ) -> str:
     """
     Export a FiftyOne dataset to Label Studio for annotation.
@@ -351,11 +396,24 @@ def export_to_label_studio(
         return "LS_TOKEN not set in .env"
 
     try:
-        # load_dataset() returns a cached singleton; reload() picks up fields another process wrote.
+        # fo.load_dataset() returns a process-wide singleton keyed by name — if this
+        # process already loaded this dataset earlier (e.g. during selection/listing),
+        # its in-memory schema can be stale relative to fields another process (the
+        # auto-labeling subprocess) just wrote. reload() forces a resync from Mongo.
         dataset = fo.load_dataset(dataset_name)
         dataset.reload()
     except Exception as e:
         return f"Failed to load dataset '{dataset_name}': {e}"
+
+    # Checked before anything else: an empty export gives the user nothing to
+    # annotate. Stopping here also skips the 20-second prediction-field poll
+    # below, and creates no project that would only be deleted again.
+    if len(dataset) == 0:
+        logging.warning(f"[LS] export_to_label_studio: dataset '{dataset_name}' has no images")
+        return (
+            f"EXPORT_NO_IMAGES: Dataset '{dataset_name}' contains 0 images, "
+            f"so there is nothing to export to Label Studio."
+        )
 
     try:
         client = _get_client()
@@ -418,7 +476,8 @@ def export_to_label_studio(
         project_id = project.id
         logging.warning(f"[LS] Created project {project_id} for dataset '{dataset_name}'")
 
-        # PATCH separately: HumanSignal cloud sometimes ignores it on create.
+        # PATCH label config separately — projects.create() sometimes ignores it
+        # on HumanSignal cloud, so this guarantees labels appear in the UI.
         if classes:
             patch_resp = http.request(
                 f"/api/projects/{project_id}",
@@ -431,8 +490,23 @@ def export_to_label_studio(
         image_paths = [Path(s.filepath) for s in samples]
 
         # --- Upload (concurrent, one POST per image) ----------------------
-        fname_to_task_id = _upload_images_concurrent(http, project_id, image_paths)
+        fname_to_task_id, upload_errors = await _upload_images_concurrent(ctx, http, project_id, image_paths)
         all_task_ids = list(fname_to_task_id.values())
+
+        if not all_task_ids:
+            # Total failure -- nothing worth keeping, unlike a partial one.
+            try:
+                client.projects.delete(id=project_id)
+                logging.warning(f"[LS] Deleted empty project {project_id} after total upload failure")
+            except Exception:
+                pass
+            detail = "; ".join(upload_errors[:3]) if upload_errors else "no images uploaded"
+            # Same outcome as an empty dataset — 0 images reached the backend —
+            # so it carries the same sentinel and stops the workflow the same way.
+            return (
+                f"EXPORT_NO_IMAGES: Label Studio export uploaded 0 of "
+                f"{len(image_paths)} images: {detail}"
+            )
 
         # --- Attach predictions (auto path only) --------------------------
         if with_predictions and label_field and fname_to_task_id:
@@ -490,6 +564,12 @@ def export_to_label_studio(
         )
         if with_predictions and label_field:
             msg += f"\nPredictions attached with classes: {classes}"
+        if upload_errors:
+            msg += (
+                f"\n\nWarning: {len(upload_errors)}/{len(image_paths)} image(s) failed to upload "
+                f"and were skipped: {'; '.join(upload_errors[:3])}"
+                f"{' (and more)' if len(upload_errors) > 3 else ''}"
+            )
 
         logging.info(msg)
         return msg
@@ -513,7 +593,7 @@ def export_to_label_studio(
 
 
 @mcp.tool()
-def import_from_label_studio(dataset_name: str) -> str:
+async def import_from_label_studio(dataset_name: str, ctx: Context = None) -> str:
     """
     Download completed annotations from Label Studio for a previously exported
     dataset and save them as a new FiftyOne dataset named <dataset_name>_labeled
@@ -536,7 +616,11 @@ def import_from_label_studio(dataset_name: str) -> str:
         client = _get_client()
         http   = _get_http(client)
 
-        exported_tasks = _export_snapshot(http, project_id)
+        if ctx:
+            await ctx.log(f"Requesting annotation snapshot from Label Studio project {project_id}...")
+        exported_tasks = await asyncio.to_thread(_export_snapshot, http, project_id)
+        if ctx:
+            await ctx.log(f"Snapshot ready — {len(exported_tasks)} task(s) found, matching to local images...")
 
         if not exported_tasks:
             return (
@@ -576,7 +660,8 @@ def import_from_label_studio(dataset_name: str) -> str:
             image_ref  = data.get("image", "") or data.get("$undefined$", "")
             filename   = image_ref.split("/")[-1].split("?")[0]  # strip query params
 
-            # LS prefixes uploads with a UUID ("8c7230d6-000001.jpg"); try both forms.
+            # LS prepends a random UUID to uploaded filenames (e.g. "8c7230d6-000001.jpg").
+            # Try a direct match first, then strip the UUID prefix.
             filepath = path_map.get(filename)
             if not filepath:
                 parts = filename.split("-", 1)
@@ -641,4 +726,5 @@ def import_from_label_studio(dataset_name: str) -> str:
         return msg
 
     except Exception as e:
-        return f"Label Studio import failed: {e}\n{traceback.format_exc()}"
+        logging.warning(f"[LS] import_from_label_studio failed: {traceback.format_exc()}")
+        return f"Label Studio import failed: {e}"

@@ -23,7 +23,7 @@ def auto_labeling_hint_parts(state: WorkflowState) -> list[str]:
     elif al.labeling_path:
         parts.append(f"labeling_path={al.labeling_path}")
 
-    if al.manual_classes and not al.cvat_task_id and not al.ls_task_ids and not al.phase:
+    if al.manual_classes and not al.cvat_task_ids and not al.ls_task_ids and not al.phase:
         key = "manual_classes_export_confirmed" if al.export_confirmed else "manual_classes_awaiting_confirm"
         parts.append(STATE_HINTS[key].format(classes=", ".join(al.manual_classes)))
 
@@ -51,4 +51,9 @@ def auto_labeling_hint_parts(state: WorkflowState) -> list[str]:
         parts.append(STATE_HINTS["workflow_complete"].format(labeled_dataset_name=state.labeled_dataset_name))
     if not al.phase and not al.auto_labeling_complete and (al.labeling_path or al.model_configured):
         parts.append(STATE_HINTS["reconfigurable_zone_a"].format(workflow_name=state.workflow_name))
+    # Without this the model treats a failed run as a dead end and offers only a restart.
+    if lr := state.failed_run():
+        parts.append(STATE_HINTS["last_run_failed"].format(
+            attempts=lr.attempts, error=lr.error,
+            log_note=f" Logs: {lr.log_path}." if lr.log_path else ""))
     return parts

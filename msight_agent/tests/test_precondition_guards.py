@@ -106,14 +106,14 @@ def test_can_export_to_cvat_with_predictions_passes_when_complete():
 # AutoLabelingState.can_import_from_cvat
 
 def test_can_import_from_cvat_blocks_when_no_task():
-    al = AutoLabelingState(cvat_task_id=0)
+    al = AutoLabelingState(cvat_task_ids=[])
     ok, msg = al.can_import_from_cvat()
     assert not ok
     assert msg
 
 
 def test_can_import_from_cvat_passes_when_task_exists():
-    al = AutoLabelingState(cvat_task_id=999)
+    al = AutoLabelingState(cvat_task_ids=[999])
     ok, msg = al.can_import_from_cvat()
     assert ok
     assert msg == ""

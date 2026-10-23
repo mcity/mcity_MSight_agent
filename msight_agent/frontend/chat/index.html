@@ -220,7 +220,7 @@ border-radius:10px;border:1px solid #1d273f;font-family: ui-monospace, SFMono-Re
   display: none;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 11px; color: #64748b;
-  max-height: 72px; overflow: hidden;
+  max-height: 72px; overflow-y: auto;
   white-space: pre-wrap; word-break: break-all;
   border-top: 1px solid var(--border); padding-top: 4px; margin-top: 6px;
 }
@@ -585,6 +585,7 @@ function updateStatusBubble(container, update) {
         _logLines.push(update.log);
         if (_logLines.length > MAX_LOG_LINES) _logLines.shift();
         logEl.textContent = _logLines.join("\n");
+        logEl.scrollTop = logEl.scrollHeight;
     }
 
     chatEl.scrollTop = chatEl.scrollHeight;
@@ -615,6 +616,9 @@ function parseSseChunk(buffer) {
 
 async function chatSend(content) {
     addMsg("user", content);
+
+    // Reset per turn so a previous tool's logs don't bleed into a new one.
+    _logLines = [];
 
     const statusContainer = createStatusBubble();
     chatEl.appendChild(statusContainer);
@@ -650,9 +654,8 @@ async function chatSend(content) {
                     convertStatusBubbleToIntro(statusContainer, data.message || "");
                 }
                 if (type === "status") {
-                    // Keep accumulated log lines while run_auto_labeling is active.
-                    const keepLog = _logLines.length > 0;
-                    updateStatusBubble(statusContainer, { status: data.message, keepLog });
+                    // Safe to always keep logs within a turn since they're reset above.
+                    updateStatusBubble(statusContainer, { status: data.message, keepLog: true });
                 }
                 if (type === "log")   updateStatusBubble(statusContainer, { log: data.line });
                 if (type === "raw_logs") addRawLogsBlock(data.service, data.text);
@@ -684,6 +687,14 @@ formEl.addEventListener("submit", (e) => {
     if (!val || sendBtn.disabled) return;
     inputEl.value = "";
     chatSend(val);
+});
+
+// Enter sends the message, Shift+Enter makes a new line
+inputEl.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" || e.shiftKey) return;
+    if (e.isComposing || e.keyCode === 229) return;  // ignore IME input
+    e.preventDefault();
+    formEl.requestSubmit();
 });
 
 // Ingestion functionality
@@ -723,6 +734,9 @@ document.getElementById('ingestForm').addEventListener('submit', async function(
 
         // Listen to SSE events
         const evtSource = new EventSource(`${INGEST_BASE}/ingest/stream/${jobId}`);
+
+        // The stream always ends with "done", even after a failure, so success must be proven.
+        let hadError = false;
 
         evtSource.onopen = () => {
             logsEl.textContent += `[INFO] Event stream connected\n`;
@@ -768,7 +782,9 @@ document.getElementById('ingestForm').addEventListener('submit', async function(
             }
         });
 
-        evtSource.addEventListener("error", (event) => {
+        // "ingest_error", not "error": EventSource uses "error" for its own transport failures.
+        evtSource.addEventListener("ingest_error", (event) => {
+            hadError = true;
             try {
                 const data = JSON.parse(event.data);
                 logsEl.textContent += `[ERROR] ${data.data.msg}\n`;
@@ -779,9 +795,22 @@ document.getElementById('ingestForm').addEventListener('submit', async function(
             }
         });
 
-        evtSource.addEventListener("done", () => {
-            statusEl.textContent = "✅ Ingestion complete";
-            logsEl.textContent += `[INFO] Ingestion completed successfully\n`;
+        evtSource.addEventListener("done", (event) => {
+            let ok = !hadError;
+            try {
+                const parsed = JSON.parse(event.data);
+                if (parsed && parsed.data && parsed.data.ok === false) ok = false;
+            } catch (e) {
+                /* Unparseable terminal event — fall back to the error flag. */
+            }
+
+            if (ok) {
+                statusEl.textContent = "✅ Ingestion complete";
+                logsEl.textContent += `[INFO] Ingestion completed successfully\n`;
+            } else {
+                statusEl.textContent = "❌ Ingestion failed";
+                logsEl.textContent += `[INFO] Ingestion failed — see the errors above\n`;
+            }
             logsEl.scrollTop = logsEl.scrollHeight;
             evtSource.close();
         });

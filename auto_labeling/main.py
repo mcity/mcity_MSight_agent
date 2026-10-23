@@ -237,6 +237,7 @@ class WorkflowExecutor:
             return False
 
         logging.info(f"Selected workflows: {self.workflows}")
+        failed_workflows: List[str] = []
         for workflow in self.workflows:
             logging.info(
                 f"Running workflow {workflow} for dataset {self.selected_dataset}"
@@ -463,10 +464,12 @@ class WorkflowExecutor:
                                 if "inference" in mode:
                                     logging.info(f"Running inference for RF-DETR model: {config}")
                                     fallback_hf_map = config_rfdetr.get("fallback_hf_repo", {})
+                                    fallback_file_map = config_rfdetr.get("fallback_hf_filename", {})
                                     rfdetr_inference_settings = {
                                         **config_autolabel["inference_settings"],
                                         "class_names": config_rfdetr.get("class_names"),
                                         "fallback_hf_repo": fallback_hf_map.get(config),
+                                        "fallback_hf_filename": fallback_file_map.get(config),
                                     }
                                     detector.inference(
                                         inference_settings=rfdetr_inference_settings
@@ -693,9 +696,16 @@ class WorkflowExecutor:
                 logging.info(f"Completed workflow {workflow} and cleaned up memory")
 
             except Exception as e:
-                logging.error(f"Workflow {workflow}: An error occurred: {e}")
+                # logging.exception keeps the traceback that logging.error dropped.
+                logging.exception(f"Workflow {workflow}: An error occurred: {e}")
+                failed_workflows.append(workflow)
                 wandb_close(exit_code=1)
                 #cleanup_memory()  # Clean up even after failure
+
+        # Later workflows still run after one fails, but the failure is reported.
+        if failed_workflows:
+            logging.error(f"Failed workflows: {failed_workflows}")
+            return False
 
         return True
 
@@ -706,6 +716,29 @@ def _run_msight_localization(dataset: fo.Dataset) -> None:
     WORKFLOWS["auto_labeling"], not WORKFLOW_STATE (main.py never reads that)."""
     import subprocess
     import importlib
+
+    al_config = WORKFLOWS.get("auto_labeling", {})
+    detection_field = al_config.get("localization_detection_field")
+    loc_maps_path = al_config.get("localization_locmap_path")
+    intrinsics_path = al_config.get("localization_intrinsics_path")
+
+    if not detection_field or not loc_maps_path or not intrinsics_path:
+        logging.error(
+            "MSight localization is enabled but missing one or more required config keys: "
+            "'localization_detection_field', 'localization_locmap_path', "
+            "'localization_intrinsics_path'. Skipping."
+        )
+        return
+
+    # No detections in this field (e.g. the run used a different model than the one
+    # configured): not an error, so skip before installing dependencies.
+    if detection_field not in dataset.get_field_schema():
+        logging.warning(
+            f"MSight localization skipped: dataset '{dataset.name}' has no field "
+            f"'{detection_field}'. Set localization_detection_field to a field of "
+            f"this dataset, or disable localization."
+        )
+        return
 
     try:
         importlib.import_module("msight_base")
@@ -730,19 +763,6 @@ def _run_msight_localization(dataset: fo.Dataset) -> None:
         )
     except ImportError as exc:
         logging.error(f"Could not import MSight localization modules: {exc}")
-        return
-
-    al_config = WORKFLOWS.get("auto_labeling", {})
-    detection_field = al_config.get("localization_detection_field")
-    loc_maps_path = al_config.get("localization_locmap_path")
-    intrinsics_path = al_config.get("localization_intrinsics_path")
-
-    if not detection_field or not loc_maps_path or not intrinsics_path:
-        logging.error(
-            "MSight localization is enabled but missing one or more required config keys: "
-            "'localization_detection_field', 'localization_locmap_path', "
-            "'localization_intrinsics_path'. Skipping."
-        )
         return
 
     msight_field = f"msight_{detection_field}"
@@ -789,7 +809,7 @@ def main():
             dataset=None,
             dataset_info=None,
         )
-        executor.execute()
+        workflows_ok = executor.execute()
 
         # FIX: Pull back outputs after ingestion
         dataset = executor.dataset
@@ -804,7 +824,7 @@ def main():
             dataset,
             dataset_info,
         )
-        executor.execute()
+        workflows_ok = executor.execute()
 
 
     if dataset is not None:
@@ -833,7 +853,12 @@ def main():
     time_stop = time.time()
     logging.info(f"Elapsed time: {time_stop - time_start:.2f} seconds")
 
+    return workflows_ok
+
 
 if __name__ == "__main__":
     cleanup_memory()
-    main()
+    # The agent decides success from main.py's exit code, so a caught workflow
+    # exception must not exit 0.
+    if not main():
+        sys.exit(1)

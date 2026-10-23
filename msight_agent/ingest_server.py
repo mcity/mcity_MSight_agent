@@ -81,12 +81,28 @@ async def ingest_stream(job_id: str):
     async def event_generator():
         # Optional SSE retry instruction for client reconnects
         yield "retry: 1000\n\n"
+        had_error = False
         while True:
             msg = await q.get()
             if msg is None:
-                yield "event: done\ndata: {}\n\n"
+                # The stream always ends here, even after a failure; ok carries the outcome.
+                payload = json.dumps({"type": "done", "data": {"ok": not had_error}})
+                yield f"event: done\ndata: {payload}\n\n"
                 break
-            yield f"event: log\ndata: {msg}\n\n"
+
+            # Forward each event under its own type (hardcoding "log" hid ingestion errors).
+            try:
+                parsed = json.loads(msg)
+            except ValueError:
+                parsed = None
+            ev_type = parsed.get("type", "log") if isinstance(parsed, dict) else "log"
+
+            if ev_type == "error":
+                had_error = True
+                # EventSource reports its own transport failures as "error"; keep them apart.
+                ev_type = "ingest_error"
+
+            yield f"event: {ev_type}\ndata: {msg}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 

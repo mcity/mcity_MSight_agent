@@ -114,7 +114,7 @@ def test_auto_labeling_tools_no_path_backend_confirmed_label_studio():
 def test_auto_labeling_tools_manual_cvat_no_classes_no_task():
     state = _al_state(
         labeling_path="manual", labeling_backend=LabelingBackend.CVAT,
-        manual_classes=[], cvat_task_id=0,
+        manual_classes=[], cvat_task_ids=[],
     )
     result = state.valid_tool_names()
     assert result == ALWAYS | {"set_selected_dataset", "export_to_cvat", "set_labeling_backend", "set_labeling_path"}
@@ -132,7 +132,7 @@ def test_auto_labeling_tools_manual_cvat_classes_set_export_not_confirmed():
 def test_auto_labeling_tools_manual_cvat_task_exported():
     state = _al_state(
         labeling_path="manual", labeling_backend=LabelingBackend.CVAT,
-        cvat_task_id=42,
+        cvat_task_ids=[42],
     )
     result = state.valid_tool_names()
     assert result == ALWAYS | {"import_from_cvat"}

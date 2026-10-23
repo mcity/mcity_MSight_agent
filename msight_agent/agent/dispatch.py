@@ -7,7 +7,7 @@ from msight_agent.agent.routing import (
     Sentinels, HardStop, Injection, FallThrough, ToolRouting, WRITE_TOOLS,
     format_reply, tool_status, unwrap_tool_output, TOOL_STATUS_MESSAGES,
 )
-from msight_agent.auto_labeling.handlers import AutoLabelingHandlers
+from msight_agent.auto_labeling.handlers import AutoLabelingHandlers, user_texts
 from msight_agent.msight.handlers import MsightPipelineHandlers
 from msight_agent.agent.state import (
     WorkflowState, AutoLabelingPhase, WORKFLOW_SPECS, validate_tool_input,
@@ -40,6 +40,7 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
             "max_grad_norm": 0.01,
         }
         self._progress_cb = None  # async (event_type: str, data: dict) -> None
+        self._user_texts: list[str] = []  # set by run(); read by the provenance guards
         # Lets Demo start inject a fallback intro if send_intro was skipped.
         self._intro_sent_this_turn = False
         # Any WRITE_TOOLS success this turn drops send_reply's source tag.
@@ -76,6 +77,7 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
         """Process all tool calls for one request. Reloads WorkflowState from config.py each call."""
         self.state = WorkflowState.load()
         self._progress_cb = progress_cb
+        self._user_texts = user_texts(messages)
 
         # Sync caches from WORKFLOWS so displayed values reflect prior-request changes.
         try:
@@ -323,8 +325,15 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
                     f"from scratch, confirm with them first, then call switch_workflow "
                     f"again with confirm_restart=true."
                 )
-                msg = result.split("SWITCH_LOCKED: ", 1)[1] if "SWITCH_LOCKED: " in result else result
-                return result, [HardStop(msg)]
+                # The reply becomes an assistant turn in the browser's history, so it must
+                # name no tool (it read as a standing order and fired turns later) and must
+                # not be a yes/no question (a bare "yes" would discard everything).
+                return result, [HardStop(
+                    f"The workflow is locked while the {action} is in progress, so I "
+                    f"cannot change its settings until the labels are imported. If you "
+                    f"would rather discard all progress and start over from scratch, "
+                    f"tell me and I will confirm with you first."
+                )]
 
             logging.warning(
                 f"[PIPELINE] switch_workflow full-reset: '{workflow_name}'"
@@ -335,7 +344,8 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
             return result, [await self._post_workflow_select_routing(workflow_name)]
 
         if fn_name == "switch_workflow":
-            self.state = WorkflowState()
+            # Keeps the conversation's history budget, like reset_for_workflow.
+            self.state = WorkflowState(turns_since_reset=self.state.turns_since_reset)
             self.state.save()
             result = unwrap_tool_output(await mcp_client.call_tool(fn_name, fn_args))
             return result, [await self._post_workflow_select_routing(workflow_name)]

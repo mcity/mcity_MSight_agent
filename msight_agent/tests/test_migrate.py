@@ -43,17 +43,17 @@ def test_migrate_top_level_cvat_task_id_lifted_to_subdict():
     }
     result = migrate(raw)
     assert "cvat_task_id" not in result
-    assert result["auto_labeling"]["cvat_task_id"] == 42
+    assert result["auto_labeling"]["cvat_task_ids"] == [42]
 
 
-def test_migrate_top_level_cvat_task_id_none_becomes_zero():
-    """Old shape could have cvat_task_id=None; _migrate converts to 0."""
+def test_migrate_top_level_cvat_task_id_none_becomes_empty_list():
+    """Old shape could have cvat_task_id=None; _migrate converts to []."""
     raw = {
         "workflow_name": "auto_labeling",
         "cvat_task_id": None,
     }
     result = migrate(raw)
-    assert result["auto_labeling"]["cvat_task_id"] == 0
+    assert result["auto_labeling"]["cvat_task_ids"] == []
 
 
 def test_migrate_top_level_auto_labeling_fields_dropped_for_non_auto_labeling_workflow():
@@ -81,6 +81,8 @@ def test_migrate_auto_labeling_subdict_gets_missing_defaults():
     }
     result = migrate(raw)
     al = result["auto_labeling"]
+    assert "cvat_task_id" not in al
+    assert al.get("cvat_task_ids") == []
     assert al.get("labeling_backend") == ""
     assert al.get("ls_task_ids") == []
     assert al.get("manual_classes") == []
@@ -118,7 +120,7 @@ def test_migrate_auto_labeling_subdict_preserves_existing_values():
     result = migrate(raw)
     al = result["auto_labeling"]
     assert al["auto_labeling_complete"] is True
-    assert al["cvat_task_id"] == 99
+    assert al["cvat_task_ids"] == [99]
     assert al["labeling_backend"] == "cvat"
     assert al["ls_task_ids"] == [1, 2]
     assert al["manual_classes"] == ["car"]
@@ -190,4 +192,4 @@ def test_migrate_result_is_valid_workflow_state_with_auto_labeling():
     assert state.workflow_name == "auto_labeling"
     assert state.auto_labeling is not None
     assert state.auto_labeling.auto_labeling_complete is True
-    assert state.auto_labeling.cvat_task_id == 7
+    assert state.auto_labeling.cvat_task_ids == [7]

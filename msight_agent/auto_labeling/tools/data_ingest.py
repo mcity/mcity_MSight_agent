@@ -146,6 +146,52 @@ async def _stream_subprocess(proc: asyncio.subprocess.Process, on_line):
             await on_line(source, line.decode("utf-8", errors="ignore"))
     await asyncio.gather(_reader(proc.stdout, "stdout"), _reader(proc.stderr, "stderr"))
 
+_SELECTED_WORKFLOW_RE = re.compile(r'^\s*SELECTED_WORKFLOW\s*=\s*\[.*?\]\s*$', re.MULTILINE)
+
+
+def _data_ingest_block_span(src: str) -> Optional[tuple[int, int]]:
+    """(start, end) of the WORKFLOWS["data_ingest"] dict literal, braces matched."""
+    start = src.find('"data_ingest": {')
+    if start == -1:
+        start = src.find("'data_ingest': {")
+    if start == -1:
+        return None
+    depth, i = 0, src.index("{", start)
+    for j in range(i, len(src)):
+        depth += {"{": 1, "}": -1}.get(src[j], 0)
+        if depth == 0:
+            return start, j + 1
+    return None
+
+
+def _restore_ingest_patch(original: str) -> None:
+    """Undo only what ingest patched (SELECTED_WORKFLOW and the data_ingest block).
+    Restoring the whole file would also undo anything the chat changed meanwhile,
+    e.g. a dataset selected while the upload was running."""
+    current = _read(CONFIG_PATH)
+    if m := _SELECTED_WORKFLOW_RE.search(original):
+        current = _SELECTED_WORKFLOW_RE.sub(lambda _: m.group(0).strip(), current, count=1)
+    orig_span, cur_span = _data_ingest_block_span(original), _data_ingest_block_span(current)
+    if orig_span and cur_span:
+        current = current[:cur_span[0]] + original[orig_span[0]:orig_span[1]] + current[cur_span[1]:]
+    _write(CONFIG_PATH, current)
+
+
+def _mark_ingested(dataset_name: str) -> None:
+    """Make the new dataset the selected one, in both the chat's session state and
+    SELECTED_DATASET (what main.py runs on) -- they must agree."""
+    from msight_agent.agent.state import WorkflowState
+    from msight_agent.agent.workflow_tools import write_selected_dataset
+    try:
+        write_selected_dataset(dataset_name)
+        state = WorkflowState.load()
+        state.dataset_name = dataset_name
+        state.dataset_confirmed = True
+        state.save()
+    except Exception as e:
+        logging.warning(f"[INGEST] Failed to select ingested dataset '{dataset_name}': {e}")
+
+
 # ---- CORE STREAMING IMPLEMENTATION ----
 async def _run_data_ingest_streaming_core(
     zip_path: Optional[str] = None,
@@ -214,11 +260,8 @@ async def _run_data_ingest_streaming_core(
         _write(log_path, "".join(combined_lines))
 
         try:
-            if backup_path.exists():
-                _write(CONFIG_PATH, _read(backup_path))
-                backup_path.unlink(missing_ok=True)
-            else:
-                logging.warning("[INGEST] Backup not found — config.py not restored")
+            _restore_ingest_patch(original)
+            backup_path.unlink(missing_ok=True)
         except Exception as restore_err:
             logging.warning(f"[INGEST] Failed to restore config.py: {restore_err}")
 
@@ -226,15 +269,8 @@ async def _run_data_ingest_streaming_core(
             ds_name = dataset_prefix or "custom_dataset"
 
         if final_rc == 0:
-            # Ingestion runs outside chat, so confirm the dataset here.
-            try:
-                from msight_agent.agent.state import WorkflowState
-                state = WorkflowState.load()
-                state.dataset_name = ds_name
-                state.dataset_confirmed = True
-                state.save()
-            except Exception as e:
-                logging.warning(f"[INGEST] Failed to mark dataset confirmed in WorkflowState: {e}")
+            # Ingestion runs outside chat, so select the dataset here.
+            _mark_ingested(ds_name)
 
             await _emit(emit, {
                 "type": "agent",
@@ -255,9 +291,10 @@ async def _run_data_ingest_streaming_core(
         await _emit(emit, {"type": "error", "data": {"msg": str(e)}})
         try:
             if backup_path.exists():
-                _write(CONFIG_PATH, _read(backup_path))
+                _restore_ingest_patch(_read(backup_path))
                 backup_path.unlink(missing_ok=True)
-        except Exception: pass
+        except Exception as restore_err:
+            logging.warning(f"[INGEST] Failed to restore config.py: {restore_err}")
     finally:
         if extracted_tmp and extracted_tmp.exists():
             shutil.rmtree(extracted_tmp, ignore_errors=True)
@@ -350,21 +387,11 @@ async def run_data_ingest_tool(
         if not name:
             name = dataset_prefix or "custom_dataset"
 
-        _write(CONFIG_PATH, original)
-        try:
-            backup_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        _restore_ingest_patch(original)
+        backup_path.unlink(missing_ok=True)
 
         if rc == 0:
-            try:
-                from msight_agent.agent.state import WorkflowState
-                state = WorkflowState.load()
-                state.dataset_name = name
-                state.dataset_confirmed = True
-                state.save()
-            except Exception as e:
-                logging.warning(f"[INGEST] Failed to mark dataset confirmed in WorkflowState: {e}")
+            _mark_ingested(name)
 
         tail = combined[-5000:] if len(combined) > 5000 else combined
         status = "ok" if rc == 0 else "error"
@@ -381,7 +408,7 @@ async def run_data_ingest_tool(
         logging.exception("run_data_ingest failed")
         try:
             if CONFIG_PATH.with_suffix(".py.bak").exists():
-                _write(CONFIG_PATH, _read(CONFIG_PATH.with_suffix(".py.bak")))
+                _restore_ingest_patch(_read(CONFIG_PATH.with_suffix(".py.bak")))
                 CONFIG_PATH.with_suffix(".py.bak").unlink(missing_ok=True)
         except Exception:
             pass
