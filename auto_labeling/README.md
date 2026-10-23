@@ -18,7 +18,6 @@ auto_labeling/
 ├── workflows/           # auto_labeling.py, data_ingest.py, keypoint models
 ├── utils/               # Dataset loading, logging, W&B helpers
 ├── localization/        # Offline lat/lon localization of detections (see localization/README.md)
-├── custom_models/       # Containerized external models (Co-DETR)
 ├── tests/               # Engine tests (run from this folder: pytest tests)
 ├── output/              # Trained models, exports, detections (gitignored)
 └── logs/                # Engine logs (gitignored)
