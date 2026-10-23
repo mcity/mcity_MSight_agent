@@ -11,7 +11,6 @@ from msight_agent.msight.runtime.paths import get_msight_path
 from msight_agent.agent.routing import (
     Sentinels, HardStop, Injection, FallThrough, ToolRouting, tool_status, unwrap_tool_output,
 )
-from msight_agent.shared.progress_relay import clear_active_progress_cb, set_active_progress_cb
 from msight_agent.agent.state import MsightPipelineState
 
 _PENDING_LABEL = "will start automatically once the pipeline starts"
@@ -67,6 +66,14 @@ class MsightPipelineHandlers:
 
     async def _handle_confirm_msight_run(self) -> tuple[str, list[ToolRouting]]:
         mp = self._msight_state()
+        # Only record consent for a summary the user actually saw; don't trust the tool filter.
+        if not mp.run_awaiting_confirmation:
+            logging.warning("[PIPELINE] confirm_run (msight_pipeline) BLOCKED — no summary is pending")
+            return Sentinels.CONFIRM_NOT_PENDING, [Injection(
+                "confirm_run was blocked: no pre-run summary is pending, so there is nothing for "
+                "the user to have approved. Do NOT call confirm_run again. Call "
+                "start_msight_pipeline to produce a fresh summary, and wait for the user to approve it."
+            )]
         mp.run_confirmed = True
         mp.run_awaiting_confirmation = False
         mp.run_confirmation_requested_at = 0.0
@@ -231,13 +238,7 @@ class MsightPipelineHandlers:
             await self._progress_cb("intro", {"message": self._fallback_demo_intro(mp)})
             self._intro_sent_this_turn = True
 
-        if self._progress_cb:
-            set_active_progress_cb(self._progress_cb)
-        try:
-            result = unwrap_tool_output(await mcp_client.call_tool("start_msight_pipeline", fn_args))
-        finally:
-            if self._progress_cb:
-                clear_active_progress_cb()
+        result = unwrap_tool_output(await self._call_tool_with_progress(mcp_client, "start_msight_pipeline", fn_args))
         mp.pipeline_running = tool_status(result) == "ok"
         # Reset regardless of outcome, so the next start asks for consent again.
         mp.run_confirmed = False
@@ -251,7 +252,7 @@ class MsightPipelineHandlers:
     async def _handle_stop_msight_pipeline(
         self, fn_args: dict, mcp_client
     ) -> tuple[str, list[ToolRouting]]:
-        """Clears pipeline_running on success"""
+        """Clears pipeline_running on success."""
         result = unwrap_tool_output(await mcp_client.call_tool("stop_msight_pipeline", fn_args))
         if tool_status(result) == "ok":
             mp = self._msight_state()

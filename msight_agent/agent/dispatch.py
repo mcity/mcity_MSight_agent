@@ -12,6 +12,7 @@ from msight_agent.msight.handlers import MsightPipelineHandlers
 from msight_agent.agent.state import (
     WorkflowState, AutoLabelingPhase, WORKFLOW_SPECS, validate_tool_input,
 )
+from msight_agent.shared.progress_relay import clear_active_progress_cb, set_active_progress_cb
 
 
 class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
@@ -52,13 +53,23 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
         error_sentinels: list[str],
         state_setter,
     ) -> "HardStop | None":
-        """Run `setter` and save state unless `result` contains an error sentinel (then HardStop)."""
+        """Run `state_setter` and save state unless `result` contains an error sentinel (then HardStop)."""
         if error_sentinels and any(s in result for s in error_sentinels):
             err = result.split(":", 1)[1].strip() if ":" in result else result
             return HardStop(err)
         state_setter()
         self.state.save()
         return None
+
+    async def _call_tool_with_progress(self, mcp_client, tool_name: str, args: dict):
+        """call_tool with the tool's ctx.log() lines relayed to this turn's stream."""
+        if self._progress_cb:
+            set_active_progress_cb(self._progress_cb)
+        try:
+            return await mcp_client.call_tool(tool_name, args)
+        finally:
+            if self._progress_cb:
+                clear_active_progress_cb()
 
     async def _emit_raw_logs(self, result: str, fn_args: dict, progress_cb) -> None:
         """Stream get_msight_logs output to the frontend verbatim before the summary."""
@@ -221,19 +232,13 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
             "confirm_export": lambda: self._handle_confirm_export(),
             "confirm_run": lambda: self._handle_confirm_run(),
             "select_msight_mode": lambda: self._handle_select_msight_mode(fn_args),
-            "select_workflow": lambda: self._handle_select_or_switch_workflow(
-                fn_name, fn_args, mcp_client, messages
-            ),
-            "switch_workflow": lambda: self._handle_select_or_switch_workflow(
-                fn_name, fn_args, mcp_client, messages
-            ),
+            "select_workflow": lambda: self._handle_select_or_switch_workflow(fn_name, fn_args, mcp_client),
+            "switch_workflow": lambda: self._handle_select_or_switch_workflow(fn_name, fn_args, mcp_client),
             "set_selected_dataset": lambda: self._handle_set_selected_dataset(fn_args, mcp_client),
             "list_model_sources_and_models": lambda: self._handle_list_model_sources_and_models(
                 fn_args, mcp_client
             ),
-            "configure_auto_labeling": lambda: self._handle_configure_auto_labeling_gated(
-                fn_args, mcp_client, messages
-            ),
+            "configure_auto_labeling": lambda: self._handle_configure_auto_labeling_gated(fn_args, mcp_client),
             "set_auto_labeling_hyperparams": lambda: self._handle_set_auto_labeling_hyperparams(
                 fn_args, mcp_client
             ),
@@ -263,7 +268,7 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
         return format_reply(fn_args.get("message", ""), source), [FallThrough()]
 
     async def _handle_select_or_switch_workflow(
-        self, fn_name: str, fn_args: dict, mcp_client, messages: list | None = None
+        self, fn_name: str, fn_args: dict, mcp_client
     ) -> tuple[str, list[ToolRouting]]:
         """Reset state for the target workflow, then call the MCP tool."""
         workflow_name = fn_args.get("workflow_name", "")
@@ -335,27 +340,19 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
                     f"tell me and I will confirm with you first."
                 )]
 
-            logging.warning(
-                f"[PIPELINE] switch_workflow full-reset: '{workflow_name}'"
-            )
+            logging.warning(f"[PIPELINE] switch_workflow full-reset: '{workflow_name}'")
+
+        if workflow_name:
             self.state = self.state.reset_for_workflow(workflow_name)
             self._maybe_reset_msight_calibration(workflow_name)
-            result = unwrap_tool_output(await mcp_client.call_tool(fn_name, fn_args))
-            return result, [await self._post_workflow_select_routing(workflow_name)]
-
-        if fn_name == "switch_workflow":
+        else:
             # Keeps the conversation's history budget, like reset_for_workflow.
             self.state = WorkflowState(turns_since_reset=self.state.turns_since_reset)
             self.state.save()
-            result = unwrap_tool_output(await mcp_client.call_tool(fn_name, fn_args))
-            return result, [await self._post_workflow_select_routing(workflow_name)]
-
-        self.state = self.state.reset_for_workflow(workflow_name)
-        self._maybe_reset_msight_calibration(workflow_name)
         result = unwrap_tool_output(await mcp_client.call_tool(fn_name, fn_args))
         return result, [await self._post_workflow_select_routing(workflow_name)]
 
-    async def _post_workflow_select_routing(self, workflow_name: str) -> "ToolRouting":
+    async def _post_workflow_select_routing(self, workflow_name: str) -> ToolRouting:
         """After workflow selection: list datasets if required, else fall through."""
         spec = WORKFLOW_SPECS.get(workflow_name)
         if spec and not spec.requires_dataset:

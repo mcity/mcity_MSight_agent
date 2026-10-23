@@ -1268,10 +1268,7 @@ class HuggingFaceObjectDetection:
                 ]
 
                 if not checkpoint_dirs:
-                    logging.error(
-                        f"No checkpoint directory found in {self.model_root}!"
-                    )
-                    model_path = None
+                    raise FileNotFoundError(f"No checkpoint directory found in {self.model_root}")
                 else:
                     # Sort by modification time (latest first)
                     checkpoint_dirs.sort(
@@ -1295,9 +1292,9 @@ class HuggingFaceObjectDetection:
                 image_processor = AutoProcessor.from_pretrained(model_path)
                 model = AutoModelForObjectDetection.from_pretrained(model_path)
             except Exception as e:
-                logging.error(
-                    f"Model {self.model_name} could not be loaded from folder {self.model_root}/{selected_checkpoint}. Inference not possible."
-                )
+                raise RuntimeError(
+                    f"Model {self.model_name} could not be loaded from {self.model_root}: {e}. Inference not possible."
+                ) from e
 
         device, _, _ = get_backend()
         logging.info(f"Using device {device} for inference.")

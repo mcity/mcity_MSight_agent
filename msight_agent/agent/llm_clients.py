@@ -287,7 +287,7 @@ class ClaudeClient(BaseLLMClient):
         return result
 
     @staticmethod
-    def _to_anthropic_messages(openai_messages: list) -> tuple[str, list]:
+    def _to_anthropic_messages(openai_messages: list) -> tuple[list[str], list]:
         """Convert OpenAI-format messages to Anthropic format (system list + messages list)."""
         system_parts: list[str] = []
         result: list[dict] = []
@@ -372,6 +372,7 @@ class ClaudeClient(BaseLLMClient):
                 tool_calls.append(_FakeToolCall(id=block.id, name=block.name, arguments=json.dumps(block.input)))
 
         return _FakeMessage(content="".join(text_parts) or None, tool_calls=tool_calls)
+
 
 PROVIDERS = {"openai": OpenAIClient, "groq": GroqClient, "gemini": GeminiClient, "claude": ClaudeClient}
 _PROVIDER_KEY_ENV = {"openai": "OPENAI_API_KEY", "claude": "ANTHROPIC_API_KEY",

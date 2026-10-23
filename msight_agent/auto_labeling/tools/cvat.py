@@ -246,14 +246,14 @@ async def export_to_cvat(
         label_field = None
         classes = list(classes) if classes else []
         if with_predictions:
-            pred_fields = [f for f in schema.keys() if f.startswith("pred_od_")]
+            pred_fields = [f for f in schema if f.startswith("pred_od_")]
             # Prediction field may not be in MongoDB yet; poll for it.
             if not pred_fields:
-                for attempt in range(10):
-                    time.sleep(2)
+                for _ in range(10):
+                    await asyncio.sleep(2)
                     dataset.reload()
                     schema = dataset.get_field_schema()
-                    pred_fields = [f for f in schema.keys() if f.startswith("pred_od_")]
+                    pred_fields = [f for f in schema if f.startswith("pred_od_")]
                     if pred_fields:
                         image_paths = [sample.filepath for sample in dataset]
                         break
@@ -552,13 +552,12 @@ async def import_from_cvat(dataset_name: str, ctx: Context = None) -> str:
 
         final_dataset.persistent = True
 
-        for attempt in range(5):
-            existing = fo.list_datasets()
-            if labeled_name in existing:
+        for _ in range(5):
+            if labeled_name in fo.list_datasets():
                 verify = fo.load_dataset(labeled_name)
                 if len(verify) > 0:
                     break
-            time.sleep(2)
+            await asyncio.sleep(2)
         else:
             return (
                 f"Import appeared to succeed but dataset '{labeled_name}' "

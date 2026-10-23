@@ -5,21 +5,20 @@ about node types or topics. Extra backends can be registered via the
 "msight_agent.executors" entry-point group.
 """
 import asyncio
-import importlib.metadata as metadata
 import os
 import shlex
 import shutil
 import signal
 import time
+from importlib import metadata
 from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable
 
 from msight_agent.msight.runtime.utils import run_cmd
+from msight_agent.shared.paths import NODE_LOG_DIR
 
 ENTRY_POINT_GROUP = "msight_agent.executors"
 DEFAULT_BACKEND = "supervisor"
-
-from msight_agent.shared.paths import NODE_LOG_DIR as LOG_DIR
 _STARTUP_GRACE_SECONDS = 0.5
 
 CPU_IMAGE_TAG = "msight-vision-cpu-local"
@@ -184,7 +183,7 @@ class SupervisorHandle(ExecutorHandle):
 
 
 def _pid_path(name: str) -> Path:
-    return LOG_DIR / f"{name}.pid"
+    return NODE_LOG_DIR / f"{name}.pid"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -226,8 +225,8 @@ class SupervisorExecutor:
         if running is not None and running.returncode is None:
             return SupervisorHandle(name, process=running)
 
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        log_path = LOG_DIR / f"{name}.log"
+        NODE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = NODE_LOG_DIR / f"{name}.log"
         with open(log_path, "wb") as log_file:
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdout=log_file, stderr=asyncio.subprocess.STDOUT,
@@ -268,7 +267,7 @@ class SupervisorExecutor:
         _pid_path(handle.name).unlink(missing_ok=True)
 
     async def logs(self, handle: SupervisorHandle, tail: int = 200) -> str:
-        log_path = LOG_DIR / f"{handle.name}.log"
+        log_path = NODE_LOG_DIR / f"{handle.name}.log"
         if not log_path.is_file():
             return ""
         return "\n".join(log_path.read_text(errors="replace").splitlines()[-tail:])

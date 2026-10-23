@@ -33,7 +33,7 @@ dataset uploads ──► ingest server (8002)                                  
 | `chat_server` | 8001 | Runs the agent: builds the prompt and live state hint, calls the LLM, executes its tool calls, streams replies. Also serves calibration/video uploads and recording downloads. |
 | `ingest_server` | 8002 | Dataset uploads for auto-labeling. |
 | `msight_api` | 8003 | REST API + built dashboard. Calls the same MCP tools as the chat. |
-| `client_chat` | 5225 | Serves the chat web page. |
+| `client_chat` | 5225 | Serves the chat web page (without `--ui`: a terminal chat against the same server). |
 
 The LLM is your choice: OpenAI, Anthropic Claude, Google Gemini or Groq.
 

@@ -19,15 +19,6 @@ def test_filter_tools_none_state_returns_all_tools():
     assert result == ALL_TOOLS
 
 
-# valid_tool_names() returns None → fails open (all tools)
-
-def test_filter_tools_valid_tool_names_returns_none_returns_all_tools():
-    state = MagicMock()
-    state.valid_tool_names.return_value = None
-    result = filter_tools_for_state(ALL_TOOLS, state)
-    assert result == ALL_TOOLS
-
-
 # valid_tool_names() raises → fails open (all tools)
 
 def test_filter_tools_valid_tool_names_raises_returns_all_tools():

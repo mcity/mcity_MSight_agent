@@ -5,7 +5,6 @@ import json
 import logging
 from contextlib import asynccontextmanager
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -23,8 +22,6 @@ from msight_agent.agent.tool_schema import tools
 from msight_agent.msight import routes as msight_routes
 from msight_agent.shared.mcp_connection import mcp_session
 from msight_agent.shared.progress_relay import get_active_progress_cb
-
-load_dotenv()
 
 MAX_HISTORY_TURNS = 4
 # Keyword check for the default workflow; anything else defaults to msight_pipeline.

@@ -66,9 +66,8 @@ def web_port_from_cmd(cmd: str) -> Optional[int]:
     parts = cmd.split()
     for spec in NODE_CATALOG.values():
         if spec.web_port and spec.binary in parts:
-            if "--port" in parts and parts.index("--port") + 1 < len(parts):
-                return int(parts[parts.index("--port") + 1])
-            return spec.web_port
+            i = parts.index("--port") + 1 if "--port" in parts else len(parts)
+            return int(parts[i]) if i < len(parts) and parts[i].isdigit() else spec.web_port
     return None
 
 

@@ -213,34 +213,6 @@ def resolve_pretrained_checkpoint(config: Dict) -> Optional[str]:
         )
 
 
-    # List all .pth files for debugging
-    all_checkpoints = list(work_path.glob("*.pth"))
-    log.info("  Found %d .pth files in %s", len(all_checkpoints), work_dir)
-    for ckpt in all_checkpoints[:5]:  # Show first 5
-        log.info("    - %s", ckpt.name)
-
-    # Look for best checkpoint with metrics
-    best_checkpoints = sorted(work_path.glob("best_coco_AP_epoch_*.pth"))
-    if best_checkpoints:
-        log.info("  Using best checkpoint: %s", best_checkpoints[-1].name)
-        return str(best_checkpoints[-1])
-
-    # Look for epoch checkpoints (when validation is disabled)
-    epoch_checkpoints = sorted(work_path.glob("epoch_*.pth"))
-    if epoch_checkpoints:
-        log.info("  Using latest epoch checkpoint: %s", epoch_checkpoints[-1].name)
-        return str(epoch_checkpoints[-1])
-
-    # Look for last checkpoint
-    last_checkpoint = work_path / "last.pth"
-    if last_checkpoint.exists():
-        log.info("  Using last checkpoint: last.pth")
-        return str(last_checkpoint)
-
-    log.warning("  No checkpoints found (looked for: best_coco_AP_epoch_*.pth, epoch_*.pth, last.pth)")
-    return None
-
-
 def resolve_checkpoint_path(config: Dict) -> Optional[str]:
     """
     Resolve checkpoint path based on configuration.

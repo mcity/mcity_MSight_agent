@@ -1,7 +1,7 @@
 """Routing/sentinel primitives shared by ChatPipeline and its handler mixins (avoids a circular import)."""
 import json
 import re
-from dataclasses import dataclass as _dc
+from dataclasses import dataclass
 
 
 # Human-readable status emitted to the UI before each tool call.
@@ -22,16 +22,16 @@ TOOL_STATUS_MESSAGES: dict[str, str] = {
     "get_labeling_backend":                  "Detecting annotation backend...",
     "set_labeling_backend":                  "Configuring annotation backend...",
     "set_labeling_path":                     "Setting labeling path...",
-    "confirm_export":                         "Recording export consent...",
-    "confirm_run":                            "Recording run consent...",
-    "reset_workflow_state":                   "Resetting workflow state...",
+    "confirm_export":                        "Recording export consent...",
+    "confirm_run":                           "Recording run consent...",
+    "reset_workflow_state":                  "Resetting workflow state...",
     "launch_voxel51_session":                "Launching Voxel51 visualization...",
     "diagnose_msight_pipeline":              "Diagnosing pipeline — sampling live data flow (~5-10s)...",
     "inspect_host":                          "Inspecting the host...",
 }
 
 # Strip ANSI escape codes and bare CR from subprocess output.
-_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]|\r')
+ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]|\r')
 
 # Tools that change live state; a success suppresses send_reply's source tag
 # and counts as real progress when the iteration budget runs out.
@@ -87,26 +87,25 @@ def format_reply(message: str, source: str | None) -> str:
     return message
 
 
-# _handle_* returns (raw_str, list[ToolRouting]); _orchestrate applies all
-# Injections, then the last HardStop wins.
+# Handlers return (raw_str, list[ToolRouting]); ChatPipeline._orchestrate applies
+# all Injections, then the last HardStop wins.
 
 
-@_dc
+@dataclass
 class Injection:
     """Inject a system context message; the agentic loop continues."""
     message: str
 
 
-@_dc
+@dataclass
 class HardStop:
     """Return this reply directly to the user; the agentic loop ends."""
     reply: str
 
 
-@_dc
+@dataclass
 class FallThrough:
     """No pipeline reply; let the final LLM pass summarize the tool result."""
-    pass
 
 
 ToolRouting = Injection | HardStop | FallThrough

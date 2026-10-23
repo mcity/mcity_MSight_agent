@@ -11,10 +11,10 @@ from PIL import Image
 import fiftyone as fo
 import yaml
 from fiftyone.utils.huggingface import load_from_hub
-from nuscenes.nuscenes import NuScenes
 
 from config.config import ACCEPTED_SPLITS, GLOBAL_SEED, NUM_WORKERS, PERSISTENT
-from utils.custom_view import max_detections, subset_splits, vru_mcity_fisheye
+# Custom views are looked up by name via globals() in load_dataset.
+from utils.custom_view import max_detections, subset_splits, vru_mcity_fisheye  # noqa: F401
 from utils.sample_field_operations import rename_sample_field
 
 
@@ -38,6 +38,11 @@ def load_dataset(selected_dataset: str, n_iteration=0) -> fo.Dataset:
 
     if dataset_info:
         loader_function = dataset_info.get("loader_fct")
+        if loader_function not in globals():
+            raise ValueError(
+                f"Dataset '{selected_dataset['name']}' names loader '{loader_function}' in "
+                f"datasets.yaml, but utils/dataset_loader.py has no such function."
+            )
         dataset = globals()[loader_function](dataset_info)
         n_samples_original = len(dataset)
         n_samples_requested = selected_dataset["n_samples"]
@@ -226,7 +231,7 @@ def _align_ground_truth(dataset, gt_field="ground_truth"):
 
 def _post_process_dataset(dataset):
     """Post-processes the dataset by setting persistence, computing metadata, aligning splits, and aligning ground truth."""
-    logging.info(f"Running dataset post-processing.")
+    logging.info("Running dataset post-processing.")
     # Set persistance
     # https://docs.voxel51.com/user_guide/using_datasets.html#dataset-persistence
     dataset.persistent = PERSISTENT
@@ -235,12 +240,27 @@ def _post_process_dataset(dataset):
     dataset.compute_metadata(num_workers=NUM_WORKERS, overwrite=False, progress=True)
 
     # Align split names
-    splits = _align_splits(dataset)
+    _align_splits(dataset)
 
     # Align ground truth field
     _align_ground_truth(dataset)
 
     return dataset
+
+
+def _hf_token():
+    """HF_TOKEN from the environment (the repo's .env), else from a legacy .secret file."""
+    if token := os.environ.get("HF_TOKEN", "").strip():
+        return token
+    try:
+        with open(".secret", "r") as f:
+            for line in f:
+                if line.startswith("HF_TOKEN="):
+                    return line.split("=", 1)[1].strip()
+    except FileNotFoundError:
+        pass
+    logging.warning("No HF_TOKEN in the environment or .secret; only public Hugging Face datasets will load.")
+    return None
 
 
 def load_dataset_info(dataset_name, config_path=_DEFAULT_DATASETS_YAML):
@@ -290,24 +310,7 @@ def load_mcity_fisheye_2000(dataset_info):
         dataset = fo.load_dataset(dataset_name)
         logging.info("Existing dataset " + dataset_name + " was loaded.")
     elif hf_dataset_name is not None:
-        # Read API key for HF access
-        hf_token = None
-        try:
-            with open(".secret", "r") as f:
-                for line in f:
-                    if line.startswith("HF_TOKEN="):
-                        hf_token = line.split("=")[1].strip()
-        except FileNotFoundError:
-            logging.error(
-                "'.secret' file not found. Please create it to load private datasets."
-            )
-            hf_token = None
-
-        if hf_token is None:
-            logging.error(
-                "Provide your Hugging Face 'HF_TOKEN' in the .secret file to load private datasets."
-            )
-        dataset = load_from_hub(hf_dataset_name, name=dataset_name, token=hf_token)
+        dataset = load_from_hub(hf_dataset_name, name=dataset_name, token=_hf_token())
         _post_process_dataset(dataset)
     else:
         dataset = fo.Dataset(dataset_name)
@@ -340,24 +343,7 @@ def load_dataset_from_hf_hub(dataset_info):
         dataset = fo.load_dataset(dataset_name)
         logging.info("Existing dataset " + dataset_name + " was loaded.")
     else:
-        # Read API key for HF access
-        hf_token = None
-        try:
-            with open(".secret", "r") as f:
-                for line in f:
-                    if line.startswith("HF_TOKEN="):
-                        hf_token = line.split("=")[1].strip()
-        except FileNotFoundError:
-            logging.error(
-                "'.secret' file not found. Please create it to load private datasets."
-            )
-            hf_token = None
-
-        if hf_token is None:
-            logging.error(
-                "Provide your Hugging Face 'HF_TOKEN' in the .secret file to load private datasets."
-            )
-        dataset = load_from_hub(hf_dataset_name, name=dataset_name, token=hf_token)
+        dataset = load_from_hub(hf_dataset_name, name=dataset_name, token=_hf_token())
         _post_process_dataset(dataset)
 
     return dataset
@@ -527,25 +513,13 @@ def load_custom_dataset(dataset_info=None):
 
 
 def load_mars_multiagent(dataset_info):
-    """Load the MARS multi-agent dataset from Hugging Face."""
-    hugging_face_id = "ai4ce/MARS/Multiagent_53scene"
-
-    dataset = None  # TODO Implement loading
-    _post_process_dataset(dataset)
-
-    return dataset
+    """MARS multi-agent (ai4ce/MARS/Multiagent_53scene): loading is not implemented yet."""
+    raise NotImplementedError("Loading the MARS multi-agent dataset is not implemented yet.")
 
 
 def load_mars_multitraversal(dataset_info):
-    """Loads and post-processes multi-traversal MARS dataset from specified location."""
-    location = 10
-    data_root = "./datasets/MARS/Multitraversal_2023_10_04-2024_03_08"
-    nusc = NuScenes(version="v1.0", dataroot=f"data_root/{location}", verbose=True)
-
-    dataset = None  # TODO Implement loading
-    _post_process_dataset(dataset)
-
-    return dataset
+    """MARS multi-traversal (./datasets/MARS/...): loading is not implemented yet."""
+    raise NotImplementedError("Loading the MARS multi-traversal dataset is not implemented yet.")
 
 def load_sunrgbd(dataset_info):
     dataset_name = dataset_info["name"]

@@ -1,4 +1,7 @@
+"""Chat client: `--ui` serves the web chat (port 5225); without it, a terminal chat
+against the same /chat/stream endpoint."""
 import argparse
+import json
 import os
 import threading
 import time
@@ -7,31 +10,39 @@ from http.server import SimpleHTTPRequestHandler
 from socketserver import TCPServer
 
 import requests
-from dotenv import load_dotenv
 
 from msight_agent.shared.host_utils import resolve_host
 
-load_dotenv()
-
 host = resolve_host()
-API_URL = f"http://{host}:8001/chat"
-history = []
+STREAM_URL = f"http://{host}:8001/chat/stream"
+history: list[list[str]] = []
 
 
 # Terminal mode
 
 def send_message(message: str) -> str:
-    global history
+    """Send one turn and return the agent's reply, printing status lines as they stream."""
     payload = {"message": message, "history": history}
-    res = requests.post(API_URL, json=payload)
-    res.raise_for_status()
-    reply = res.json().get("reply", "")
+    reply, event = "", ""
+    with requests.post(STREAM_URL, json=payload, stream=True, timeout=(10, None)) as res:
+        res.raise_for_status()
+        for line in res.iter_lines(decode_unicode=True):
+            if line.startswith("event: "):
+                event = line[len("event: "):]
+            elif line.startswith("data: "):
+                data = json.loads(line[len("data: "):])
+                if event == "status":
+                    print(f"  … {data.get('message', '')}")
+                elif event == "intro":
+                    print(f"Agent: {data.get('message', '')}")
+                elif event in ("reply", "error"):
+                    reply = data.get("message", "")
     history.append([message, reply])
     return reply
 
 
 def run_terminal():
-    print("MCity AI Agent is ready! Type 'exit' to quit.\n")
+    print("MSight Agent is ready! Type 'exit' to quit.\n")
     while True:
         try:
             user_input = input("User: ")
@@ -79,7 +90,6 @@ def run_ui():
     webbrowser.open(url)
     print(f"[UI] Opened {url}. Press Ctrl+C to stop.")
     t.join()
-
 
 
 # Entry point

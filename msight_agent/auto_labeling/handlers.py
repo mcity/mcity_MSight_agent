@@ -5,16 +5,17 @@ import logging
 import os
 import re
 import sys
-from pathlib import Path
 from typing import Optional
 
-from msight_agent.shared.paths import ANNOTATION_TASKS_DIR, LOG_DIR, MAIN_PATH
-from msight_agent.shared.progress_relay import clear_active_progress_cb, set_active_progress_cb
 from msight_agent.agent.routing import (
     Sentinels, HardStop, Injection, FallThrough, ToolRouting,
-    unwrap_tool_output, _ANSI_RE,
+    unwrap_tool_output, ANSI_RE,
 )
-from msight_agent.agent.state import AutoLabelingState, config_selected_dataset, LabelingBackend, AutoLabelingPhase, LabelingPath
+from msight_agent.agent.state import (
+    AutoLabelingState, AutoLabelingPhase, LabelingBackend, LabelingPath, config_selected_dataset,
+)
+from msight_agent.auto_labeling.tools.labeling import summarize_run, write_run_log
+from msight_agent.shared.paths import ANNOTATION_TASKS_DIR, MAIN_PATH
 
 
 # Run tools report failure as "... failed with exit code N", so one without the
@@ -129,18 +130,50 @@ def _parse_cvat_task_ids(text: str) -> list[int]:
     return [int(x.strip()) for x in ids_part.split(",") if x.strip()]
 
 
+def _backend_label(backend: str) -> str:
+    return "Label Studio" if backend == LabelingBackend.LABEL_STUDIO else "CVAT"
+
+
+def _export_tool(backend: str) -> str:
+    return "export_to_label_studio" if backend == LabelingBackend.LABEL_STUDIO else "export_to_cvat"
+
+
+def _detect_backend_from_env() -> tuple[bool, bool, str]:
+    """(cvat token set, LS token set, active backend). Presence only; validity is checked at export."""
+    cvat_ok = bool(os.getenv("CVAT_ACCESS_TOKEN", "").strip())
+    ls_ok   = bool(os.getenv("LS_TOKEN", "").strip())
+    if cvat_ok and ls_ok:
+        active = LabelingBackend.BOTH
+    elif ls_ok:
+        active = LabelingBackend.LABEL_STUDIO
+    elif cvat_ok:
+        active = LabelingBackend.CVAT
+    else:
+        active = LabelingBackend.NONE
+    return cvat_ok, ls_ok, active
+
+
+def _ls_task_ids_from_registry(dataset_name: str) -> list[int]:
+    """Task ids export_to_label_studio recorded for `dataset_name` ([] if none or unreadable)."""
+    tasks_file = ANNOTATION_TASKS_DIR / "ls_tasks.json"
+    try:
+        registry = json.loads(tasks_file.read_text()) if tasks_file.exists() else {}
+    except (OSError, ValueError) as e:
+        logging.warning(f"[PIPELINE] Could not read {tasks_file}: {e}")
+        return []
+    return registry.get(dataset_name, {}).get("task_ids", [])
+
+
 class AutoLabelingHandlers:
     """Mixin: all auto_labeling-workflow tool handlers. See agent/dispatch.py's ChatPipeline."""
 
-    async def _call_tool_with_progress(self, mcp_client, tool_name: str, args: dict):
-        """call_tool with the tool's ctx.log() lines relayed to this turn's stream."""
-        if self._progress_cb:
-            set_active_progress_cb(self._progress_cb)
-        try:
-            return await mcp_client.call_tool(tool_name, args)
-        finally:
-            if self._progress_cb:
-                clear_active_progress_cb()
+    def _store_backend(self, backend: str) -> None:
+        """Persist a detected/chosen backend (BOTH is a sentinel the state hint routes on)."""
+        if backend in (LabelingBackend.CVAT, LabelingBackend.LABEL_STUDIO, LabelingBackend.BOTH):
+            if self.state.auto_labeling is None:
+                self.state.auto_labeling = AutoLabelingState()
+            self.state.auto_labeling.labeling_backend = backend
+            self.state.save()
 
     def _handle_run_failure(self, result: str) -> str:
         """Record a failed run and build the reply. No completion flag is set and no
@@ -247,7 +280,7 @@ class AutoLabelingHandlers:
         effective_backend = (al.labeling_backend if al else "") or initial_backend
 
         if path_was_preserved and al and al.labeling_path:
-            backend_label = "Label Studio" if effective_backend == LabelingBackend.LABEL_STUDIO else "CVAT"
+            backend_label = _backend_label(effective_backend)
             model_info = (
                 f" Model '{al.model_name}' ({al.model_source}) is still configured."
                 if al.model_configured else ""
@@ -265,7 +298,7 @@ class AutoLabelingHandlers:
             )]
 
         if effective_backend:
-            backend_label = "Label Studio" if effective_backend == LabelingBackend.LABEL_STUDIO else "CVAT"
+            backend_label = _backend_label(effective_backend)
             dataset_note = (
                 f"Switched to **{dataset_name}** (backend preserved: {backend_label})."
                 if was_dataset_switch
@@ -283,10 +316,7 @@ class AutoLabelingHandlers:
             )
             return tool_output, self._routing_for_backend(backend_info)
 
-        backend_info = await self._auto_detect_backend(mcp_client)
-        if backend_info:
-            return tool_output, self._routing_for_backend(backend_info)
-        return tool_output, [Injection(f"DATASET_CONFIRMED: {dataset_name}")]
+        return tool_output, self._routing_for_backend(self._auto_detect_backend())
 
     async def _handle_set_selected_dataset(
         self, fn_args: dict, mcp_client
@@ -339,31 +369,15 @@ class AutoLabelingHandlers:
         """Detect the active backend and return routing for the LABELING_BACKEND gate."""
         result = unwrap_tool_output(await mcp_client.call_tool("get_labeling_backend", fn_args))
         # Read env vars directly — unwrap_tool_output may return a Python repr, not valid JSON.
-        try:
-            cvat_ok = bool(os.getenv("CVAT_ACCESS_TOKEN", "").strip())
-            ls_ok   = bool(os.getenv("LS_TOKEN", "").strip())
-            if cvat_ok and ls_ok:
-                active = LabelingBackend.BOTH
-            elif ls_ok:
-                active = LabelingBackend.LABEL_STUDIO
-            elif cvat_ok:
-                active = LabelingBackend.CVAT
-            else:
-                active = LabelingBackend.NONE
-            if active in (LabelingBackend.CVAT, LabelingBackend.LABEL_STUDIO, LabelingBackend.BOTH):
-                if self.state.auto_labeling is None:
-                    self.state.auto_labeling = AutoLabelingState()
-                self.state.auto_labeling.labeling_backend = active
-                self.state.save()
-            backend_info = {
-                "cvat_available": cvat_ok,
-                "ls_available":   ls_ok,
-                "active_backend": active,
-                "message":        f"Backend detected: {active}.",
-            }
-            return result, self._routing_for_backend(backend_info)
-        except Exception:
-            return result, [FallThrough()]
+        cvat_ok, ls_ok, active = _detect_backend_from_env()
+        self._store_backend(active)
+        backend_info = {
+            "cvat_available": cvat_ok,
+            "ls_available":   ls_ok,
+            "active_backend": active,
+            "message":        f"Backend detected: {active}.",
+        }
+        return result, self._routing_for_backend(backend_info)
 
     async def _handle_list_model_sources_and_models(
         self, fn_args: dict, mcp_client
@@ -391,53 +405,27 @@ class AutoLabelingHandlers:
         self.state.save()
         return result, [HardStop(self._format_model_list(result))]
 
-    async def _auto_detect_backend(self, mcp_client) -> dict | None:
-        """Detect the labeling backend from env vars (token presence only; validity checked at export)."""
-        try:
-            cvat_ok = bool(os.getenv("CVAT_ACCESS_TOKEN", "").strip())
-            ls_ok   = bool(os.getenv("LS_TOKEN", "").strip())
+    _DETECTED_BACKEND_MESSAGES = {
+        # BOTH doesn't pre-select a backend — the LLM must ask the user to choose.
+        LabelingBackend.BOTH: "Both CVAT and Label Studio credentials are configured. "
+                              "Which would you prefer to use?",
+        LabelingBackend.LABEL_STUDIO: "Label Studio credentials found. Using Label Studio for annotation.",
+        LabelingBackend.CVAT: "CVAT credentials found. Using CVAT for annotation.",
+        LabelingBackend.NONE: "No annotation backend credentials found in .env. "
+                              "Please add CVAT_ACCESS_TOKEN or LS_TOKEN before continuing.",
+    }
 
-            if cvat_ok and ls_ok:
-                # Do not pre-set a backend — the LLM must ask the user to choose.
-                active  = LabelingBackend.BOTH
-                message = (
-                    "Both CVAT and Label Studio credentials are configured. "
-                    "Which would you prefer to use?"
-                )
-            elif ls_ok:
-                active  = LabelingBackend.LABEL_STUDIO
-                message = "Label Studio credentials found. Using Label Studio for annotation."
-            elif cvat_ok:
-                active  = LabelingBackend.CVAT
-                message = "CVAT credentials found. Using CVAT for annotation."
-            else:
-                active  = LabelingBackend.NONE
-                message = (
-                    "No annotation backend credentials found in .env. "
-                    "Please add CVAT_ACCESS_TOKEN or LS_TOKEN before continuing."
-                )
-
-            backend_info = {
-                "cvat_available": cvat_ok,
-                "ls_available":   ls_ok,
-                "active_backend": active,
-                "message":        message,
-            }
-
-            # BOTH is a sentinel so the state hint routes to set_labeling_backend next.
-            if active in (LabelingBackend.CVAT, LabelingBackend.LABEL_STUDIO, LabelingBackend.BOTH):
-                if self.state.auto_labeling is None:
-                    self.state.auto_labeling = AutoLabelingState()
-                self.state.auto_labeling.labeling_backend = active
-                self.state.save()
-                logging.warning(f"[PIPELINE] Backend auto-detected and written to state: {active}")
-            else:
-                logging.warning(f"[PIPELINE] Backend detection: {active} — not writing to state")
-
-            return backend_info
-        except Exception as e:
-            logging.warning(f"[PIPELINE] _auto_detect_backend failed: {e}")
-            return None
+    def _auto_detect_backend(self) -> dict:
+        """Detect the labeling backend from env vars and store it in state."""
+        cvat_ok, ls_ok, active = _detect_backend_from_env()
+        self._store_backend(active)
+        logging.warning(f"[PIPELINE] Backend auto-detected: {active}")
+        return {
+            "cvat_available": cvat_ok,
+            "ls_available":   ls_ok,
+            "active_backend": active,
+            "message":        self._DETECTED_BACKEND_MESSAGES[active],
+        }
 
     def _routing_for_backend(self, backend_info: dict) -> list[ToolRouting]:
         """Translate backend detection result into routing items."""
@@ -458,7 +446,7 @@ class AutoLabelingHandlers:
             return [Injection(f"LABELING_BACKEND: {active}. {msg_text} {instruction}")]
 
         al = self.state.auto_labeling
-        backend_label = "Label Studio" if active == LabelingBackend.LABEL_STUDIO else "CVAT"
+        backend_label = _backend_label(active)
 
         if al and al.labeling_path:
             path_label = (
@@ -477,11 +465,7 @@ class AutoLabelingHandlers:
                         f"Let me know when you would like to proceed with "
                         f"exporting to {backend_label}."
                     )]
-                fn_export = (
-                    "export_to_label_studio"
-                    if active == LabelingBackend.LABEL_STUDIO
-                    else "export_to_cvat"
-                )
+                fn_export = _export_tool(active)
                 dataset = self.state.dataset_name or "?"
                 return [Injection(
                     f"BACKEND_SWITCHED: annotation backend is now {backend_label}. "
@@ -554,7 +538,7 @@ class AutoLabelingHandlers:
             al.run_confirmed = False
             al.run_awaiting_confirmation = False
 
-        stop = self._set_flag_if_ok(result, ["Invalid model"], _set_model_configured)
+        stop = self._set_flag_if_ok(result, ["Invalid model", "Config not written"], _set_model_configured)
         if stop:
             return result, [stop]
         model_name   = al.model_name or "?"
@@ -639,7 +623,7 @@ class AutoLabelingHandlers:
         classes      = self.state.auto_labeling.manual_classes or []
         classes_repr = "[" + ", ".join(repr(c) for c in classes) + "]"
         dataset      = self.state.dataset_name or "?"
-        fn           = "export_to_label_studio" if backend == LabelingBackend.LABEL_STUDIO else "export_to_cvat"
+        fn           = _export_tool(backend)
         logging.warning(
             f"[PIPELINE] confirm_export: export_confirmed=True "
             f"dataset={dataset!r} backend={backend!r} classes={classes}"
@@ -659,8 +643,7 @@ class AutoLabelingHandlers:
         dataset  = self.state.dataset_name or "?"
         source   = (al.model_source if al else "") or "?"
         model    = (al.model_name   if al else "") or "?"
-        backend  = (al.labeling_backend if al else "") or LabelingBackend.CVAT
-        backend_label = "Label Studio" if backend == LabelingBackend.LABEL_STUDIO else "CVAT"
+        backend_label = _backend_label(al.labeling_backend if al else "")
         d = self.auto_labeling_cache
         return (
             f"{Sentinels.RUN_NEEDS_CONFIRMATION} "
@@ -701,8 +684,8 @@ class AutoLabelingHandlers:
     ) -> tuple[str, list[ToolRouting]]:
         """Shared export_to_cvat / export_to_label_studio implementation."""
         is_ls = backend == LabelingBackend.LABEL_STUDIO
-        backend_label = "Label Studio" if is_ls else "CVAT"
-        tool_name = "export_to_label_studio" if is_ls else "export_to_cvat"
+        backend_label = _backend_label(backend)
+        tool_name = _export_tool(backend)
 
         if self.state.auto_labeling and not self.state.auto_labeling.labeling_backend:
             msg = (
@@ -813,15 +796,7 @@ class AutoLabelingHandlers:
             return result, [FallThrough()]
 
         if is_ls and "Project ID" in result:
-            try:
-                tasks_file = ANNOTATION_TASKS_DIR / "ls_tasks.json"
-                if tasks_file.exists():
-                    registry = json.loads(tasks_file.read_text())
-                    dataset_name = fn_args.get("dataset_name", "")
-                    if dataset_name in registry:
-                        al.ls_task_ids = registry[dataset_name].get("task_ids", [])
-            except Exception:
-                pass
+            al.ls_task_ids = _ls_task_ids_from_registry(fn_args.get("dataset_name", "")) or al.ls_task_ids
             if not al.ls_task_ids:
                 return result, [HardStop(
                     "The export may have succeeded on the Label Studio backend, but the "
@@ -859,10 +834,8 @@ class AutoLabelingHandlers:
     ) -> tuple[str, list[ToolRouting]]:
         return await self._handle_export_generic(LabelingBackend.CVAT, fn_args, mcp_client)
 
-    async def _handle_run_auto_labeling_streaming(
-        self, fn_args: dict, progress_cb, mcp_client
-    ) -> tuple[str, list[ToolRouting]]:
-        """Runs main.py directly (bypassing MCP), streaming stdout/stderr line-by-line."""
+    def _run_gate(self) -> Optional[tuple[str, list[ToolRouting]]]:
+        """Preconditions + consent for a run: None when it may start, else the response."""
         if self.state.auto_labeling is None:
             self.state.auto_labeling = AutoLabelingState()
 
@@ -877,6 +850,14 @@ class AutoLabelingHandlers:
             self.state.save()
             sentinel = self._build_run_needs_confirmation_sentinel()
             return sentinel, [HardStop(self._format_run_confirmation_prompt())]
+        return None
+
+    async def _handle_run_auto_labeling_streaming(
+        self, progress_cb, mcp_client
+    ) -> tuple[str, list[ToolRouting]]:
+        """Runs main.py directly (bypassing MCP), streaming stdout/stderr line-by-line."""
+        if blocked := self._run_gate():
+            return blocked
 
         process = await asyncio.create_subprocess_exec(
             sys.executable, "-u", str(MAIN_PATH),
@@ -893,77 +874,26 @@ class AutoLabelingHandlers:
                 raw = await stream.readline()
                 if not raw:
                     break
-                text = _ANSI_RE.sub("", raw.decode("utf-8", errors="ignore")).rstrip()
+                text = ANSI_RE.sub("", raw.decode("utf-8", errors="ignore")).rstrip()
                 if not text.strip():
                     continue
                 buf.append(text)
                 await progress_cb("log", {"line": text})
 
-
         await asyncio.gather(_read(process.stdout, stdout_lines), _read(process.stderr, stderr_lines))
         await process.wait()
 
-        output       = "\n".join(stdout_lines)
-        error_output = "\n".join(stderr_lines)
-        combined     = output + "\n" + error_output
-
-        error_lines = [l for l in stderr_lines if " - ERROR - " in l]
-
-        if "Evaluating detections..." in combined:
-            res_lines, capture = [], False
-            for line in stdout_lines:
-                if "              precision    recall  f1-score   support" in line:
-                    capture = True
-                    res_lines.append(line)
-                elif capture and line.startswith("You have launched a remote App on port 5151"):
-                    break
-                elif capture:
-                    res_lines.append(line)
-            report = "\n".join(res_lines).strip() or "No inference results found."
-        elif error_lines:
-            report = "Workflow completed with errors:\n" + "\n".join(error_lines[-10:])
-        else:
-            report = "Workflow completed successfully.\nThe model is ready to be tested using inference on the validation set."
-
-        log_path = LOG_DIR / "last_auto_labeling_log.txt"
-        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(log_path).write_text(
-            f"=== STDOUT ===\n{output}\n\n=== STDERR ===\n{error_output}\n\n=== EXIT CODE ===\n{process.returncode}",
-            encoding="utf-8",
-        )
-
-        if process.returncode == 0:
-            result = (
-                f"Auto-labeling workflow completed.\n\n"
-                f"**Result Summary:**\n```\n{report}\n```\n"
-                f"Full logs saved to `{log_path}`"
-            )
-        else:
-            result = (
-                f"{Sentinels.RUN_FAILED}: Auto-labeling failed with exit code {process.returncode}.\n"
-                f"Error details:\n```\n{error_output[-3000:]}\n```\n"
-                f"Full logs saved to `{log_path}`"
-            )
+        output, error_output = "\n".join(stdout_lines), "\n".join(stderr_lines)
+        log_path = write_run_log(output, error_output, process.returncode)
+        result = summarize_run(output, error_output, process.returncode, log_path)
         finalized = await self._finalize_auto_labeling(result, mcp_client)
         return result, [HardStop(finalized)]
 
     async def _handle_run_auto_labeling(
         self, fn_args: dict, mcp_client
     ) -> tuple[str, list[ToolRouting]]:
-        if self.state.auto_labeling is None:
-            self.state.auto_labeling = AutoLabelingState()
-
-        ok, msg = self.state.auto_labeling.can_run_auto_labeling(
-            self.state.dataset_confirmed, self.state.dataset_name,
-        )
-        if not ok:
-            return msg, [FallThrough()]
-
-        if not self.state.auto_labeling.run_confirmed:
-            self.state.auto_labeling.run_awaiting_confirmation = True
-            self.state.save()
-            sentinel = self._build_run_needs_confirmation_sentinel()
-            return sentinel, [HardStop(self._format_run_confirmation_prompt())]
+        if blocked := self._run_gate():
+            return blocked
 
         result = unwrap_tool_output(await mcp_client.call_tool("run_auto_labeling", fn_args))
         finalized = await self._finalize_auto_labeling(result, mcp_client)
@@ -1082,18 +1012,14 @@ class AutoLabelingHandlers:
         if path == LabelingPath.MANUAL:
             if al.manual_classes:
                 classes_s = ", ".join(al.manual_classes)
-                backend_l = "Label Studio" if al.labeling_backend == LabelingBackend.LABEL_STUDIO else "CVAT"
+                backend_l = _backend_label(al.labeling_backend)
                 return result, [HardStop(
                     f"Manual Labeling selected.\n\n"
                     f"Your annotation classes are set to: {classes_s}. "
                     f"Let me know when you would like to proceed with "
                     f"exporting to {backend_l}."
                 )]
-            fn_export = (
-                "export_to_label_studio"
-                if al.labeling_backend == LabelingBackend.LABEL_STUDIO
-                else "export_to_cvat"
-            )
+            fn_export = _export_tool(al.labeling_backend)
             dataset = self.state.dataset_name or "?"
             return result, [Injection(
                 "LABELING_PATH_SET: manual. "
@@ -1165,8 +1091,7 @@ class AutoLabelingHandlers:
         dataset      = self.state.dataset_name or "?"
         source       = (al.model_source if al else "") or "?"
         model        = (al.model_name   if al else "") or "?"
-        backend      = (al.labeling_backend if al else "") or LabelingBackend.CVAT
-        backend_label = "Label Studio" if backend == LabelingBackend.LABEL_STUDIO else "CVAT"
+        backend_label = _backend_label(al.labeling_backend if al else "")
         return (
             f"Here's a summary of what will be run:\n\n"
             f"- **Dataset:** {dataset}\n"
@@ -1207,8 +1132,7 @@ class AutoLabelingHandlers:
         """Export after auto-labeling. Returns (text to append to the run reply, images
         reached the annotation tool); False makes the caller treat the run as failed."""
         is_ls = backend == LabelingBackend.LABEL_STUDIO
-        tool_name     = "export_to_label_studio" if is_ls else "export_to_cvat"
-        backend_label = "Label Studio"            if is_ls else "CVAT"
+        tool_name, backend_label = _export_tool(backend), _backend_label(backend)
 
         export_result = await self._call_tool_with_progress(
             mcp_client, tool_name, {"dataset_name": dataset_name, "with_predictions": True}
@@ -1221,21 +1145,13 @@ class AutoLabelingHandlers:
         al = self.state.auto_labeling
         if al and success:
             if is_ls:
-                try:
-                    tasks_file = ANNOTATION_TASKS_DIR / "ls_tasks.json"
-                    if tasks_file.exists():
-                        reg = json.loads(tasks_file.read_text())
-                        if dataset_name in reg:
-                            al.ls_task_ids = reg[dataset_name].get("task_ids", [])
-                            self.state.save()
-                except Exception:
-                    pass
+                al.ls_task_ids = _ls_task_ids_from_registry(dataset_name) or al.ls_task_ids
             else:
                 try:
                     al.cvat_task_ids = _parse_cvat_task_ids(export_msg)
-                    self.state.save()
-                except Exception:
-                    pass
+                except ValueError as e:
+                    logging.warning(f"[PIPELINE] Could not parse CVAT task ids: {e}")
+            self.state.save()
 
         if not success:
             return (
@@ -1272,7 +1188,7 @@ class AutoLabelingHandlers:
         dataset_name = self.state.dataset_name
 
         backend = al.labeling_backend or LabelingBackend.CVAT
-        backend_label = "Label Studio" if backend == LabelingBackend.LABEL_STUDIO else "CVAT"
+        backend_label = _backend_label(backend)
 
         if dataset_name:
             if self._progress_cb:
@@ -1280,7 +1196,8 @@ class AutoLabelingHandlers:
             try:
                 export_note, exported = await self._do_post_run_export(backend, dataset_name, mcp_client)
             except Exception as e:
-                export_note, exported = f"\n\nNote: {backend} export failed: {str(e)}", False
+                logging.warning(f"[PIPELINE] Post-run export to {backend_label} raised: {e}")
+                export_note, exported = f"\n\nNote: {backend_label} export failed: {e}", False
         else:
             export_note, exported = "\n\nNote: Could not determine dataset name for export.", False
 
@@ -1300,14 +1217,11 @@ class AutoLabelingHandlers:
     def _finalize_import(self, fn_args: dict, tool_output: str) -> str:
         base_dataset = fn_args.get("dataset_name", "").removesuffix("_labeled")
         labeled_name = f"{base_dataset}_labeled" if base_dataset else ""
-        try:
-            self.state.labeled_dataset_name = labeled_name
-            if self.state.auto_labeling:
-                self.state.auto_labeling.labels_imported = True
-                self.state.auto_labeling.phase = AutoLabelingPhase.COMPLETE
-            self.state.save()
-        except Exception:
-            pass
+        self.state.labeled_dataset_name = labeled_name
+        if self.state.auto_labeling:
+            self.state.auto_labeling.labels_imported = True
+            self.state.auto_labeling.phase = AutoLabelingPhase.COMPLETE
+        self.state.save()
         return f"{tool_output.strip()}\n\nWould you like to visualize the labeled dataset in Voxel51?"
 
     async def _format_auto_labeling_reply(self, tool_output: str) -> str:
@@ -1316,7 +1230,7 @@ class AutoLabelingHandlers:
             return (
                 f"{summary}\n[source: tool result — run_auto_labeling]\n\n"
                 f"Full Classification Report:\n"
-                f"```\n{tool_output.strip()}\n```"
+                f"```\n{tool_output.strip()}\n```\n\n"
                 f"Would you like to launch Voxel51 to explore the results?"
             )
         return tool_output.strip()
@@ -1349,7 +1263,7 @@ class AutoLabelingHandlers:
         return result, [Injection("RUN_CONFIRMED: Consent recorded. Call run_auto_labeling() immediately.")]
 
     async def _handle_configure_auto_labeling_gated(
-        self, fn_args: dict, mcp_client, messages: list
+        self, fn_args: dict, mcp_client
     ) -> tuple[str, list[ToolRouting]]:
         """Block configure_auto_labeling unless the user actually named the model."""
         model_name_raw = fn_args.get("selected_model", "")
@@ -1376,5 +1290,5 @@ class AutoLabelingHandlers:
     ) -> tuple[str, list[ToolRouting]]:
         """Run auto-labeling, streaming progress when a progress_cb is available."""
         if progress_cb:
-            return await self._handle_run_auto_labeling_streaming(fn_args, progress_cb, mcp_client)
+            return await self._handle_run_auto_labeling_streaming(progress_cb, mcp_client)
         return await self._handle_run_auto_labeling(fn_args, mcp_client)

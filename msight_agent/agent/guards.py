@@ -53,8 +53,6 @@ def filter_tools_for_state(all_tools: list, state) -> list:
     except Exception:
         logging.warning("[FILTER] valid_tool_names() raised — returning full tool list")
         return all_tools
-    if valid_names is None:
-        return all_tools
     return [t for t in all_tools if t["function"]["name"] in valid_names]
 
 

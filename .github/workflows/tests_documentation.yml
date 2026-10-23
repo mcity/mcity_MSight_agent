@@ -1,5 +1,6 @@
-# This workflow will install Python dependencies, run tests and lint with a single version of Python
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
+# Lint + agent tests are the required checks for main (fast, no GPU, no downloads).
+# Engine tests download datasets/models from Hugging Face, so they run as a separate,
+# non-required job: a failure there shows up without blocking merges.
 
 name: Tests and Docs
 
@@ -17,7 +18,44 @@ permissions:
   pull-requests: write
 
 jobs:
-  build:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Lint with flake8
+      run: |
+        pip install flake8==7.1.1
+        # Stop the build on Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --exclude archive
+        # Everything else is reported as warnings. The GitHub editor is 127 chars wide
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics --exclude archive
+
+  agent-tests:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Remove unnecessary files
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+    - uses: actions/checkout@v4
+      with:
+        submodules: false
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+        cache: 'pip'
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    - name: Agent tests
+      run: pytest -s msight_agent/tests
+
+  engine-tests:
     runs-on: ubuntu-latest
     steps:
     - name: Remove unnecessary files
@@ -36,34 +74,40 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y ffmpeg
-    - name: Upgrade pip
-      run: python -m pip install --upgrade pip
     - name: Install dependencies
       run: |
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-    - name: List all available pip updates
-      run: pip list --outdated
-    - name: Lint with flake8
-      run: |
-        # stop the build if there are Python syntax errors or undefined names
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --exclude archive
-        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
-        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics --exclude archive
-    - name: Test with pytest
-      env: # Or as an environment variable
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    - name: Engine tests
+      env:
         HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      run: |
-        pytest -s msight_agent/tests
-        cd auto_labeling && pytest -s tests --ignore tests/workflow_aws_download_test.py --ignore tests/workflow_zero_shot_od_test.py
+      working-directory: auto_labeling
+      run: pytest -s tests --ignore tests/workflow_aws_download_test.py --ignore tests/workflow_zero_shot_od_test.py
 
+  docs:
+    needs: agent-tests
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: false
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+        cache: 'pip'
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
     - name: Documentation with pdoc
       run: pdoc ./auto_labeling/*.py ./auto_labeling/workflows/*.py ./auto_labeling/config/*.py ./auto_labeling/utils/*.py -o archive/docs
     - uses: actions/upload-pages-artifact@v3
       with:
         path: archive/docs/
-
-    # Local availability of docs
+    # Local availability of docs (main only: a PR's docs don't belong in a docs PR)
     - name: Pull request for updated documentation
+      if: github.event_name == 'push'
       uses: peter-evans/create-pull-request@v7
       with:
         base: main
@@ -76,7 +120,7 @@ jobs:
   # Deploy the artifact to GitHub pages PUBLICLY when pushes to main occur
   # https://github.com/mitmproxy/pdoc/blob/main/.github/workflows/docs.yml
   deploy:
-    needs: build
+    needs: docs
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:

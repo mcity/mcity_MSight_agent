@@ -1,12 +1,82 @@
-from msight_agent.shared.mcp import mcp
-import re
+"""MCP tools that configure and run the auto-labeling engine (via config.py and main.py)."""
 import asyncio
 import logging
+import re
 import sys
 from pathlib import Path
 
-
+from msight_agent.shared.mcp import mcp
 from msight_agent.shared.paths import CONFIG_PATH, LOG_DIR, MAIN_PATH
+
+_RUN_LOG_PATH = LOG_DIR / "last_auto_labeling_log.txt"
+_REPORT_HEADER = "              precision    recall  f1-score   support"
+_REPORT_END = "You have launched a remote App on port 5151"
+
+
+def write_run_log(stdout: str, stderr: str, returncode) -> Path:
+    """Save a run's full output; returns the log path."""
+    _RUN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _RUN_LOG_PATH.write_text(
+        f"=== STDOUT ===\n{stdout}\n\n=== STDERR ===\n{stderr}\n\n=== EXIT CODE ===\n{returncode}",
+        encoding="utf-8",
+    )
+    return _RUN_LOG_PATH
+
+
+def summarize_run(stdout: str, stderr: str, returncode, log_path: Path) -> str:
+    """The run result the agent reads: the classification report (inference), a
+    completion note (training), or a RUN_FAILED line with the last error."""
+    if returncode != 0:
+        logging.warning(f"[AUTO_LABELING] run failed with exit code {returncode}:\n{stderr}")
+        tail = stderr.strip().splitlines()[-1] if stderr.strip() else "no error output captured"
+        return (
+            f"RUN_FAILED: Auto-labeling failed with exit code {returncode}.\n"
+            f"Last error line: {tail}\n"
+            f"Full logs saved to `{log_path}`"
+        )
+
+    error_lines = [line for line in stderr.splitlines() if " - ERROR - " in line]
+    if "Evaluating detections..." in stdout + stderr:
+        report_lines, capture = [], False
+        for line in stdout.splitlines():
+            if _REPORT_HEADER in line:
+                capture = True
+            elif capture and line.startswith(_REPORT_END):
+                break
+            if capture:
+                report_lines.append(line)
+        report = "\n".join(report_lines).strip() or "No inference results found."
+    elif error_lines:
+        report = "Workflow completed with errors:\n" + "\n".join(error_lines[-10:])
+    else:
+        report = "Workflow completed successfully.\nThe model is ready to be tested using inference on the validation set."
+    return (
+        f"Auto-labeling workflow completed.\n\n"
+        f"**Result Summary:**\n```\n{report}\n```\n"
+        f"Full logs saved to `{log_path}`"
+    )
+
+
+def _update_auto_labeling_keys(updated_keys: dict[str, str]) -> bool:
+    """Rewrite `"key": value` lines inside WORKFLOWS["auto_labeling"] in config.py.
+    Keys are quoted as they appear in the file. False if the block wasn't found."""
+    lines = CONFIG_PATH.read_text().split("\n")
+    modified = []
+    in_block = found = False
+    for line in lines:
+        if '"auto_labeling": {' in line:
+            in_block = found = True
+        elif in_block:
+            stripped = line.strip()
+            key = stripped.split(":")[0]
+            if key in updated_keys:
+                line = f"        {key}: {updated_keys[key]},"
+            elif stripped.startswith("}"):
+                in_block = False
+        modified.append(line)
+    if found:
+        CONFIG_PATH.write_text("\n".join(modified).rstrip("\n") + "\n")
+    return found
 
 
 
@@ -187,43 +257,12 @@ def set_auto_labeling_hyperparams(
     """
     Modify only the specified hyperparameters for the auto_labeling workflow.
     """
-    lines = CONFIG_PATH.read_text().split("\n")
-    modified = []
-    in_auto_labeling = False
-
-    updated_keys = {}
-    if mode is not None:
-        updated_keys["\"mode\""] = str(mode)
-    if epochs is not None:
-        updated_keys["\"epochs\""] = str(epochs)
-    if early_stop_patience is not None:
-        updated_keys["\"early_stop_patience\""] = str(early_stop_patience)
-    if early_stop_threshold is not None:
-        updated_keys["\"early_stop_threshold\""] = str(early_stop_threshold)
-    if learning_rate is not None:
-        updated_keys["\"learning_rate\""] = str(learning_rate)
-    if weight_decay is not None:
-        updated_keys["\"weight_decay\""] = str(weight_decay)
-    if max_grad_norm is not None:
-        updated_keys["\"max_grad_norm\""] = str(max_grad_norm)
-
-    for line in lines:
-        if '"auto_labeling": {' in line:
-            in_auto_labeling = True
-            modified.append(line)
-            continue
-
-        if in_auto_labeling:
-            stripped = line.strip()
-            key = stripped.split(":")[0]
-            if key in updated_keys:
-                line = f"        {key}: {updated_keys[key]},"
-            elif stripped.startswith("}"):
-                in_auto_labeling = False
-
-        modified.append(line)
-
-    CONFIG_PATH.write_text("\n".join(modified).rstrip("\n") + "\n")
+    values = {
+        "mode": mode, "epochs": epochs, "early_stop_patience": early_stop_patience,
+        "early_stop_threshold": early_stop_threshold, "learning_rate": learning_rate,
+        "weight_decay": weight_decay, "max_grad_norm": max_grad_norm,
+    }
+    _update_auto_labeling_keys({f'"{k}"': str(v) for k, v in values.items() if v is not None})
     return "Hyperparameters updated successfully."
 
 
@@ -240,40 +279,16 @@ def set_msight_localization_config(
     to the Ashley/Huron intersection camera's calibration (single-camera only).
     Only call this tool for a dataset that actually came from that camera.
     """
-    lines = CONFIG_PATH.read_text().split("\n")
-    modified = []
-    in_auto_labeling = False
-    found_auto_labeling_block = False
-
     updated_keys = {
         "\"localization_enabled\"": str(enabled),
         "\"localization_detection_field\"": repr(detection_field),
     }
-
-    for line in lines:
-        if '"auto_labeling": {' in line:
-            in_auto_labeling = True
-            found_auto_labeling_block = True
-            modified.append(line)
-            continue
-
-        if in_auto_labeling:
-            stripped = line.strip()
-            key = stripped.split(":")[0]
-            if key in updated_keys:
-                line = f"        {key}: {updated_keys[key]},"
-            elif stripped.startswith("}"):
-                in_auto_labeling = False
-
-        modified.append(line)
-
-    if not found_auto_labeling_block:
+    if not _update_auto_labeling_keys(updated_keys):
         return (
             "MSIGHT_LOCALIZATION_ERROR: Could not find the \"auto_labeling\" block in "
             "config.py — localization settings were not saved."
         )
 
-    CONFIG_PATH.write_text("\n".join(modified).rstrip("\n") + "\n")
     return (
         "MSight localization configured — it will run automatically as part of the "
         "next auto-labeling run, using the Ashley/Huron intersection camera's "
@@ -324,55 +339,10 @@ async def run_auto_labeling() -> str:
         )
 
         stdout_data, stderr_data = await process.communicate()
-        output = stdout_data.decode("utf-8", errors="ignore") if stdout_data else ""
-        error_output = stderr_data.decode("utf-8", errors="ignore") if stderr_data else ""
-
-        combined_output = output + "\n" + error_output
-
-        if "Evaluating detections..." in combined_output:
-            res_lines = []
-            capture = False
-
-            for line in output.splitlines():
-                if "              precision    recall  f1-score   support" in line:
-                    capture = True
-                    res_lines.append(line)
-                    continue
-                elif capture and line.startswith("You have launched a remote App on port 5151"):
-                    break
-                elif capture:
-                    res_lines.append(line)
-
-            report = "\n".join(res_lines).strip() if res_lines else "No inference results found."
-        else:
-            report = "Training completed successfully.\nThe model is ready to be tested using inference on the validation set."
-
-        log_path = LOG_DIR / "last_auto_labeling_log.txt"
-        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(log_path, "w", encoding="utf-8") as f:
-            f.write("=== STDOUT ===\n")
-            f.write(output)
-            f.write("\n\n=== STDERR ===\n")
-            f.write(error_output)
-            f.write(f"\n\n=== EXIT CODE ===\n{process.returncode}")
-
-        if process.returncode == 0:
-            return (
-                f"Auto-labeling workflow completed.\n\n"
-                f"**Result Summary:**\n```\n{report}\n```\n"
-                f"Full logs saved to `{log_path}`"
-            )
-        else:
-            logging.warning(
-                f"[AUTO_LABELING] run_auto_labeling failed with exit code "
-                f"{process.returncode}:\n{error_output}"
-            )
-            tail = error_output.strip().splitlines()[-1] if error_output.strip() else "no error output captured"
-            return (
-                f"RUN_FAILED: Auto-labeling failed with exit code {process.returncode}.\n"
-                f"Last error line: {tail}\n"
-                f"Full logs saved to `{log_path}`"
-            )
-
     except Exception as e:
-        return f"Error executing auto_labeling: {str(e)}"
+        logging.exception("[AUTO_LABELING] could not start main.py")
+        return f"RUN_FAILED: Auto-labeling could not start.\nLast error line: {e}"
+    output = stdout_data.decode("utf-8", errors="ignore") if stdout_data else ""
+    error_output = stderr_data.decode("utf-8", errors="ignore") if stderr_data else ""
+    log_path = write_run_log(output, error_output, process.returncode)
+    return summarize_run(output, error_output, process.returncode, log_path)

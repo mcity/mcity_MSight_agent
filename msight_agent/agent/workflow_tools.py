@@ -13,26 +13,26 @@ from ruamel.yaml import YAML
 from tqdm import tqdm as _tqdm_base
 
 from utils.dataset_loader import load_dataset
+from msight_agent.agent.state import WorkflowState
 from msight_agent.shared.mcp import mcp
-
 from msight_agent.shared.paths import CONFIG_PATH, DATASETS_YAML as DEFAULT_DATASETS_YAML
+
+# One line only ([ \t], not \s): \s would also swallow the blank lines around it.
+SELECTED_WORKFLOW_RE = re.compile(r"^[ \t]*SELECTED_WORKFLOW[ \t]*=[ \t]*\[[^\n]*\][ \t]*$", re.MULTILINE)
+
+
+def with_selected_workflow(src: str, workflow_name: str) -> str:
+    """config.py source with SELECTED_WORKFLOW set to [workflow_name] (prepended if absent)."""
+    line = f'SELECTED_WORKFLOW = ["{workflow_name}"]'
+    if SELECTED_WORKFLOW_RE.search(src):
+        return SELECTED_WORKFLOW_RE.sub(line, src, count=1)
+    return f"{line}\n{src}"
 
 
 @mcp.tool()
 def select_workflow(workflow_name: str) -> str:
-    """
-    Updates SELECTED_WORKFLOW in config.py to the given workflow name.
-    Example: "auto_labeling", "class_mapping", "anomaly_detection", etc.
-    """
-    lines = CONFIG_PATH.read_text().split("\n")
-    modified = []
-    pattern = re.compile(r"^SELECTED_WORKFLOW\s*=\s*\[.*\]")
-    for line in lines:
-        if pattern.match(line):
-            modified.append(f'SELECTED_WORKFLOW = ["{workflow_name}"]')
-        else:
-            modified.append(line)
-    CONFIG_PATH.write_text("\n".join(modified).rstrip("\n") + "\n")
+    """Updates SELECTED_WORKFLOW in config.py to the given workflow name."""
+    CONFIG_PATH.write_text(with_selected_workflow(CONFIG_PATH.read_text(), workflow_name))
     return f"Workflow selected: `{workflow_name}`."
 
 
@@ -142,8 +142,7 @@ async def set_selected_dataset(dataset_name: str, ctx: Context = None) -> str:
     available = fo.list_datasets()
     if dataset_name not in available:
         yaml_names = _extract_names_after_line(DEFAULT_DATASETS_YAML, 0)
-        fixed_names = ["fisheye8k", "fisheye8k_mini", "mcity_fisheye_2000", "mcity_fisheye_2100"]
-        all_known = set(available + yaml_names + fixed_names)
+        all_known = set(available + yaml_names + FIXED_DATASETS)
         if dataset_name not in all_known:
             return f"DATASET_NOT_FOUND: '{dataset_name}' does not exist."
 
@@ -181,16 +180,8 @@ def switch_workflow(workflow_name: str) -> str:
     Switch to a new workflow. Updates SELECTED_WORKFLOW and clears SELECTED_DATASET
     in config.py, since every caller treats this as a full reset.
     """
-    lines = CONFIG_PATH.read_text().split("\n")
-    modified = []
-    pattern = re.compile(r"^SELECTED_WORKFLOW\s*=\s*\[.*\]")
-    for line in lines:
-        if pattern.match(line):
-            modified.append(f'SELECTED_WORKFLOW = ["{workflow_name}"]')
-        else:
-            modified.append(line)
-    modified = _reset_selected_dataset_block(modified)
-    CONFIG_PATH.write_text("\n".join(modified).rstrip("\n") + "\n")
+    lines = with_selected_workflow(CONFIG_PATH.read_text(), workflow_name).split("\n")
+    CONFIG_PATH.write_text("\n".join(_reset_selected_dataset_block(lines)).rstrip("\n") + "\n")
     return f"Switched to workflow: `{workflow_name}`."
 
 
@@ -200,21 +191,10 @@ def reset_workflow_state() -> str:
     Resets SELECTED_WORKFLOW, SELECTED_DATASET, and WORKFLOW_STATE in config.py,
     allowing the user to start a new workflow.
     """
-    # Reset WORKFLOW_STATE via WorkflowState — typed, validated, correct schema
-    from msight_agent.agent.state import WorkflowState
     WorkflowState.reset()
 
-    # Reset SELECTED_WORKFLOW and SELECTED_DATASET via line replacement
-    src_lines = CONFIG_PATH.read_text().split("\n")
-    result_lines = []
-    for line in src_lines:
-        if line.strip().startswith("SELECTED_WORKFLOW"):
-            result_lines.append('SELECTED_WORKFLOW = [""]')
-        else:
-            result_lines.append(line)
-    result_lines = _reset_selected_dataset_block(result_lines)
-
-    CONFIG_PATH.write_text("\n".join(result_lines).rstrip("\n") + "\n")
+    lines = with_selected_workflow(CONFIG_PATH.read_text(), "").split("\n")
+    CONFIG_PATH.write_text("\n".join(_reset_selected_dataset_block(lines)).rstrip("\n") + "\n")
     return "Workflow, dataset, and session state have been reset. You may now start a new workflow."
 
 
@@ -226,6 +206,10 @@ FIXED_DATASETS: List[str] = [
     "mcity_fisheye_2000",
     "mcity_fisheye_2100",
 ]
+
+# list_datasets offers the fixed datasets plus the datasets.yaml entries from this line
+# on (the entries above it are engine-internal datasets the chat doesn't offer).
+_FIRST_LISTED_YAML_LINE = 52
 
 _NAME_LINE = re.compile(r"^\s*-\s*name:\s*[\"']?([^\"']+)[\"']?\s*$", re.IGNORECASE)
 
@@ -253,7 +237,7 @@ def list_datasets() -> List[str]:
     Fixed datasets always appear first, followed by names from datasets.yaml.
     """
     _prune_stale_custom_entries()
-    dynamic_names = _extract_names_after_line(DEFAULT_DATASETS_YAML, 52)
+    dynamic_names = _extract_names_after_line(DEFAULT_DATASETS_YAML, _FIRST_LISTED_YAML_LINE)
     out: List[str] = []
     for n in FIXED_DATASETS:
         if n not in out:

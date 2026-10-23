@@ -16,8 +16,7 @@ from typing import Optional
 
 from dotenv import dotenv_values
 
-from msight_agent.shared.mcp import mcp
-from msight_agent.shared.mcp import error_json, ok_json
+from msight_agent.shared.mcp import error_json, mcp, ok_json
 from msight_agent.msight.runtime.control_plane import get_control_plane
 from msight_agent.msight.runtime.paths import get_msight_path
 from msight_agent.msight.runtime.utils import run_cmd
@@ -194,7 +193,13 @@ async def stop_msight_recording() -> str:
 
     sensor, _last_recording_sensor = _last_recording_sensor, None
     if not sensor:
-        return ok_json(msg)
+        # Lost on an MCP server restart mid-recording; the pipeline's sensor is the
+        # only one recordings are made for, so use it if it has segments on disk.
+        msight_path, err = get_msight_path()
+        fallback = None if err else active_sensor_name(msight_path)
+        if not fallback or not _segments(fallback):
+            return ok_json(msg)
+        sensor = fallback
     out_path, err = await _concat_recording_segments(sensor)
     if err:
         return ok_json(f"{msg} {err}")

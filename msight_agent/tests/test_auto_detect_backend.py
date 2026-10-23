@@ -1,5 +1,4 @@
 """ChatPipeline._auto_detect_backend under each credential combination."""
-import asyncio
 from unittest.mock import MagicMock, patch
 
 from msight_agent.agent.dispatch import ChatPipeline
@@ -23,7 +22,7 @@ def detect(cvat_token: str = "", ls_token: str = "") -> dict | None:
     env = {"CVAT_ACCESS_TOKEN": cvat_token, "LS_TOKEN": ls_token}
     with patch("msight_agent.auto_labeling.handlers.os.getenv", side_effect=lambda key, default="": env.get(key, default)):
         with patch.object(WorkflowState, "save"):
-            return pipeline, asyncio.run(pipeline._auto_detect_backend(mcp_client=MagicMock()))
+            return pipeline, pipeline._auto_detect_backend()
 
 
 # Regression: os.getenv must not raise NameError → result must not be None
@@ -90,7 +89,7 @@ def test_auto_detect_backend_writes_state_for_ls():
     env = {"CVAT_ACCESS_TOKEN": "", "LS_TOKEN": "tok"}
     with patch("msight_agent.auto_labeling.handlers.os.getenv", side_effect=lambda key, default="": env.get(key, default)):
         with patch.object(WorkflowState, "save") as mock_save:
-            asyncio.run(pipeline._auto_detect_backend(mcp_client=MagicMock()))
+            pipeline._auto_detect_backend()
     assert pipeline.state.auto_labeling.labeling_backend == LabelingBackend.LABEL_STUDIO
     mock_save.assert_called_once()
 
@@ -100,6 +99,6 @@ def test_auto_detect_backend_does_not_write_state_for_none():
     env = {"CVAT_ACCESS_TOKEN": "", "LS_TOKEN": ""}
     with patch("msight_agent.auto_labeling.handlers.os.getenv", side_effect=lambda key, default="": env.get(key, default)):
         with patch.object(WorkflowState, "save") as mock_save:
-            asyncio.run(pipeline._auto_detect_backend(mcp_client=MagicMock()))
+            pipeline._auto_detect_backend()
     assert pipeline.state.auto_labeling.labeling_backend == ""
     mock_save.assert_not_called()

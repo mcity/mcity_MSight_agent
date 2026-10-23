@@ -40,7 +40,7 @@ def test_locked_reply_names_no_tool_and_asks_no_yes_no(phase, action):
     state = WorkflowState(workflow_name="auto_labeling", dataset_name="ds", dataset_confirmed=True,
                           auto_labeling=AutoLabelingState(phase=phase))
     result, routings = asyncio.run(_pipeline(state)._handle_select_or_switch_workflow(
-        "switch_workflow", {"workflow_name": "auto_labeling"}, _client(), []))
+        "switch_workflow", {"workflow_name": "auto_labeling"}, _client()))
     reply = routings[0].reply
     assert isinstance(routings[0], HardStop)
     assert "switch_workflow" not in reply and "(" not in reply and "?" not in reply

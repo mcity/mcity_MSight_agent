@@ -11,7 +11,7 @@ from msight_agent.shared.host_utils import is_cloud_deployment
 from msight_agent.agent.state import WORKFLOW_SPECS
 
 _AGENT_PROMPTS = Path(__file__).resolve().parent / "prompts"
-_MCP_LAYER = Path(__file__).resolve().parents[1]
+_PACKAGE_DIR = Path(__file__).resolve().parents[1]
 
 
 def _demo_video_hint() -> str:
@@ -74,7 +74,7 @@ def _load_state_hints() -> dict[str, str]:
 
 
 _WORKFLOW_PROMPTS = {
-    name: (_MCP_LAYER / spec.prompt_file).read_text()
+    name: (_PACKAGE_DIR / spec.prompt_file).read_text()
     for name, spec in WORKFLOW_SPECS.items()
 }
 _MSIGHT_PROMPT_BY_MODE = _msight_prompt_by_mode(_WORKFLOW_PROMPTS["msight_pipeline"])

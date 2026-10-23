@@ -8,18 +8,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from dotenv import dotenv_values, load_dotenv
+from dotenv import dotenv_values
 from fastmcp import Context
 
 from msight_agent.shared.host_utils import resolve_host
-from msight_agent.shared.mcp import mcp
-from msight_agent.shared.mcp import error_json, ok_json
+from msight_agent.shared.mcp import error_json, mcp, ok_json
 from msight_agent.msight.runtime.calibration import calibration_mismatch
 from msight_agent.msight.runtime.control_plane import get_control_plane
 from msight_agent.msight.runtime.executors import has_gpu
 from msight_agent.msight.runtime.paths import get_msight_path
-
-load_dotenv()
 
 VIEWER_PORT = 9010
 FIXED_PIPELINE_NODES = ("video_source", "rfdetr_detector", "detection_viewer")

@@ -1,5 +1,6 @@
-from msight_agent.shared.mcp import mcp
-from msight_agent.shared.mcp import error_json
+"""Dataset ingestion: patch config.py for the engine's data_ingest workflow, run
+main.py, stream its output, then restore config.py and select the new dataset.
+Driven by ingest_server.py (the upload window), not by an MCP tool."""
 import asyncio
 import json
 import logging
@@ -7,51 +8,35 @@ import re
 import shutil
 import sys
 import tempfile
+import uuid
 import zipfile
 from pathlib import Path
-from typing import Optional, List, Tuple, Awaitable, Callable
-import uuid
+from typing import Awaitable, Callable, List, Optional, Tuple
 
-
+from msight_agent.agent.state import WorkflowState
+from msight_agent.agent.workflow_tools import SELECTED_WORKFLOW_RE, with_selected_workflow, write_selected_dataset
 from msight_agent.shared.paths import CONFIG_PATH, DATASET_UPLOADS_DIR, LOG_DIR, MAIN_PATH
 
 UPLOAD_ROOT = DATASET_UPLOADS_DIR.resolve()
-UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
-# Type for streaming emit callbacks
 EmitFn = Callable[[dict], Awaitable[None]]
 
-async def _emit(maybe_emit: Optional[EmitFn], payload: dict):
-    """Emit to provided callback or MCP event bus."""
-    if maybe_emit:
-        await maybe_emit(payload)
-    else:
-        await mcp.yield_event(payload)
 
-# Paths
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-# ----- helpers -----
-def _extract_zip(zip_path: str) -> str:
+def _extract_zip(zip_path: str) -> tuple[Path, Path]:
+    """(dataset folder, temp root to delete): the zip's single top-level folder if it has one."""
     tmp_root = Path(tempfile.mkdtemp(prefix="ingest_zip_"))
     with zipfile.ZipFile(zip_path, "r") as z:
         z.extractall(tmp_root)
-    entries = [p for p in tmp_root.iterdir()]
+    entries = list(tmp_root.iterdir())
     if len(entries) == 1 and entries[0].is_dir():
-        return str(entries[0])
-    return str(tmp_root)
+        return entries[0], tmp_root
+    return tmp_root, tmp_root
+
 
 def _read(p: Path) -> str:
     return p.read_text(encoding="utf-8")
 
 def _write(p: Path, s: str) -> None:
     p.write_text(s, encoding="utf-8")
-
-def _set_selected_workflow(src: str) -> str:
-    pattern = r'^\s*SELECTED_WORKFLOW\s*=\s*\[.*?\]\s*$'
-    repl = 'SELECTED_WORKFLOW = ["data_ingest"]'
-    if re.search(pattern, src, flags=re.MULTILINE | re.DOTALL):
-        return re.sub(pattern, repl, src, flags=re.MULTILINE | re.DOTALL)
-    return repl + "\n" + src
 
 def _patch_data_ingest_block(
     src: str,
@@ -72,11 +57,7 @@ def _patch_data_ingest_block(
     fps_val = int(fps)
     splits_val = json.dumps([float(x) for x in split_percentages])
 
-    start = src.find('"data_ingest": {')
-    if start == -1:
-        start = src.find("'data_ingest': {")
-
-    if start == -1:
+    if _data_ingest_block_span(src) is None:
         m = re.search(r'WORKFLOWS\s*=\s*\{', src)
         block_lines = [
             '    "data_ingest": {',
@@ -98,20 +79,11 @@ def _patch_data_ingest_block(
             insert_at = m.end()
         return src[:insert_at + 1] + "\n" + block + src[insert_at + 1:]
 
-    i, brace, end = start, 0, None
-    while i < len(src):
-        ch = src[i]
-        if ch == "{": brace += 1
-        elif ch == "}":
-            brace -= 1
-            if brace == 0:
-                end = i
-                break
-        i += 1
-    if end is None:
+    span = _data_ingest_block_span(src)
+    if span is None:
         return src
-
-    block_src = src[start:end + 1]
+    start, end = span
+    block_src = src[start:end]
     block_new = block_src
     block_new = upsert_key(block_new, "dataset_dir", repr(dataset_dir))
     block_new = upsert_key(block_new, "fps", str(fps_val))
@@ -120,7 +92,7 @@ def _patch_data_ingest_block(
         block_new = upsert_key(block_new, "dataset_name", repr(dataset_name))
     if annotation_format:
         block_new = upsert_key(block_new, "annotation_format", repr(annotation_format))
-    return src[:start] + block_new + src[end + 1:]
+    return src[:start] + block_new + src[end:]
 
 def _parse_name_samples(text: str) -> Tuple[Optional[str], Optional[int]]:
     name, samples = None, None
@@ -146,9 +118,6 @@ async def _stream_subprocess(proc: asyncio.subprocess.Process, on_line):
             await on_line(source, line.decode("utf-8", errors="ignore"))
     await asyncio.gather(_reader(proc.stdout, "stdout"), _reader(proc.stderr, "stderr"))
 
-_SELECTED_WORKFLOW_RE = re.compile(r'^\s*SELECTED_WORKFLOW\s*=\s*\[.*?\]\s*$', re.MULTILINE)
-
-
 def _data_ingest_block_span(src: str) -> Optional[tuple[int, int]]:
     """(start, end) of the WORKFLOWS["data_ingest"] dict literal, braces matched."""
     start = src.find('"data_ingest": {')
@@ -169,8 +138,8 @@ def _restore_ingest_patch(original: str) -> None:
     Restoring the whole file would also undo anything the chat changed meanwhile,
     e.g. a dataset selected while the upload was running."""
     current = _read(CONFIG_PATH)
-    if m := _SELECTED_WORKFLOW_RE.search(original):
-        current = _SELECTED_WORKFLOW_RE.sub(lambda _: m.group(0).strip(), current, count=1)
+    if m := SELECTED_WORKFLOW_RE.search(original):
+        current = SELECTED_WORKFLOW_RE.sub(lambda _: m.group(0).strip(), current, count=1)
     orig_span, cur_span = _data_ingest_block_span(original), _data_ingest_block_span(current)
     if orig_span and cur_span:
         current = current[:cur_span[0]] + original[orig_span[0]:orig_span[1]] + current[cur_span[1]:]
@@ -180,8 +149,6 @@ def _restore_ingest_patch(original: str) -> None:
 def _mark_ingested(dataset_name: str) -> None:
     """Make the new dataset the selected one, in both the chat's session state and
     SELECTED_DATASET (what main.py runs on) -- they must agree."""
-    from msight_agent.agent.state import WorkflowState
-    from msight_agent.agent.workflow_tools import write_selected_dataset
     try:
         write_selected_dataset(dataset_name)
         state = WorkflowState.load()
@@ -192,46 +159,45 @@ def _mark_ingested(dataset_name: str) -> None:
         logging.warning(f"[INGEST] Failed to select ingested dataset '{dataset_name}': {e}")
 
 
-# ---- CORE STREAMING IMPLEMENTATION ----
-async def _run_data_ingest_streaming_core(
+async def run_data_ingest(
+    emit: EmitFn,
     zip_path: Optional[str] = None,
     source_path: Optional[str] = None,
     fps: int = 2,
     split_percentages: Optional[List[float]] = None,
     dataset_prefix: Optional[str] = None,
     annotation_format: Optional[str] = None,
-    emit: Optional[EmitFn] = None,
-):
+) -> None:
+    """Ingest a zip or folder, sending {"type", "data"} events to `emit`."""
     if not zip_path and not source_path:
-        await _emit(emit, {"type": "error", "data": {"msg": "Provide zip_path or source_path"}})
+        await emit({"type": "error", "data": {"msg": "Provide zip_path or source_path"}})
         return
 
-    extracted_tmp = None
+    tmp_root = None
     backup_path = CONFIG_PATH.with_suffix(".py.bak")
     combined_lines: List[str] = []
     ds_name, samples, final_rc = None, None, None
 
     try:
-        dataset_dir = _extract_zip(zip_path) if zip_path else source_path
+        dataset_dir = source_path
         if zip_path:
-            # we extracted under /tmp -> move to persistent, shared path
-            extracted_tmp = Path(dataset_dir)
+            # Extracted under /tmp; move into the persistent upload folder.
+            extracted, tmp_root = _extract_zip(zip_path)
             persistent_dir = UPLOAD_ROOT / f"job_{uuid.uuid4().hex}"
             persistent_dir.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(extracted_tmp), str(persistent_dir))
+            shutil.move(str(extracted), str(persistent_dir))
             dataset_dir = str(persistent_dir)
-            extracted_tmp = None  # moved; nothing left to delete
-        await _emit(emit, {"type": "log", "data": {"msg": f"Prepared dataset_dir: {dataset_dir}"}})
+        await emit({"type": "log", "data": {"msg": f"Prepared dataset_dir: {dataset_dir}"}})
 
         original = _read(CONFIG_PATH)
         _write(backup_path, original)
-        patched = _set_selected_workflow(original)
+        patched = with_selected_workflow(original, "data_ingest")
         patched = _patch_data_ingest_block(
             patched, dataset_dir, int(fps), split_percentages or [0.7, 0.15, 0.15],
             dataset_prefix, annotation_format
         )
         _write(CONFIG_PATH, patched)
-        await _emit(emit, {"type": "log", "data": {"msg": "Config patched for data_ingest"}})
+        await emit({"type": "log", "data": {"msg": "Config patched for data_ingest"}})
 
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "-u", str(MAIN_PATH),
@@ -251,12 +217,13 @@ async def _run_data_ingest_streaming_core(
 
             _, s = _parse_name_samples(text)
             if s: samples = s
-            await _emit(emit, {"type": "log", "data": {"msg": text}})
+            await emit({"type": "log", "data": {"msg": text}})
 
         await _stream_subprocess(proc, on_line)
         final_rc = await proc.wait()
 
         log_path = LOG_DIR / "last_data_ingest_log.txt"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         _write(log_path, "".join(combined_lines))
 
         try:
@@ -272,7 +239,7 @@ async def _run_data_ingest_streaming_core(
             # Ingestion runs outside chat, so select the dataset here.
             _mark_ingested(ds_name)
 
-            await _emit(emit, {
+            await emit({
                 "type": "agent",
                 "data": {
                     "msg": (
@@ -282,13 +249,13 @@ async def _run_data_ingest_streaming_core(
                     "samples": samples,
                 },
             })
-            await _emit(emit, {"type": "done", "data": {"ok": True}})
+            await emit({"type": "done", "data": {"ok": True}})
         else:
-            await _emit(emit, {"type": "error", "data": {"msg": f"data_ingest failed with exit code {final_rc}"}})
+            await emit({"type": "error", "data": {"msg": f"data_ingest failed with exit code {final_rc}"}})
 
     except Exception as e:
-        logging.exception("run_data_ingest_streaming failed")
-        await _emit(emit, {"type": "error", "data": {"msg": str(e)}})
+        logging.exception("run_data_ingest failed")
+        await emit({"type": "error", "data": {"msg": str(e)}})
         try:
             if backup_path.exists():
                 _restore_ingest_patch(_read(backup_path))
@@ -296,126 +263,5 @@ async def _run_data_ingest_streaming_core(
         except Exception as restore_err:
             logging.warning(f"[INGEST] Failed to restore config.py: {restore_err}")
     finally:
-        if extracted_tmp and extracted_tmp.exists():
-            shutil.rmtree(extracted_tmp, ignore_errors=True)
-
-# ---- MCP TOOL WRAPPER (no emit in signature) ----
-@mcp.tool(name="run_data_ingest_streaming", description="Streaming: run data_ingest via main.py and emit live events")
-async def run_data_ingest_streaming(
-    zip_path: Optional[str] = None,
-    source_path: Optional[str] = None,
-    fps: int = 2,
-    split_percentages: Optional[List[float]] = None,
-    dataset_prefix: Optional[str] = None,
-    annotation_format: Optional[str] = None,
-):
-    await _run_data_ingest_streaming_core(
-        zip_path=zip_path,
-        source_path=source_path,
-        fps=fps,
-        split_percentages=split_percentages,
-        dataset_prefix=dataset_prefix,
-        annotation_format=annotation_format,
-        emit=None  # MCP uses its own event bus
-    )
-
-# ---- NON-STREAMING TOOL ----
-async def _run_main_and_capture() -> tuple[str, str, int]:
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-u", str(MAIN_PATH),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=str(MAIN_PATH.parent)
-    )
-    out, err = await proc.communicate()
-    return (
-        out.decode("utf-8", errors="ignore") if out else "",
-        err.decode("utf-8", errors="ignore") if err else "",
-        proc.returncode,
-    )
-
-@mcp.tool(name="run_data_ingest", description="Run data_ingest via main.py after patching config; returns JSON with logs")
-async def run_data_ingest_tool(
-    zip_path: Optional[str] = None,
-    source_path: Optional[str] = None,
-    fps: int = 2,
-    split_percentages: Optional[List[float]] = None,
-    dataset_prefix: Optional[str] = None,
-    annotation_format: Optional[str] = None,
-):
-
-    if not zip_path and not source_path:
-        return error_json("Provide zip_path or source_path")
-
-    extracted_tmp = None
-    try:
-        dataset_dir = _extract_zip(zip_path) if zip_path else source_path
-        if zip_path:
-            extracted_tmp = Path(dataset_dir)
-            persistent_dir = UPLOAD_ROOT / f"job_{uuid.uuid4().hex}"
-            persistent_dir.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(extracted_tmp), str(persistent_dir))
-            dataset_dir = str(persistent_dir)
-            extracted_tmp = None
-
-        original = _read(CONFIG_PATH)
-        backup_path = CONFIG_PATH.with_suffix(".py.bak")
-        _write(backup_path, original)
-
-        patched = _set_selected_workflow(original)
-        patched = _patch_data_ingest_block(
-            patched,
-            dataset_dir=dataset_dir,
-            fps=int(fps),
-            split_percentages=split_percentages or [0.7, 0.15, 0.15],
-            dataset_name=dataset_prefix,
-            annotation_format=annotation_format,
-        )
-        _write(CONFIG_PATH, patched)
-
-        stdout_text, stderr_text, rc = await _run_main_and_capture()
-        combined = ""
-        if stdout_text:
-            combined += "=== STDOUT ===\n" + stdout_text + "\n"
-        if stderr_text:
-            combined += "=== STDERR ===\n" + stderr_text + "\n"
-
-        log_path = LOG_DIR / "last_data_ingest_log.txt"
-        _write(log_path, combined)
-
-        name, samples = _parse_name_samples(combined)
-        if not name:
-            name = dataset_prefix or "custom_dataset"
-
-        _restore_ingest_patch(original)
-        backup_path.unlink(missing_ok=True)
-
-        if rc == 0:
-            _mark_ingested(name)
-
-        tail = combined[-5000:] if len(combined) > 5000 else combined
-        status = "ok" if rc == 0 else "error"
-        return json.dumps({
-            "status": status,
-            "name": name,
-            "samples": samples,
-            "returncode": rc,
-            "log_path": str(log_path),
-            "log_tail": tail,
-        })
-
-    except Exception as e:
-        logging.exception("run_data_ingest failed")
-        try:
-            if CONFIG_PATH.with_suffix(".py.bak").exists():
-                _restore_ingest_patch(_read(CONFIG_PATH.with_suffix(".py.bak")))
-                CONFIG_PATH.with_suffix(".py.bak").unlink(missing_ok=True)
-        except Exception:
-            pass
-        return error_json(str(e))
-    finally:
-        if extracted_tmp and extracted_tmp.exists():
-            try:
-                shutil.rmtree(extracted_tmp, ignore_errors=True)
-            except Exception:
-                pass
+        if tmp_root is not None:
+            shutil.rmtree(tmp_root, ignore_errors=True)

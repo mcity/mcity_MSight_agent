@@ -6,8 +6,7 @@ changes are cheap and reversible.
 import difflib
 from typing import Optional
 
-from msight_agent.shared.mcp import mcp
-from msight_agent.shared.mcp import error_json, ok_json
+from msight_agent.shared.mcp import error_json, mcp, ok_json
 from msight_agent.msight.runtime.node_catalog import NODE_CATALOG
 from msight_agent.msight.runtime.control_plane import get_control_plane
 from msight_agent.msight.runtime.utils import next_free_port, port_in_use, topic_list
@@ -17,7 +16,7 @@ from msight_agent.msight.runtime.paths import get_msight_path
 _NODE_TYPE_DESCRIPTIONS: dict[str, str] = {
     "video_source_rtsp": "Publishes frames from a live RTSP stream (or a local video file path passed as rtsp_url).",
     "video_source_mp4_folder": "Publishes frames sequentially from a folder of .mp4 files.",
-    "rfdetr_detector": "Runs RF-DETR object detection on a frame topic, publishes detections. Needs GPU.",
+    "rfdetr_detector": "Runs RF-DETR object detection on a frame topic, publishes detections. Uses the GPU; on a GPU-less host it falls back to a much slower CPU-only image.",
     "detection_viewer": "Web viewer (configurable port) that renders a detection topic as annotated video in-browser.",
     "frame_annotator": "Draws detection boxes/labels onto frames, republishes as an annotated frame topic.",
     "video_aggregator": "Buffers an annotated frame topic into short video clips.",

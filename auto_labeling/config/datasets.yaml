@@ -54,7 +54,7 @@ datasets:
     loader_fct: load_mcity_31k
     hf_dataset_name: mcity-ai/mcity_31k_clean_ds
   - name: gamedayds
-    loader_fct: load_gameday_ds
+    loader_fct: load_dataset_from_hf_hub
     hf_dataset_name: Abeyankar/gameday_ds
   - name: gameday_ds_annotated
     loader_fct: load_fisheye_8k

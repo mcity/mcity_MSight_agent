@@ -25,6 +25,7 @@ def calibration_paths(msight_path: Path) -> tuple[Path, Path]:
     return (config_path.parent / config["intrinsics"]).resolve(), \
            (config_path.parent / config["loc_maps"]).resolve()
 
+
 # state -> (SESSION_STATE hint wording, consent-summary wording, check-tool message)
 _STATE_TEXT = {
     "missing": (
@@ -156,7 +157,8 @@ def calibration_mismatch(msight_path: Path, video_input: Optional[str]) -> Optio
     if not video_input or not Path(video_input).exists():
         return None
     try:
-        map_h, map_w = np.load(calibration_paths(msight_path)[1])["x_map"].shape[:2]
+        with np.load(calibration_paths(msight_path)[1]) as maps:
+            map_h, map_w = maps["x_map"].shape[:2]
     except Exception:
         return None  # missing/unreadable calibration is reported by calibration_status
     frame = _video_frame_size(video_input)

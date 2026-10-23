@@ -1,9 +1,10 @@
 """Pydantic state machine over WORKFLOW_STATE in config.py: schemas, guards, persistence."""
 
 import ast
-import re
 import importlib
 import logging
+import re
+import time
 from dataclasses import dataclass
 from typing import ClassVar, Literal, Optional
 
@@ -322,11 +323,6 @@ class WorkflowState(BaseModel):
             )
         return True, ""
 
-    def reset_auto_labeling_from(self, step: str) -> None:
-        if self.auto_labeling is not None:
-            self.auto_labeling.reset_from_step(step)
-        self.save()
-
     def record_run(self, workflow: str, failed: bool, error: str = "", log_path: str = "") -> None:
         """Store a run's outcome and persist the whole state (including the caller's changes).
         `attempts` counts consecutive runs of the same workflow."""
@@ -348,8 +344,8 @@ class WorkflowState(BaseModel):
             return lr
         return None
 
-    def valid_tool_names(self) -> set[str] | None:
-        """Return valid tools for the current step, or None to expose all tools."""
+    def valid_tool_names(self) -> set[str]:
+        """The tools valid at the current workflow step."""
         ALWAYS = ALWAYS_TOOLS
 
         if not self.workflow_name:
@@ -423,6 +419,7 @@ class WorkflowState(BaseModel):
                 return ALWAYS | {"launch_voxel51_session"}
             import_tool = "import_from_label_studio" if ls else "import_from_cvat"
             return ALWAYS | {import_tool}
+        return ALWAYS
 
     @classmethod
     def load(cls) -> "WorkflowState":
@@ -434,8 +431,7 @@ class WorkflowState(BaseModel):
 
             # TTL: after an hour without writes, clear stale confirmation gates.
             try:
-                import time as _time
-                age = _time.time() - CONFIG_PATH.stat().st_mtime
+                age = time.time() - CONFIG_PATH.stat().st_mtime
                 if age > 3600 and state.auto_labeling:
                     if state.auto_labeling.run_awaiting_confirmation:
                         state.auto_labeling.run_awaiting_confirmation = False
@@ -449,7 +445,7 @@ class WorkflowState(BaseModel):
                 # msight_pipeline's shorter TTL below always fires first.
                 mp = state.msight_pipeline
                 if mp and mp.run_awaiting_confirmation and mp.run_confirmation_requested_at:
-                    pending_age = _time.time() - mp.run_confirmation_requested_at
+                    pending_age = time.time() - mp.run_confirmation_requested_at
                     if pending_age > 300:
                         mp.run_awaiting_confirmation = False
                         mp.run_confirmation_requested_at = 0.0
@@ -458,11 +454,11 @@ class WorkflowState(BaseModel):
                             f"confirmation after {pending_age:.0f}s unanswered"
                         )
                 # Expire deferred requests so they don't fire on an unrelated later start.
-                if mp and mp.recording_pending and mp.recording_pending_since and _time.time() - mp.recording_pending_since > 3600:
+                if mp and mp.recording_pending and mp.recording_pending_since and time.time() - mp.recording_pending_since > 3600:
                     mp.recording_pending = False
                     mp.recording_pending_since = 0.0
                     logging.warning("[STATE] TTL: cleared stale recording_pending")
-                if mp and mp.archiving_pending and mp.archiving_pending_since and _time.time() - mp.archiving_pending_since > 3600:
+                if mp and mp.archiving_pending and mp.archiving_pending_since and time.time() - mp.archiving_pending_since > 3600:
                     mp.archiving_pending = False
                     mp.archiving_pending_since = 0.0
                     mp.archiving_pending_bucket = ""
@@ -583,6 +579,3 @@ class WorkflowState(BaseModel):
         fresh.workflow_just_reset = True
         fresh.save()
         return fresh
-
-    def current_substate(self):
-        return getattr(self, self.workflow_name, None) if self.workflow_name else None

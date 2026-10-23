@@ -3,7 +3,7 @@ import json
 
 from fastmcp import FastMCP
 
-mcp = FastMCP("MCity Agent")
+mcp = FastMCP("MSight Agent")
 
 
 def error_json(message: str) -> str:

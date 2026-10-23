@@ -40,7 +40,7 @@ def config(tmp_path, monkeypatch):
 
 
 def _ingest_patch(original: str) -> str:
-    patched = data_ingest._set_selected_workflow(original)
+    patched = data_ingest.with_selected_workflow(original, "data_ingest")
     return data_ingest._patch_data_ingest_block(patched, "/data/job_1", 2, [0.7, 0.2, 0.1], "custom_dataset4", "auto")
 
 
@@ -68,3 +68,8 @@ def test_write_and_read_selected_dataset(config):
     write_selected_dataset("fisheye8k")
     assert config_selected_dataset() == "fisheye8k"
     assert '"n_samples": None' in config.read_text()
+
+
+def test_selected_workflow_rewrite_keeps_surrounding_lines():
+    src = 'X = 1\n\nSELECTED_WORKFLOW = ["a"]\n\n\nY = 2\n'
+    assert data_ingest.with_selected_workflow(src, "b") == 'X = 1\n\nSELECTED_WORKFLOW = ["b"]\n\n\nY = 2\n'

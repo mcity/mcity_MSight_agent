@@ -281,7 +281,7 @@ def _export_snapshot(http, project_id: int) -> list[dict]:
     return dl_resp.json() if isinstance(dl_resp.json(), list) else []
 
 
-def _ls_result_to_fo_detection(result: dict, img_w: int, img_h: int):
+def _ls_result_to_fo_detection(result: dict):
     """
     Convert a single Label Studio rectanglelabels result to a FiftyOne Detection.
     LS value coords are percentages [0,100]; FiftyOne expects normalized [0,1].
@@ -444,7 +444,7 @@ async def export_to_label_studio(
             if not pred_fields:
                 # Wait up to 20s for the prediction field to appear after inference.
                 for _ in range(10):
-                    time.sleep(2)
+                    await asyncio.sleep(2)
                     dataset.reload()
                     schema      = dataset.get_field_schema()
                     pred_fields = [f for f in schema if f.startswith("pred_od_")]
@@ -681,7 +681,7 @@ async def import_from_label_studio(dataset_name: str, ctx: Context = None) -> st
             for r in results:
                 if r.get("type") != "rectanglelabels":
                     continue
-                det = _ls_result_to_fo_detection(r, img_w=1, img_h=1)
+                det = _ls_result_to_fo_detection(r)
                 if det:
                     fo_detections.append(det)
 
@@ -707,7 +707,7 @@ async def import_from_label_studio(dataset_name: str, ctx: Context = None) -> st
                 verify = fo.load_dataset(labeled_name)
                 if len(verify) > 0:
                     break
-            time.sleep(2)
+            await asyncio.sleep(2)
         else:
             return (
                 f"Import appeared to succeed but dataset '{labeled_name}' "
