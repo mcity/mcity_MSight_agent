@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Mcity MSight agent deployment -- PHASE 1 (bake). Provisions Docker/MSight_Vision/agent deps from scratch on a non-GPU (r5) instance; image this instance once working, point Docker/deploy-agent-AWS-AMI.yml (PHASE 2) at the resulting AMI.
+
+Parameters:
+  UbuntuAMI:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/canonical/ubuntu/server/noble/stable/current/amd64/hvm/ebs-gp3/ami-id'
+  OPENAIAPIKEY:
+    Type: String
+    Default: sk-123456789123456789123456789 # Replace this key
+    NoEcho: true
+  ANTHROPICAPIKEY:
+    Type: String
+    Default: ''
+    Description: Anthropic API key
+    NoEcho: true
+  GEMINIAPIKEY:
+    Type: String
+    Default: ''
+    Description: Gemini API key
+    NoEcho: true
+  GROQAPIKEY:
+    Type: String
+    Default: ''
+    Description: Groq API key
+    NoEcho: true
+  LSTOKEN:
+    Type: String
+    Default: ''
+    Description: Label Studio API token
+    NoEcho: true
+  LSURL:
+    Type: String
+    Default: 'https://app.humansignal.com'
+    Description: Label Studio instance URL
+  CVATURL:
+    Type: String
+    Default: 'https://app.cvat.ai'
+    Description: CVAT instance URL
+  CVATACCESSTOKEN:
+    Type: String
+    Default: ''
+    Description: CVAT access token (leave empty if using Label Studio)
+    NoEcho: true
+  KeyPairName:
+    Type: String
+    Default: mcity-msight-agent-key
+    Description: The name of the new Key Pair to be created
+  RepoURL:
+    Type: String
+    Default: 'https://github.com/mcity/mcity_MSight_agent.git'
+    Description: URL of this agent's public git repository
+  RepoBranch:
+    Type: String
+    Default: main
+    Description: Branch of RepoURL to clone -- this repo only has main, unlike the mcity_data_engine_msight repo this template was adapted from
+  MsightVisionRepoURL:
+    Type: String
+    Default: 'https://github.com/michigan-traffic-lab/MSight_Vision.git'
+    Description: URL of the MSight_Vision git repository to clone alongside this agent
+  # TEMPORARY: rf-detr-detector's docker-compose.yml layout is what our calibration/CPU-override code depends on; not yet merged to main upstream.
+  MsightVisionRepoBranch:
+    Type: String
+    Default: rf-detr-detector
+    Description: Branch of MsightVisionRepoURL to clone -- not yet on main
+  # Confirmed: r5 family, no GPU. msight/executors.py auto-detects this and runs RF-DETR on a CPU-only image.
+  InstanceType:
+    Type: String
+    Default: r5.large
+  HFTOKEN:
+    Type: String
+    Default: hf_asdasdasduasdasdasTSDSDasfadfasdasd
+    NoEcho: true
+
+Resources:
+  MyKeyPair:
+    Type: 'AWS::EC2::KeyPair'
+    Properties:
+      KeyName: !Ref KeyPairName
+
+  InstanceSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable HTTP and SSH access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5225
+          ToPort: 5225
+          CidrIp: 0.0.0.0/0
+        # 8000 mcp_server, 8001 chat_server, 8002 ingest_server, 8003 msight_api.
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8003
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 5151
+          ToPort: 5151
+          CidrIp: 0.0.0.0/0
+        # MSight_Vision's web viewer (msight/pipeline.py's VIEWER_PORT).
+        - IpProtocol: tcp
+          FromPort: 9010
+          ToPort: 9010
+          CidrIp: 0.0.0.0/0
+
+  WebServerInstance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref MyKeyPair
+      SecurityGroups:
+        - !Ref InstanceSecurityGroup
+      ImageId: '{{resolve:ssm:/aws/service/canonical/ubuntu/server/noble/stable/current/amd64/hvm/ebs-gp3/ami-id}}'
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # cloud-init already runs as root -- no sudo -s needed.
+          set -x
+          export DEBIAN_FRONTEND=noninteractive
+
+          apt-get update -y
+          apt-get install -y git python3-pip python3-venv curl ffmpeg ca-certificates gnupg
+
+          # ---- Docker Engine + Compose plugin (msight/executors.py runs each node with `docker run`) ----
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          chmod a+r /etc/apt/keyrings/docker.asc
+          echo \
+            "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo \"$VERSION_CODENAME\") stable" \
+            > /etc/apt/sources.list.d/docker.list
+          apt-get update -y
+          apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          usermod -aG docker ubuntu
+
+          # No GPU on this instance family -- no NVIDIA driver/Container Toolkit step. msight/executors.py auto-detects this and uses a CPU-only image instead.
+
+          # ---- MSight_Vision checkout (never modified in place, only shelled out to) ----
+          cd /home/ubuntu
+          git clone --branch ${MsightVisionRepoBranch} ${MsightVisionRepoURL} MSight_Vision
+          cd MSight_Vision
+          python3 -m venv venv
+          venv/bin/pip install --upgrade pip
+          # This venv is what _ensure_annotator/_ensure_aggregator launch host-side for recording/archiving.
+          venv/bin/pip install -e .
+          # MSight_Vision's own .env -- just needs to exist for `docker compose --env-file .env`; VIDEO_INPUT/RTSP_URL are set per-run instead.
+          if [ -f env_sample ] && [ ! -f .env ]; then cp env_sample .env; fi
+          # Pre-build the CPU-mode rfdetr_detector image, and pre-pull redis, so every later
+          # launch on this AMI is a plain `up -d` with no build or network dependency.
+          docker compose -f docker-compose.yml -f docker-compose.cpu.yml --env-file .env build
+          docker compose -f docker-compose.yml -f docker-compose.cpu.yml --env-file .env pull redis
+
+          # Demo-mode sample video: MSight_Vision ships no video, only a JPG sequence -- stitch one angle into an actual .mp4.
+          ffmpeg -y -framerate 5 -pattern_type glob \
+            -i "examples/fullstack/sample_data/gs_State_Ellsworth_SE/*.jpg" \
+            -c:v libx264 -pix_fmt yuv420p /home/ubuntu/msight_demo_video.mp4
+
+          # ---- Agent code ----
+          cd /home/ubuntu
+          git config --global --add safe.directory /home/ubuntu/myapp
+          git clone --branch ${RepoBranch} ${RepoURL} myapp
+          cd myapp
+
+          python3 -m venv venv
+          source venv/bin/activate
+
+          # Every package below is exact-pinned, so --no-deps skips pip's slow full-graph resolution.
+          if [ -f requirements_prod.txt ]; then
+            pip3 install -r requirements_prod.txt --no-deps
+          fi
+          if [ -f requirements.txt ]; then
+            pip3 install -r requirements.txt --no-deps
+          fi
+
+          # fiftyone's sse-starlette<1 conflicts with mcp's >=1.6.1, so installed separately with --no-deps.
+          pip3 install "fiftyone==1.4.1" --no-deps
+
+          # Pinned: requirements.txt's strawberry-graphql predates pydantic v2; numpy must match msight_core/imgaug.
+          pip3 install "strawberry-graphql==0.280.0"
+          pip3 install "numpy==1.26.3"
+
+          cat <<EOF > .env
+          LLM_PROVIDER=openai
+          OPENAI_MODEL=gpt-5-mini
+          OPENAI_API_KEY=${OPENAIAPIKEY}
+          ANTHROPIC_API_KEY=${ANTHROPICAPIKEY}
+          GEMINI_API_KEY=${GEMINIAPIKEY}
+          GROQ_API_KEY=${GROQAPIKEY}
+          LS_TOKEN=${LSTOKEN}
+          LS_URL=${LSURL}
+          CVAT_URL=${CVATURL}
+          CVAT_ACCESS_TOKEN=${CVATACCESSTOKEN}
+          HF_TOKEN=${HFTOKEN}
+          MSIGHT_VISION_PATH=/home/ubuntu/MSight_Vision
+          MSIGHT_DEMO_VIDEO_PATH=/home/ubuntu/msight_demo_video.mp4
+          EOF
+          chmod 600 .env
+
+          # Run from the repo root (PYTHONPATH makes msight_agent importable as a package;
+          # msight_agent puts the auto_labeling engine on sys.path itself).
+          export PYTHONPATH=/home/ubuntu/myapp
+
+          (cd auto_labeling && nohup python3 session_v51.py > session_v51.log 2>&1 &)
+
+          nohup python3 -m msight_agent.mcp_server > mcp_server.log 2>&1 &
+          nohup python3 -m msight_agent.client_chat --ui > client_chat.log 2>&1 &
+          nohup python3 -m msight_agent.chat_server > chat_server.log 2>&1 &
+          nohup python3 -m msight_agent.msight_api > msight_api.log 2>&1 &
+          nohup python3 -m uvicorn msight_agent.ingest_server:app --host 0.0.0.0 --port 8002 > ingest_server.log 2>&1
+
+Outputs:
+  PublicIP:
+    Description: Instance Public IP
+    Value: !GetAtt WebServerInstance.PublicIp

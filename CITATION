@@ -1,11 +1,24 @@
 cff-version: 1.2.0
-message: "If you use the Mcity Data Engine, please cite it as below."
+message: "If you use the MSight Agent, please cite it as below. It drives MSight Vision and builds on the Mcity Data Engine; please cite those too."
 authors:
-- family-names: "Bogdoll"
-  given-names: "Daniel"
-  orcid: "https://orcid.org/0000-0003-0432-4937"
-- family-names: "Stevens"
-  given-names: "Gregory"
-title: "Mcity Data Engine"
-date-released: 2025-01-16
-url: "https://github.com/mcity/mcity_data_engine"
+- family-names: "Venkat"
+  given-names: "Sneha"
+title: "MSight Agent"
+date-released: 2026-10-23
+url: "https://github.com/mcity/mcity_MSight_agent"
+references:
+- type: software
+  title: "MSight Vision"
+  authors:
+  - name: "Michigan Traffic Lab"
+  url: "https://github.com/michigan-traffic-lab/MSight_Vision"
+- type: software
+  title: "Mcity Data Engine"
+  authors:
+  - family-names: "Bogdoll"
+    given-names: "Daniel"
+    orcid: "https://orcid.org/0000-0003-0432-4937"
+  - family-names: "Stevens"
+    given-names: "Gregory"
+  date-released: 2025-01-16
+  url: "https://github.com/mcity/mcity_data_engine"

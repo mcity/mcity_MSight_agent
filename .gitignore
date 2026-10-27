@@ -22,9 +22,10 @@ sdist/
 var/
 venv/
 venv_kp/
-mde_uploads/
+# Agent runtime data (recordings, uploads, logs, annotation task registries)
+/data/
 wheels/
-workflows/keypoint/output/
+auto_labeling/workflows/keypoint/output/
 share/python-wheels/
 *.egg-info/
 .installed.cfg
@@ -37,6 +38,10 @@ MANIFEST
 /datasets/*
 !/datasets/datasets.yaml
 /output
+# Runtime output of the auto-labeling engine (runs from auto_labeling/)
+auto_labeling/output/
+auto_labeling/logs/
+auto_labeling/session_v51.log
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -182,9 +187,9 @@ cython_debug/
 .claude/
 
 # generated cloud data
-cloud/data/
-cloud/logs
-cloud/wandb/
+archive/cloud/data/
+archive/cloud/logs
+archive/cloud/wandb/
 
 # Weights and Biases default
 wandb/

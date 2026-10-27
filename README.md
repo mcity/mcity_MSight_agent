@@ -1,426 +1,204 @@
-## Acknowledgements
-Mcity would like to thank Amazon Web Services (AWS) for their pivotal role in providing the cloud infrastructure on which the Data Engine depends. We couldn’t have done it without their tremendous support!
+# MSight Agent
 
-# Agentic Mcity Data Engine
-
-![mcity_dataengine](https://github.com/user-attachments/assets/4b80c882-7522-4a06-8b15-c4e294b95b56)
+A natural-language agent for running and debugging [MSight Vision](https://github.com/michigan-traffic-lab/MSight_Vision), Mcity's roadside camera-perception pipeline (video source → RF-DETR detection → live web viewer). You talk to it in a chat window; it starts, reconfigures, records and troubleshoots the live pipeline for you. An auto-labeling workflow is built in to produce labeled datasets for the detector.
 
 <p align="center">
-  <img alt="Test Results" src="https://github.com/mcity/mcity_data_engine/actions/workflows/tests_documentation.yml/badge.svg"/>
-  <img alt="Test Results for UofM Cluster" src="https://github.com/mcity/mcity_data_engine/actions/workflows/lighthouse_build.yml/badge.svg"/>
   <img alt="Ubuntu Version" src="https://img.shields.io/badge/Ubuntu-24.04-blue"/>
   <img alt="Python Version" src="https://img.shields.io/badge/Python-3.12-blue"/>
-  <img alt="PyTorch Version" src="https://img.shields.io/badge/PyTorch-2.5-blue"/>
-  <img alt="CUDA Version" src="https://img.shields.io/badge/CUDA-12.4-blue"/>
-  <img alt="Visitors" src="https://visitor-badge.laobi.icu/badge?page_id=mcity.mcity_data_engine"/>
 </p>
 
-<p align='center'>
+## What it does
 
-<a target="_blank" rel="noopener noreferrer" href="https://colab.research.google.com/github/mcity/mcity_data_engine/blob/main/fish_eye_8k_colab.ipynb">
-<picture>
-  <source srcset="https://github.com/user-attachments/assets/26c12ccc-327a-4702-a49d-76bfeb83bc62" width="15%">
-  <img alt="Mcity Data Engine Google Colab Demo" src="">
-</picture>
-</a>
+- **Run the pipeline.** A one-click demo on a sample video, or your own video file, folder or RTSP stream. Starting your own source always shows a summary and waits for your confirmation.
+- **Camera calibration.** Upload `intrinsics.json` and a pixel-to-world `.npz` map from the chat. Files are validated on upload (keys, shape, image size), and the pipeline refuses to start if the map can't cover the video's frames.
+- **Build custom pipelines.** Add or remove any of 29 MSight node types (extra viewers, LiDAR, trackers, sinks) by asking. Input topics and ports are checked before a node starts, and viewers come back with their URL.
+- **Record & archive.** Save the annotated video locally or push it to S3.
+- **Debug it.** "The viewer is frozen" triggers a live diagnosis: it measures data flow on every topic and walks the publisher → topic → subscriber graph to separate the root cause from knock-on effects. It also reports which nodes run on GPU vs CPU and why, what was added or removed recently, and can run read-only host commands (drivers, ports, disk, Docker). It never changes the pipeline unless you ask.
+- **Dashboard.** A web dashboard (port 8003) for status, nodes, logs and recording, alongside the chat.
+- **Auto-labeling.** Select a dataset, configure a detection model, run auto-labeling, review in CVAT or Label Studio, and localize detections to lat/lon. See [auto_labeling/README.md](auto_labeling/README.md).
 
-<a target="_blank" rel="noopener noreferrer" href="https://github.com/mcity/mcity_data_engine/wiki">
-<picture>
-  <source srcset="https://github.com/user-attachments/assets/e3e1cd10-5195-4db7-9147-11b75e078662" width="15%">
-  <img alt="Mcity Data Engine Wiki" src="">
-</picture>
-</a>
+The agent never modifies MSight Vision itself: it drives a separate checkout through Docker, MSight's own launch commands and its Redis message bus.
 
-<a target="_blank" rel="noopener noreferrer" href="https://mcity.github.io/mcity_data_engine/">
-<picture>
-  <source srcset="https://github.com/user-attachments/assets/b93f0c88-172d-4eed-8dac-3fdb82436f71"
-width="15%">
-  <img alt="Mcity Data Engine Docs" src="">
-</picture>
-</a>
+## How it fits together
 
-<a target="_blank" rel="noopener noreferrer" href="https://wandb.ai/mcity">
-<picture>
-  <source srcset="https://github.com/user-attachments/assets/2e54c0ba-26b7-42cf-b33f-903ddfd55ae9" width="15%">
-  <img alt="Mcity Data Engine Logs" src="">
-</picture>
-</a>
-
-<a target="_blank" rel="noopener noreferrer" href="https://huggingface.co/mcity-data-engine">
-<picture>
-  <source srcset="https://github.com/user-attachments/assets/5b925a76-d0a2-46ad-8d95-b9296d6a5b46" width="15%">
-  <img alt="Mcity Data Engine Models" src="">
-</picture>
-</a>
-</p>
-
-The Agentic MCity Data Engine introduces a conversational AI layer that sits seamlessly on top of the core data engine, enabling natural language interaction with complex computer vision workflows. Built using the Model Context Protocol (MCP), the agent acts as an intelligent orchestrator that guides users through workflow configuration and execution without requiring deep technical knowledge.
-
-This repository (`mcity_MSight_agent`) currently exposes two workflows through that agentic layer:
-- **Auto Labeling** — dataset selection, model configuration, and training/inference against the Mcity Data Engine's own FiftyOne-based pipeline, with export to CVAT or Label Studio for review.
-- **MSight Pipeline** — natural-language control of [MSight_Vision](https://github.com/michigan-traffic-lab/MSight_Vision), a third-party, open-source roadside camera-perception pipeline (RF-DETR detection, tracking, live web viewer). The agent does not vendor or modify MSight_Vision — it drives a separate, independently-checked-out copy entirely through Docker Compose and MSight_Vision's own CLI entry points. See [MSight Pipeline Workflow](#msight-pipeline-workflow) below.
-
-<div align="center">
-  <picture>
-    <source srcset="https://github.com/user-attachments/assets/19f326be-6588-457a-92d4-b7ec08f7491b" width="75%">
-    <img alt="Agentic Mcity Data Engine Architecture" src="">
-  </picture>
-  <p><em>Figure 1. The Agentic Mcity Data Engine bridges programmatic and natural-language workflows through an LLM-agnostic MCP layer.</em></p>
-</div>
-
-
-On February 24, 2025, Daniel Bogdoll, a research scholar at Mcity, gave a presentation on the first release of the Mcity Data Engine in Ann Arbor, Michigan. The recording provides insight into the general architecture, its features and ecosystem integrations, and demonstrates successful data curation and model training for improved Vulnerable Road User (VRU) detection:
-<div align="center">
-      <a href="https://www.youtube.com/watch?v=ciT8YwQCHwo">
-         <img src="https://github.com/user-attachments/assets/dcd2cd42-9cc0-4cf0-abab-a4d4ebd14198" style="width:60%;">
-      </a>
-</div>
-
-## Key Features of the Agentic Implementation:
-The Agentic Mcity Data Engine extends the Mcity Data Engine with an LLM-agnostic orchestration layer powered by the Model Context Protocol (MCP).
-This layer transforms each workflow — Auto Labeling and MSight Pipeline — into structured, callable tools that can be accessed either through natural-language interaction or programmatic APIs.
-
-<div align="center"> <picture> <source srcset="https://github.com/user-attachments/assets/3a5c751d-a386-4170-bd44-a29783fc92d6" width="80%"> <img alt="Agentic Mcity Data Engine Detailed Architecture" src=""> </picture> <p><em>Figure 2. Agentic Mcity Data Engine architecture – detailed interaction between user, LLM, chat server, MCP tool server.</em></p> </div>
-
-Natural Language Configuration: Configure complex workflows through conversational commands instead of manually editing Python config files. The agent translates natural language requests into correct configuration settings, validates parameters, maintains context across conversation turns, and guides users through multi-step workflow setup with intelligent prompts and error prevention.
-
-### Core Components:
-
-**- User Interface :** A unified entry point for interaction—users can chat via a natural-language web UI or send direct HTTP API requests from the terminal.
-
-**- Chat Server:**  A FastAPI service (port 8001) acting as the bridge between the user, LLM, and backend MCP services.
-It maintains multi-turn chat history, handles tool invocations, streams Server-Sent Event (SSE) logs, and supports both web-UI and programmatic clients.
-
-**- LLM Layer (Model-Agnostic):** Connects to OpenAI, Anthropic Claude, Google Gemini, or Groq models.
-The LLM interprets user instructions, determines the appropriate workflow tool call, and sends structured requests back to the chat server for execution.
-
-**- MCP Server:** A FastAPI-based backend (port 8000) exposing 30+ tools across both workflows — Auto Labeling (dataset selection, ingestion, model configuration, CVAT/Label Studio export, Voxel51 visualization) and MSight Pipeline (Docker Compose lifecycle control, camera-calibration status, video record & archive) — plus shared infrastructure used by both.
-
-**- Data Ingestion Server:** A dedicated service (port 8002) for uploading and preprocessing datasets.
-It supports drag-and-drop ingestion of images, videos, and annotations in COCO, YOLO, or CVAT-XML formats, automatically converting them into FiftyOne-compatible datasets.
-This server streams conversion logs and progress via SSE and updates datasets.yaml dynamically to register new datasets for use across workflows.
-
-**- Data Engine Core:** The underlying Mcity Data Engine handling data selection, labeling, training, validation, and visualization.
-The agentic layer orchestrates these modules programmatically via MCP instead of relying on static configuration editing.
-
-### MSight Pipeline Workflow
-
-The `msight_pipeline` workflow lets the agent start, stop, and monitor MSight_Vision's live RF-DETR detection pipeline — a separate `redis` + `video_source` + `rfdetr_detector` + `detection_viewer` Docker Compose stack — from a natural-language conversation, without ever touching MSight_Vision's own source:
-
-- **Requires an independent MSight_Vision checkout.** Set `MSIGHT_VISION_PATH` in `.env` to point at a working copy of [MSight_Vision](https://github.com/michigan-traffic-lab/MSight_Vision) (its own `git clone`, with `docker-compose.yml` and a Python venv with MSight's CLI entry points installed). This repo never vendors or edits that checkout — it only invokes `docker compose` against it and shells out to its CLI binaries (`msight_launch_image_to_video_aggregator`, `msight_launch_video_local_dumper`, `msight_launch_aws_video_pusher`) for the record/archive nodes.
-- **Demo or custom source:** either point the agent at the developer's own test video/stream (`MSIGHT_DEMO_VIDEO_PATH` in `.env`) for a zero-setup demo, or supply your own `video_input` (file/folder) or `rtsp_url`.
-- **Explicit run confirmation:** for a custom source, the first `start_msight_pipeline` call never launches anything — it returns a consent summary (source, calibration status, recording/archiving selection) that the user must confirm before any container actually starts.
-- **Camera calibration:** upload your own `intrinsics.json` + calibration `.npz` (built with [camera_calibration2](https://github.com/michigan-traffic-lab/camera_calibration2)) via the web UI's upload button; the agent validates the file formats and reports live calibration status (`default` / `user_calibrated` / `missing` / `partial`) every turn.
-- **Record & Archive:** independent, opt-in local video recording and S3 archiving of the *annotated* feed (bounding boxes/labels/scores drawn in via a small frame-annotator node this agent launches, not MSight_Vision itself) — run as tracked host subprocesses alongside the Docker-based detection pipeline.
-- **GPU vs CPU auto-detected:** checks for a working `nvidia-smi` and transparently layers in this repo's own CPU compose override (`mcp_layer/mcptools/msight_cpu_override.yml`).
-- **Friendly error handling:** known Docker/host failure modes (a host process already bound to Redis's port, a malformed `.env` line) are translated into actionable messages instead of raw `docker compose` output.
-
-## Online Demo: Data Selection with Embeddings
-
-To get a first feel for the Mcity Data Engine, we provide an online demo in a [Google Colab](https://colab.research.google.com/github/mcity/mcity_data_engine/blob/main/fish_eye_8k_colab.ipynb) environment. We will load the [Fisheye8K dataset](https://huggingface.co/datasets/Voxel51/fisheye8k) and demonstrate the Mcity Data Engine workflow [Embedding Selection](https://github.com/mcity/mcity_data_engine/wiki/Workflows#embedding-selection). This workflow leverages a set of models to compute image embeddings which are used to determine both representative and rare samples. The dataset is then visualized in the Voxel51 UI, highlighting how often a sample was picked by the workflow.
-
-Note that most of the Mcity Data Engine workflows require a more powerful GPU, so the possibilities within the Colab environment are limited. Other workflows may not work.
-
-Online demo on Google Colab: [Mcity Data Engine Web Demo](https://colab.research.google.com/github/mcity/mcity_data_engine/blob/main/fish_eye_8k_colab.ipynb
-)
-
-## Local Execution
-
-At least one GPU is required for many of the Mcity Data Engine workflows. Check the hardware setups we have tested in the [**Wiki**](https://github.com/mcity/mcity_data_engine/wiki/Environments). To download the repository and install the requirements run:
 ```
+browser chat (5225) ──► chat server (8001) ──► agent loop ──► MCP server (8000) ──► control plane ──► Docker / host processes
+dashboard (8003)    ──► MSight API ─────────────────────────►        ▲ same tools          │
+dataset uploads ──► ingest server (8002)                                                   └──► Redis (MSight topics + node registry)
+```
+
+| Process | Port | Role |
+|---|---|---|
+| `mcp_server` | 8000 | All tools (MSight pipeline, nodes, diagnosis, auto-labeling). Owns the control plane, the single source of truth for what's running. |
+| `chat_server` | 8001 | Runs the agent: builds the prompt and live state hint, calls the LLM, executes its tool calls, streams replies. Also serves calibration/video uploads and recording downloads. |
+| `ingest_server` | 8002 | Dataset uploads for auto-labeling. |
+| `msight_api` | 8003 | REST API + built dashboard. Calls the same MCP tools as the chat. |
+| `client_chat` | 5225 | Serves the chat web page (without `--ui`: a terminal chat against the same server). |
+
+The LLM is your choice: OpenAI, Anthropic Claude, Google Gemini or Groq.
+
+## Setup
+
+**Prerequisites** (Ubuntu 24.04):
+
+- Python 3.12, `git`, `ffmpeg`, `pciutils` (`sudo apt install python3.12-venv git ffmpeg pciutils`; pciutils lets the agent tell "no GPU" from "GPU present but driver broken")
+- Docker Engine with the Compose plugin, and your user in the `docker` group (`sudo usermod -aG docker $USER`, then log out and back in)
+- GPU (optional): NVIDIA driver + [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html). Without a GPU, RF-DETR runs on a CPU-only image automatically (much slower).
+- Node.js 22.12+ or 24 (only to build the dashboard; Ubuntu's own `nodejs` package is too old). With [nvm](https://github.com/nvm-sh/nvm): `curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash`, open a new shell, then `nvm install 24`
+- Redis is optional: if nothing is listening on `localhost:6379`, the agent starts a Redis container itself.
+
+**1. This repo:**
+
+```bash
 git clone git@github.com:mcity/mcity_MSight_agent.git
 cd mcity_MSight_agent
+python3.12 -m venv .venv          # 3.12 explicitly: several pinned packages don't support 3.13+
+.venv/bin/pip install --upgrade pip
+.venv/bin/pip install -r requirements.txt
 
-# Use python3.12 explicitly -- plain `python3` may resolve to a newer default
-# (3.13/3.14) on your system, which several pinned packages (e.g. numba==0.61.0)
-# do not yet support.
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-pip install -r agent_requirements.txt
-
-# fiftyone requires sse-starlette<1, but mcp (via fastmcp) requires >=1.6.1 --
-# no version satisfies both, so fiftyone is installed separately with --no-deps
-# rather than forcing the wrong one onto the rest of the stack.
-pip install "fiftyone==1.4.1" --no-deps
+# fiftyone requires sse-starlette<1 but mcp requires >=1.6.1, so fiftyone is
+# installed on its own with --no-deps.
+.venv/bin/pip install "fiftyone==1.4.1" --no-deps
 ```
 
-Login with your [Weights and Biases](https://wandb.ai/) and [Hugging Face](https://huggingface.co/) accounts:
-```
-wandb login
-hf auth login
-```
+**2. MSight Vision**, cloned outside this repo:
 
-### Agentic Implementation Guide:
-
-**Configuration**: Create a .env file with your LLM API key.
-```
-# Choose your LLM provider (openai, claude, gemini, or groq)
-LLM_PROVIDER=openai
-
-# Add your API key
-OPENAI_API_KEY=sk-...
-# OR
-ANTHROPIC_API_KEY=sk-ant-...
-# OR
-GEMINI_API_KEY=...
-# OR
-GROQ_API_KEY=...
-
-# Required only for the MSight Pipeline workflow — path to an independent
-# MSight_Vision checkout (see "MSight Pipeline Workflow" above).
-MSIGHT_VISION_PATH=/path/to/your/MSight_Vision
-
-# Optional — enables a one-click "Demo" source in the MSight Pipeline workflow
-# without asking the user for a video path.
-MSIGHT_DEMO_VIDEO_PATH=/path/to/a/demo/video/or/folder
+```bash
+git clone https://github.com/michigan-traffic-lab/MSight_Vision.git ~/MSight_Vision
+cd ~/MSight_Vision
+python3 -m venv venv && venv/bin/pip install -e .   # for host-process nodes (recording, LiDAR, trackers)
+cp env_sample .env                                  # its own settings; the agent overrides the source
 ```
 
-**Launch the Agentic Interface:**
-Start all four components one after the other in separate terminals:
-```
-# Terminal 1: MCP Tool Server (port 8000)
-python mcp_layer/mcp_server.py
+**3. `.env`** in this repo's root:
 
-# Terminal 2: Chat Server (port 8001)
-uvicorn mcp_layer.chat_server:app --port 8001 --reload
+```bash
+LLM_PROVIDER=openai            # openai, claude, gemini or groq
+OPENAI_API_KEY=sk-...          # and/or ANTHROPIC_API_KEY, GEMINI_API_KEY, GROQ_API_KEY
 
-# Terminal 3: Data Ingestion Server (port 8002)
-uvicorn mcp_layer.ingest_server:app --host 0.0.0.0 --port 8002 --reload
+MSIGHT_VISION_PATH=/home/<you>/MSight_Vision
+MSIGHT_DEMO_VIDEO_PATH=/path/to/demo_video.mp4   # optional: enables the one-click demo
 
-# Terminal 4: Launch Web UI (port 5225)
-python mcp_layer/client_chat.py --ui
-```
-
-The web interface will open automatically at http://localhost:5225.
-
-**Docker / AWS Deployment:**
-`agent_deployment/` does **not** contain a Dockerfile for running the agent itself in a
-local container. Instead:
-- `agent_deployment/Docker/` is a small Flask app (`App.py` + `cloudFormationManager.py` +
-  `redisManager.py`) that provides a web form for launching a *remote* AWS EC2 sandbox
-  running this repo via CloudFormation. `docker-compose.yml` there runs that launcher
-  app itself (plus a Redis instance it depends on) — it does not run the data engine.
-  Copy `agent_deployment/Docker/env_sample` to `agent_deployment/Docker/.env` and fill in
-  your AWS credentials before running `docker compose up` in that directory.
-- `agent_deployment/Full-install/` and `agent_deployment/Using-AMI/` contain the
-  CloudFormation templates (`deploy-agent.yml`, `deploy-agent-AWS-AMI.yml`) that the
-  Flask app submits — these boot a plain EC2 instance (or one from a pre-baked AMI) and
-  run the same "Launch the Agentic Interface" steps above via cloud-init.
-
-If you're looking to containerize the agent itself for local testing, that setup doesn't
-exist yet in this repo.
-
-**Talk to Task: Example Run**
-```
-User: Hi, I would like to explore the data engine for processing my data.
-
-Agent: Great! I can help you with Auto Labeling — training or running an object
-       detection model on your dataset. Which dataset would you like to use?
-
-User: fisheye8k
-
-Agent: Dataset 'fisheye8k' confirmed. Do you have credentials configured for
-       CVAT or Label Studio? I detected Label Studio credentials — using
-       Label Studio for annotation. How would you like to annotate your
-       dataset?
-          - Manual Labeling: export your dataset for manual annotation.
-          - Auto Generated Labeling: run a detection model to generate
-            predictions automatically, then review/correct them.
-
-User: Auto Generated Labeling.
-
-Agent: Here are the available model sources and models: [...]
-       Which model would you like to use?
-
-User: rfdetr_2xlarge
-
-Agent: rfdetr_2xlarge (roboflow) has been configured.
-       Here are the current hyperparameters: [...]
-       Would you like to modify any of these hyperparameters, or are you
-       ready to start?
-
-User: Let's go with the defaults.
-
-Agent: Here's a summary of what will be run: [...] Shall I proceed with
-       auto-labeling?
-
-User: Yes, proceed.
-
-[Data Engine Server]: Running auto-labeling — live logs are streamed here and to Weights and Biases.
-
-Agent: Auto-labeling completed. Predictions have been exported to Label Studio
-       for review. Let me know when you're done and I'll import your labels
-       back, or I can launch Voxel51 so you can explore the results now.
+# Optional, for auto-labeling and S3 archiving
+HF_TOKEN=...                           # Hugging Face (models, datasets)
+LS_URL=... LS_TOKEN=...                # Label Studio
+CVAT_URL=... CVAT_ACCESS_TOKEN=...     # CVAT
+AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
 ```
 
-**MSight Pipeline: Example Run**
-```
-User: I want to run the MSight camera detection pipeline.
+**4. Dashboard** (one-time build):
 
+```bash
+cd msight_agent/frontend/dashboard && npm install && npx quasar build
+```
+
+**First pipeline start is slow:** Docker pulls the `michigantrafficlab/msight-vision` image (several GB) and RF-DETR downloads its weights (~500 MB) from Hugging Face into `MSight_Vision/examples/rfdetr/models/`. Later starts take seconds.
+
+## Running
+
+Start each in its own terminal, **from the repo root**, MCP server first:
+
+```bash
+.venv/bin/python3 -m msight_agent.mcp_server                                            # 8000
+.venv/bin/python3 -m uvicorn msight_agent.chat_server:app --port 8001                   # 8001
+.venv/bin/python3 -m uvicorn msight_agent.ingest_server:app --host 0.0.0.0 --port 8002  # 8002
+.venv/bin/python3 -m msight_agent.client_chat --ui                                      # 5225, opens the chat
+.venv/bin/python3 -m msight_agent.msight_api                                            # 8003, dashboard
+```
+
+Then open the chat at http://localhost:5225 and the dashboard at http://localhost:8003. Use `.venv/bin/python3` as shown rather than an activated shell or bare `uvicorn`, so another project's environment can't get picked up.
+
+**Quick check:** in the chat, say "hi" then "run a demo". A viewer link appears; detections should show within a minute (longer on the first run). "Is it actually working?" runs a live diagnosis.
+
+**Common problems:**
+
+| Symptom | Fix |
+|---|---|
+| `ModuleNotFoundError: No module named 'msight_agent'` | Run from the repo root, with `python -m`. |
+| `permission denied ... docker.sock` | Your user isn't in the `docker` group yet (see prerequisites), or you haven't logged back in. |
+| `address already in use` on 8000–8003 or 5225 | Another copy of a server is still running; stop it first. |
+| Demo says no demo video | `MSIGHT_DEMO_VIDEO_PATH` isn't set, or the file doesn't exist. |
+| Dashboard page shows only JSON / 404 | The dashboard hasn't been built (setup step 4). |
+
+## Example session
+
+```
+You:   hi
 Agent: Welcome to MSight Agent! Would you like to:
-          - Demo: see it running immediately with a test video.
-          - Run your own pipeline: set up your own camera calibration,
-            video/RTSP source, recording & archiving, and optionally
-            auto-labeling — in any order.
+       1. Run a demo  2. Run your own pipeline  3. Manage or troubleshoot something directly
 
-User: I want to run my own pipeline.
+You:   run a demo
+Agent: [explains the pipeline] The pipeline is running — live detections at http://localhost:9010.
 
-Agent: Here's your checklist — do these in any order, come back anytime:
-          1. Camera calibration (currently: default demo calibration)
-          2. Video/RTSP source (currently: not set)
-          3. Record & Archive (available once a real source is running)
-          4. Auto Labeling (optional, if you don't have a labeled dataset yet)
-       Which would you like to start with?
+You:   add a second viewer
+Agent: 'detection_viewer_2' started on detection/gs_mcity_1. Open it at http://localhost:9011.
 
-User: Use this video file: /data/gs_mcity_1/2026-07-01.mp4
+You:   [deletes rfdetr_detector from the dashboard] the viewer is stuck
+Agent: Root cause: detection_viewer subscribes to 'detection/gs_mcity_1', which was published by
+       'rfdetr_detector' — removed 11s ago. Want me to add it back or restart the pipeline?
 
-Agent: Here's what will run:
-          - Source: /data/gs_mcity_1/2026-07-01.mp4
-          - Calibration: default demo calibration (no user upload yet)
-          - Recording: off · Archiving: off
-       Shall I start the pipeline with these settings?
-
-User: Yes, go ahead.
-
-Agent: MSight_Vision pipeline started. Watch live detections at
-       http://localhost:9010. You can also check status, view logs,
-       stop it, or restart with a different input — just ask.
-
-User: How's it doing?
-
-Agent: All 4 containers are running (redis, video_source, rfdetr_detector,
-       detection_viewer). No errors in the last 200 log lines.
+You:   is it running on CPU or GPU?
+Agent: rfdetr_detector runs on the GPU (RTX 4090); the source and viewer are CPU-only.
 ```
 
-### Notebooks and Submodules
+## Deployment
 
-To exclude the output of jupyter notebooks from git tracking, add the following lines to your ```.git/config``` :
+`deployment/` holds the AWS setup: `Docker/` is a small Flask app that launches a remote EC2 sandbox through CloudFormation, and `Full-install/` and `Using-AMI/` are the templates it submits. Those boot an instance and start the same five processes from the repo root. There is no Dockerfile for running the agent itself in a local container yet.
 
-```
-[filter "strip-notebook-output-engine"]
-    clean = <your_path>/mcity_MSight_agent/.venv/bin/jupyter nbconvert --ClearOutputPreprocessor.enabled=True --ClearMetadataPreprocessor.enabled=True --to=notebook --stdin --stdout
-    smudge = cat
-    required = true
-```
+## Development
 
-and those to ```.git/modules/mcity_data_engine_scripts/config```
-
-```
-[filter "strip-notebook-output-scripts"]
-    clean = <your_path>/mcity_MSight_agent/.venv/bin/jupyter nbconvert --ClearOutputPreprocessor.enabled=True --ClearMetadataPreprocessor.enabled=True --to=notebook --stdin --stdout
-    smudge = cat
-    required = true
+```bash
+.venv/bin/python3 -m pytest msight_agent/tests          # agent unit tests (no services needed)
+cd auto_labeling && ../.venv/bin/python3 -m pytest tests  # engine tests
+.venv/bin/python3 msight_agent/evals/fault_injection_eval.py --runs 2   # live fault-injection eval (needs the stack running, ~45 min)
 ```
 
-In order to keep the submodules updated, add the following lines to the top of your ```.git/hooks/pre-commit```:
+The eval injects real faults (killed or deleted nodes, topic typos, port conflicts, bad configs) into a running pipeline, asks the agent about the symptom, and scores both the diagnosis and the agent's reply.
 
-```
-git submodule update --recursive --remote
-git add .gitmodules $(git submodule foreach --quiet 'echo $name')
-```
+## Repository structure
 
-## Repository Structure
 ```
 .
-├── main.py                     # Entry point of the framework → Terminal 1
-├── session_v51.py              # Script to launch Voxel51 session → Terminal 2
-├── workflows/                  # Workflows for the Mcity Data Engine
-├── config/                     # Local configuration files
-├── utils/                      # General-purpose utility functions
-├── cloud/                      # Scripts run in the cloud to pre-process data
-├── docs/                       # Documentation generated with `pdoc`
-├── tests/                      # Tests using Pytest
-├── custom_models/              # External models with containerized environments
-├── MSight/                      # Offline dataset geolocation (not the live pipeline — see MSight/README.md)
-│  ├── localize_dataset.py      # Fisheye ground-contact + lat/lon localization
-│  ├── utils/
-│  │   ├── fiftyone_to_msight_det.py  # FiftyOne detections -> MSight detection objects
-│  │   └── load_locamaps.py     # Calibration NPZ/intrinsics loading + pixel localizer
-│  ├── data/                    # Hardcoded single-camera (Ashley/Huron) calibration files
-│  └── install.sh               # Installs msight_base/msight_core into the active venv
-├── mcp_layer/                   # Agentic (MCP) layer
-│  ├── mcp_server.py            # MCP tool registry (port 8000)
-│  ├── chat_server.py           # FastAPI chat endpoint (port 8001) + /msight/upload_calibration
-│  ├── ingest_server.py         # File upload & processing (port 8002)
-│  ├── client_chat.py           # Web/terminal client (port 5225)
-│  ├── chat_pipeline.py         # Tool dispatch, state routing, reply formatting
-│  ├── pipeline_handlers/       # Per-workflow handler mixins for ChatPipeline
-│  │   ├── auto_labeling.py
-│  │   └── msight_pipeline.py
-│  ├── pipeline_common.py       # Shared routing/sentinel primitives for the handlers above
-│  ├── progress_relay.py        # Relays live docker-compose build output to the active /chat/stream
-│  ├── validate_workflow_state.py # Pydantic workflow state machine (both workflows)
-│  ├── host_utils.py            # AWS IMDSv2 host/IP resolution for the viewer URL
-│  ├── mcptools/                # Tool implementations
-│  │   ├── __init__.py
-│  │   ├── workflow_selector.py
-│  │   ├── auto_labeling.py
-│  │   ├── data_ingest.py
-│  │   ├── cvat_export.py
-│  │   ├── label_studio_export.py
-│  │   ├── msight_docker.py     # start/stop/status/logs — docker compose control for MSight_Vision
-│  │   ├── msight_record_archive.py # Local recording + S3 archiving as tracked host subprocesses
-│  │   └── v51.py               # Voxel51 integration
-│  ├── msight_nodes/            # Standalone MSight nodes (not MCP tools) launched as
-│  │   │                        # subprocesses via MSight_Vision's own venv interpreter
-│  │   └── annotated_frame_publisher.py # Draws detection boxes, republishes for Record & Archive
-│  ├── llm_clients.py           # Multi-LLM support (OpenAI, Claude, Gemini, Groq)
-│  ├── tool_schema.py           # Tool definitions exposed to the LLM
-│  ├── prompts/                 # System + per-workflow prompt text
-│  │   ├── state_hints.txt      # Per-turn SESSION_STATE hint fragments
-│  │   └── workflows/
-│  │       ├── auto_labeling.txt
-│  │       └── msight_pipeline.txt
-│  ├── tests/                   # Pytest coverage for state routing/tool filtering
-│  └── ui/                      # Web interface assets
-│      └── index.html
-├── agent_deployment/            # AWS CloudFormation / Docker launcher for the agent
-├── mcity_data_engine_scripts/   # Experiment scripts and one-time operations (Mcity internal)
-├── .vscode                     # Settings for VS Code IDE
-├── .github/workflows/          # GitHub Action workflows
-├── .gitignore                  # Files and directories to be ignored by Git
-├── .gitattributes              # Rules for handling files like Notebooks during commits
-├── .gitmodules                 # Configuration for managing Git submodules
-├── .secret                     # Secret tokens (not tracked by Git)
-└── requirements.txt            # Python dependencies (pip install -r requirements.txt)
+├── msight_agent/               # The MSight agent
+│  ├── mcp_server.py            # MCP tool server (8000)
+│  ├── chat_server.py           # Chat backend (8001)
+│  ├── ingest_server.py         # Dataset uploads (8002)
+│  ├── msight_api.py            # REST API + dashboard (8003)
+│  ├── client_chat.py           # Chat page (5225)
+│  ├── agent/                   # The chat agent (workflow-independent)
+│  │   ├── loop.py              # One user turn: LLM call -> tool calls -> repeat
+│  │   ├── guards.py            # In-code turn rules (grounding, consent, measure-first)
+│  │   ├── dispatch.py          # Runs a turn's tool calls
+│  │   ├── routing.py           # Injection / HardStop / FallThrough, WRITE_TOOLS, helpers
+│  │   ├── state.py             # Pydantic session state, WORKFLOW_SPECS, valid tools per step
+│  │   ├── prompts.py           # System prompt assembly
+│  │   ├── state_hints.py       # Per-turn SESSION_STATE hint
+│  │   ├── tool_schema.py       # Tool definitions the LLM sees
+│  │   ├── llm_clients.py       # OpenAI / Claude / Gemini / Groq
+│  │   ├── workflow_tools.py    # MCP tools: select/switch/reset workflow, datasets
+│  │   └── prompts/             # base_prompt.txt, state_hints.txt
+│  ├── msight/                  # MSight Vision live pipeline (primary workflow)
+│  │   ├── runtime/             # Control plane, executors, diagnosis, node catalog, calibration
+│  │   ├── tools/               # MCP tools: pipeline, nodes, record_archive, calibration,
+│  │   │                        #   host_inspect, reference
+│  │   ├── handlers.py          # Chat-side handlers (consent gate, deferred recording)
+│  │   ├── hints.py             # MSight part of the state hint
+│  │   ├── routes.py            # Upload/download endpoints
+│  │   └── prompts/             # msight_pipeline.txt + reference/*.md
+│  ├── auto_labeling/           # Agent side of auto-labeling: tools/, handlers.py, hints.py, prompts/
+│  ├── shared/                  # MCP instance, MCP connection, repo paths, host lookup
+│  ├── frontend/                # chat/ (web page) and dashboard/ (Quasar app)
+│  ├── tests/                   # Unit tests
+│  └── evals/                   # Live fault-injection eval
+├── auto_labeling/              # Auto-labeling engine the agent runs (see auto_labeling/README.md)
+├── upstream/                   # Our MSight node meant to move into MSight Vision (frame annotator)
+├── deployment/                 # AWS CloudFormation / launcher
+├── archive/                    # Retired data-engine material (cloud scripts, generated docs, Colab notebook)
+├── data/                       # Runtime data, gitignored: recordings, uploads, logs, annotation tasks
+├── requirements.txt            # Full pinned environment
+└── requirements_prod.txt       # Subset installed on AWS instances
 ```
 
-## Training
+## Acknowledgements
 
-Training runs are logged with [Weights and Biases (WandB)](https://wandb.ai/mcity/mcity-data-engine).
-
-In order to change the standard WandB directory, run
-
-```
-echo 'export WANDB_DIR="<your_path>/mcity_MSight_agent/logs"' >> ~/.profile
-source ~/.profile
-```
-
-## Contribution
-
-Contributions are very welcome! The Mcity Data Engine is a blueprint for data curation and model training and will not support every use case out of the box. Please find instructions on how to contribute here:
-
-- [Contribute new workflow](https://github.com/mcity/mcity_data_engine/wiki/Workflows#how-to-add-a-new-workflow)
-- [Contribute new dataset](https://github.com/mcity/mcity_data_engine/wiki/Datasets#how-to-add-a-new-dataset)
-- [Contribute new model](https://github.com/mcity/mcity_data_engine/wiki/Models)
-
-Special thanks to these amazing people for contributing to the Mcity Data Engine! 🙌
-
-<a href="https://github.com/mcity/mcity_data_engine/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=mcity/mcity_data_engine" />
-</a>
-
-## Citation
-
-If you use the Mcity Data Engine in your research, feel free to cite the project:
-
-```bibtex
-@article{bogdoll2025mcitydataengine,
-  title={Mcity Data Engine},
-  author={Bogdoll, Daniel and Anata, Rajanikant Patnaik and Stevens, Gregory},
-  journal={GitHub. Note: https://github.com/mcity/mcity_data_engine},
-  year={2025}
-}
-```
+Built on the [Mcity Data Engine](https://github.com/mcity/mcity_data_engine) (see [auto_labeling/README.md](auto_labeling/README.md) for its background and citation) and [MSight Vision](https://github.com/michigan-traffic-lab/MSight_Vision). Mcity thanks Amazon Web Services (AWS) for the cloud infrastructure behind the deployment.

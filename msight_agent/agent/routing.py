@@ -1,0 +1,136 @@
+"""Routing/sentinel primitives shared by ChatPipeline and its handler mixins (avoids a circular import)."""
+import json
+import re
+from dataclasses import dataclass
+
+
+# Human-readable status emitted to the UI before each tool call.
+TOOL_STATUS_MESSAGES: dict[str, str] = {
+    "select_workflow":                       "Setting up workflow...",
+    "switch_workflow":                       "Switching workflow...",
+    "set_selected_dataset":                  "Confirming dataset...",
+    "list_datasets":                         "Fetching available datasets...",
+    "list_model_sources_and_models":         "Fetching available models...",
+    "configure_auto_labeling":               "Configuring model selection...",
+    "set_auto_labeling_hyperparams":         "Updating hyperparameters...",
+    "set_msight_localization_config":        "Configuring MSight localization...",
+    "run_auto_labeling":                     "Starting auto-labeling — this may take several minutes...",
+    "export_to_cvat":                        "Exporting dataset to CVAT...",
+    "import_from_cvat":                      "Importing annotations from CVAT...",
+    "export_to_label_studio":                "Exporting dataset to Label Studio...",
+    "import_from_label_studio":              "Importing annotations from Label Studio...",
+    "get_labeling_backend":                  "Detecting annotation backend...",
+    "set_labeling_backend":                  "Configuring annotation backend...",
+    "set_labeling_path":                     "Setting labeling path...",
+    "confirm_export":                        "Recording export consent...",
+    "confirm_run":                           "Recording run consent...",
+    "reset_workflow_state":                  "Resetting workflow state...",
+    "launch_voxel51_session":                "Launching Voxel51 visualization...",
+    "diagnose_msight_pipeline":              "Diagnosing pipeline — sampling live data flow (~5-10s)...",
+    "inspect_host":                          "Inspecting the host...",
+}
+
+# Strip ANSI escape codes and bare CR from subprocess output.
+ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]|\r')
+
+# Tools that change live state; a success suppresses send_reply's source tag
+# and counts as real progress when the iteration budget runs out.
+WRITE_TOOLS: frozenset[str] = frozenset({
+    "start_msight_pipeline", "stop_msight_pipeline",
+    "add_msight_node", "remove_msight_node",
+    "start_msight_recording", "stop_msight_recording",
+    "start_msight_archiving", "stop_msight_archiving",
+})
+
+
+def unwrap_tool_output(raw, unescape_newlines: bool = True) -> str:
+    """Normalize any LLM/MCP output type to a plain string. Pass
+    unescape_newlines=False when the result will be re-parsed as JSON."""
+    def text(value: str) -> str:
+        return (value.replace("\\n", "\n") if unescape_newlines else value).strip()
+
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    if hasattr(raw, "text"):
+        return text(raw.text or "")
+    if isinstance(raw, list):
+        parts = [unwrap_tool_output(x, unescape_newlines) for x in raw]
+        return "\n".join(p for p in parts if p).strip()
+    if isinstance(raw, dict):
+        if isinstance(raw.get("text"), str):
+            return text(raw["text"])
+        if isinstance(raw.get("content"), list):
+            return unwrap_tool_output(raw["content"], unescape_newlines)
+        if isinstance(raw.get("data"), dict) and "msg" in raw["data"]:
+            return text(str(raw["data"]["msg"]))
+        for key in ("message", "detail"):
+            if isinstance(raw.get(key), str):
+                return text(raw[key])
+    return str(raw).strip()
+
+
+def tool_status(result: str) -> str | None:
+    """The "status" of a {"status": ..., ...} tool response, or None if it isn't one."""
+    try:
+        parsed = json.loads(result)
+    except (TypeError, ValueError):
+        return None
+    return parsed.get("status") if isinstance(parsed, dict) else None
+
+
+def format_reply(message: str, source: str | None) -> str:
+    """send_reply's text, with a [source: ...] tag when the model supplied one."""
+    if source and source.strip():
+        return f"{message.strip()}\n[source: {source.strip()}]"
+    return message
+
+
+# Handlers return (raw_str, list[ToolRouting]); ChatPipeline._orchestrate applies
+# all Injections, then the last HardStop wins.
+
+
+@dataclass
+class Injection:
+    """Inject a system context message; the agentic loop continues."""
+    message: str
+
+
+@dataclass
+class HardStop:
+    """Return this reply directly to the user; the agentic loop ends."""
+    reply: str
+
+
+@dataclass
+class FallThrough:
+    """No pipeline reply; let the final LLM pass summarize the tool result."""
+
+
+ToolRouting = Injection | HardStop | FallThrough
+
+
+class Sentinels:
+    """Prefix strings returned by MCP tools to signal specific error/state conditions."""
+    DATASET_NOT_FOUND         = "DATASET_NOT_FOUND"
+    EXPORT_NEEDS_CONFIRMATION = "EXPORT_NEEDS_CONFIRMATION"
+    RUN_NEEDS_CONFIRMATION    = "RUN_NEEDS_CONFIRMATION"
+    LS_BACKEND_ERROR          = "LS_BACKEND_ERROR"
+    LS_AUTH_ERROR             = "LS_AUTH_ERROR"
+    LS_CONNECTION_ERROR       = "LS_CONNECTION_ERROR"
+    CVAT_TASK_LIMIT_REACHED   = "CVAT_TASK_LIMIT_REACHED"
+    CVAT_STORAGE_LIMIT_REACHED = "CVAT_STORAGE_LIMIT_REACHED"
+    CVAT_FORBIDDEN            = "CVAT_FORBIDDEN"
+    CVAT_AUTH_ERROR           = "CVAT_AUTH_ERROR"
+    CVAT_NOT_FOUND            = "CVAT_NOT_FOUND"
+    CVAT_CONNECTION_ERROR     = "CVAT_CONNECTION_ERROR"
+    CVAT_TIMEOUT_ERROR        = "CVAT_TIMEOUT_ERROR"
+    BACKEND_NOT_SET           = "BACKEND_NOT_SET"
+    LS_NO_ANNOTATIONS         = "LS_NO_ANNOTATIONS"
+    MSIGHT_LOCALIZATION_ERROR = "MSIGHT_LOCALIZATION_ERROR"
+    RUN_FAILED                = "RUN_FAILED"
+    EXPORT_NO_IMAGES          = "EXPORT_NO_IMAGES"
+    BACKEND_NOT_NAMED         = "BACKEND_NOT_NAMED"
+    PATH_NOT_NAMED            = "PATH_NOT_NAMED"
+    CONFIRM_NOT_PENDING       = "CONFIRM_NOT_PENDING"
