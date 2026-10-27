@@ -51,7 +51,10 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        # Exact freeze, installed like deployment does (deploy-agent.yml): --no-deps skips
+        # the resolver, which rejects declared ranges the pinned set runs fine with
+        # (fiftyone 1.4.1 declares sse-starlette<1; fastmcp needs 3.x).
+        pip install -r requirements.txt --no-deps
     - name: Agent tests
       run: pytest -s msight_agent/tests
 
@@ -77,7 +80,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        pip install -r requirements.txt --no-deps
     - name: Engine tests
       env:
         HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -99,7 +102,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        pip install -r requirements.txt --no-deps
     - name: Documentation with pdoc
       run: pdoc ./auto_labeling/*.py ./auto_labeling/workflows/*.py ./auto_labeling/config/*.py ./auto_labeling/utils/*.py -o archive/docs
     - uses: actions/upload-pages-artifact@v3
