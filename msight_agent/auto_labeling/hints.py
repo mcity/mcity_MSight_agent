@@ -45,6 +45,12 @@ def auto_labeling_hint_parts(state: WorkflowState) -> list[str]:
             parts.append(STATE_HINTS["model_configured_ready"])
     if al.auto_labeling_complete:
         parts.append("auto_labeling=complete")
+        if (al.labeling_path == LabelingPath.AUTO and not al.phase
+                and not (al.cvat_task_ids or al.ls_task_ids)):
+            export_fn = ("export_to_label_studio" if al.labeling_backend == LabelingBackend.LABEL_STUDIO
+                         else "export_to_cvat")
+            parts.append(STATE_HINTS["predictions_not_exported"].format(
+                export_fn=export_fn, dataset_name=state.dataset_name or "?"))
     if al.labeling_path == LabelingPath.AUTO:
         parts.append(f"localization={'enabled' if al.localization_enabled else 'not configured'}")
     if al.labels_imported:

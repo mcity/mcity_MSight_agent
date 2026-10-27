@@ -246,7 +246,7 @@ def test_auto_labeling_tools_auto_path_complete_labels_imported():
 def test_auto_labeling_tools_auto_path_complete_not_imported_cvat():
     state = _al_state(
         labeling_path="auto", labeling_backend=LabelingBackend.CVAT,
-        auto_labeling_complete=True, labels_imported=False,
+        auto_labeling_complete=True, labels_imported=False, cvat_task_ids=[7],
     )
     result = state.valid_tool_names()
     assert result == ALWAYS | {"import_from_cvat"}
@@ -255,9 +255,17 @@ def test_auto_labeling_tools_auto_path_complete_not_imported_cvat():
 def test_auto_labeling_tools_auto_path_complete_not_imported_ls():
     state = _al_state(
         labeling_path="auto", labeling_backend=LabelingBackend.LABEL_STUDIO,
-        auto_labeling_complete=True, labels_imported=False,
+        auto_labeling_complete=True, labels_imported=False, ls_task_ids=[7],
     )
     result = state.valid_tool_names()
     assert result == ALWAYS | {"import_from_label_studio"}
 
 
+
+
+def test_auto_labeling_tools_run_done_export_failed_offers_retry_not_import():
+    state = _al_state(
+        labeling_path="auto", labeling_backend=LabelingBackend.CVAT,
+        auto_labeling_complete=True, labels_imported=False,
+    )
+    assert state.valid_tool_names() == ALWAYS | {"export_to_cvat", "set_labeling_backend", "run_auto_labeling"}

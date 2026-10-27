@@ -14,20 +14,21 @@ from msight_agent.msight.tools.record_archive import DUMPER_NODE, PUSHER_NODE
 _PENDING = "pending (will auto-start when pipeline starts)"
 
 
-async def _msight_liveness() -> dict[str, bool]:
-    """Live recording / archiving / pipeline state (one docker call). The persisted
-    *_active flags drift when things change outside the chat (dashboard, crash)."""
-    empty = {"recording": False, "archiving": False, "pipeline": False}
+async def _msight_liveness() -> dict:
+    """Live recording / archiving / pipeline state, and the other nodes running. The
+    persisted *_active flags drift when things change outside the chat (dashboard, crash)."""
+    empty = {"recording": False, "archiving": False, "pipeline": False, "extra_nodes": []}
     if get_msight_path()[1]:
         return empty
     try:
-        snap = await get_control_plane().snapshot([DUMPER_NODE, PUSHER_NODE, *FIXED_PIPELINE_NODES])
+        live = set(await get_control_plane().live_node_names())
     except Exception:
         return empty
     return {
-        "recording": snap[DUMPER_NODE]["alive"],
-        "archiving": snap[PUSHER_NODE]["alive"],
-        "pipeline": any(snap[n]["alive"] for n in FIXED_PIPELINE_NODES),
+        "recording": DUMPER_NODE in live,
+        "archiving": PUSHER_NODE in live,
+        "pipeline": any(n in live for n in FIXED_PIPELINE_NODES),
+        "extra_nodes": sorted(live - set(FIXED_PIPELINE_NODES)),
     }
 
 
@@ -49,6 +50,15 @@ async def _msight_problems_hint() -> str:
     )
 
 
+def _extra_nodes_hint(live: dict) -> str:
+    """Nodes that outlive a pipeline stop, so the agent can remind the user about them."""
+    if not live["extra_nodes"]:
+        return ""
+    return " | " + STATE_HINTS["msight_extra_nodes_running"].format(
+        nodes=", ".join(live["extra_nodes"]),
+        when="the pipeline is still running" if live["pipeline"] else "the pipeline is stopped")
+
+
 def _source_label(mp) -> str:
     if mp.rtsp_url:
         return f"rtsp_url:{mp.rtsp_url}"
@@ -57,11 +67,12 @@ def _source_label(mp) -> str:
 
 async def msight_hint(state: WorkflowState) -> str:
     mp = state.msight_pipeline
-    if mp is None:
-        return (f"msight_checklist(mode=not set, source=not set, {calibration_label(prefixed=True)}, "
-                "recording=not active, archiving=not active)")
-
     live = await _msight_liveness()
+    if mp is None:
+        hint = (f"msight_checklist(mode=not set, source=not set, {calibration_label(prefixed=True)}, "
+                "recording=not active, archiving=not active)")
+        return hint + _extra_nodes_hint(live)
+
     parts = [f"mode={mp.mode or 'not set'}", f"source={_source_label(mp) or 'not set'}",
              calibration_label(prefixed=True)]
     if mp.sensor_name:
@@ -88,4 +99,4 @@ async def msight_hint(state: WorkflowState) -> str:
         hint += " | " + STATE_HINTS["msight_run_awaiting_confirm"]
     elif live["pipeline"]:
         hint += " | " + STATE_HINTS["msight_pipeline_running"].format(source=_source_label(mp))
-    return hint + await _msight_problems_hint()
+    return hint + _extra_nodes_hint(live) + await _msight_problems_hint()

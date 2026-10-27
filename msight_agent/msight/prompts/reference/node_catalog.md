@@ -1,15 +1,23 @@
 # MSight node catalog reference
 
 Every entry below is a `node_type` `add_msight_node` accepts today (confirmed
-against `msight_agent/msight/runtime/node_catalog.py` — 29 node types
-cataloged). 3 real msight_core entry points are deliberately excluded, not
-just unlisted: `downloaded_image_player_fps` and `road_user_list_aggregator`
-(their source files don't exist in the installed package — genuinely broken
-today) and `downloaded_image_player` (exists, but references an argument it
-never defines — guaranteed to crash). If a node type comes up that isn't
-here and isn't one of these three, say so plainly rather than guessing a
-name; it needs a new `NodeSpec` entry (a code change), not a config you're
-missing.
+against `msight_agent/msight/runtime/node_catalog.py` — 25 node types, each
+launched for real to check its flags). Deliberately excluded because they
+can't run on the installed msight_core 2.0.0, whatever they're connected to:
+`sdsm_encoder` (its launcher fails to import), `detection_results_viewer`,
+`buffering_sort` and `bytes_viewer` (they read data fields that don't
+exist), plus `downloaded_image_player(_fps)` and `road_user_list_aggregator`.
+If one of those, or anything not listed here, is asked for, say plainly it
+isn't available rather than guessing a name; adding it is a code change.
+
+**Data kinds.** Each topic carries one kind of data: `image` (sources,
+`frame_annotator`), `detections` (`rfdetr_detector`,
+`yolo_onestage_detection`), `video` (`video_aggregator`), `bytes`
+(`udp_server`, `websocket_client`), `pointcloud` (`velodyne_lidar`),
+`sequence` (`aggregator`). `list_msight_node_types` shows each node's
+`consumes`/`produces`; subscribe a node only to a topic of a kind it
+consumes — `add_msight_node` refuses a mismatch (the node would crash on
+its first message) and lists the topics that do fit.
 
 Every node needs `--name` (the `name` argument to `add_msight_node`, defaults
 to the catalog's `default_name` if omitted). Beyond that, config keys depend
@@ -45,17 +53,21 @@ Publishes frames sequentially from a folder of `.mp4` files. Required
 config: `folder` (host path, gets bind-mounted automatically). Optional:
 `resize_ratio`.
 
-## rfdetr_detector (processing, needs GPU)
+## rfdetr_detector (processing, uses GPU)
 Runs RF-DETR object detection on a frame topic, publishes detections.
-Required config: `det_configs` (a path *inside the container* — normally
-`/configs/rfdetr_config.yaml`, already bind-mounted; don't pass a host
-path here). Gotcha: this node type will fail to start on a host with no
-GPU (`nvidia-smi` unavailable) — see common_failure_modes.md.
+Config: `subscribe_topic` (a frame topic, e.g. `camera/<sensor>`) and
+`publish_topic`. `det_configs` defaults to the bind-mounted
+`/configs/rfdetr_config.yaml` — don't ask the user for it. A second detector
+needs its OWN `publish_topic` (e.g. `detection/<sensor>_<name>`):
+`add_msight_node` refuses a topic another live node already publishes, since
+both nodes' detections would interleave on it. To view it, add a second
+`detection_viewer` subscribed to that new topic. On a host with no usable GPU
+it runs on a much slower CPU-only image — see common_failure_modes.md.
 
 ## detection_viewer (sink)
 Web viewer that renders a detection topic as annotated video in-browser.
-No required config beyond `subscribe_topic`; optional `port` (defaults to
-9010). **Always pass an explicit, distinct `name` when adding a second one**
+No required config beyond `subscribe_topic`; optional `port` (left out, a
+free one from 9010 up is picked and returned as `url`). **Always pass an explicit, distinct `name` when adding a second one**
 — omitting `name` defaults to `"detection_viewer"`, the same name the main
 pipeline's own viewer already uses, and `add_msight_node` is idempotent by
 name: it will silently reuse the existing node (ignoring your `port` config
@@ -74,7 +86,7 @@ exists for this one; don't pass it.
 Buffers an annotated frame topic into short video clips (used by both
 recording and archiving — see `start_msight_recording`/`start_msight_archiving`
 for the normal path; add this directly only for a non-standard topology).
-Optional config: `buffer_size`, `overlap_size`, `fps`.
+Config: `buffer_size` and `overlap_size` (the launcher requires both; they default to 40 and 0, what recording uses), optional `fps`.
 
 ## video_local_dumper (sink)
 Writes a video topic's clips to local disk. Required config: `save_dir`.
@@ -94,24 +106,12 @@ ones that take local file paths, since a bare process already sees the
 whole host filesystem.
 
 ### aggregator (processing)
-Generic frame-buffering aggregator — distinct from `video_aggregator`
+Generic buffering aggregator for any topic — distinct from `video_aggregator`
 (image-to-video specific). Required config: `buffer_size`, `overlap_size`.
 
 ### aws_sequence_pusher (sink)
 Pushes a raw data-sequence topic to S3. Required: `bucket_name`. Optional:
 `prefix`, `aws_region`, `use_dualstack_endpoint` (boolean flag).
-
-### buffering_sort (processing)
-Buffers and time-sorts an out-of-order topic. Optional: `max_buffer_size`.
-
-### bytes_viewer (sink)
-Logs raw bytes-topic messages as text — no GUI, safe for headless hosts.
-Optional: `filter_sensor_name`.
-
-### detection_results_viewer (sink)
-Logs detection results as text — no GUI, safe for headless hosts. No extra
-config beyond `subscribe_topic`. (Don't confuse with `2d_viewer` below,
-which renders the same kind of data in an actual GUI window.)
 
 ### http_sink (sink)
 POSTs a topic's messages to an external HTTP endpoint. Required: `url`.
@@ -143,12 +143,6 @@ Renders a point-cloud topic in a 3D GUI window via `open3d`. **Needs a
 real display** — will not work on a headless host, same caveat as
 `image_viewer`. Optional: `filter_sensor_name`, `voxel_downsample`,
 `color_mode` (`ring` or `intensity`).
-
-### sdsm_encoder (processing)
-Encodes detections into SDSM (Sensor Data Sharing Message) format.
-Required: `map_center` (a `"(lat, lon)"`-shaped string — it's parsed as a
-Python literal, so it must look exactly like a tuple, not free text),
-`source_id`. Optional: `max_obj_list_length`.
 
 ### udp_server (source)
 Listens for incoming UDP packets, publishes them as a source topic.

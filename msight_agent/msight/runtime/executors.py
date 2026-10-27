@@ -6,6 +6,7 @@ about node types or topics. Extra backends can be registered via the
 """
 import asyncio
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -14,7 +15,7 @@ from importlib import metadata
 from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable
 
-from msight_agent.msight.runtime.utils import run_cmd
+from msight_agent.msight.runtime.utils import Progress, run_cmd
 from msight_agent.shared.paths import NODE_LOG_DIR
 
 ENTRY_POINT_GROUP = "msight_agent.executors"
@@ -27,6 +28,7 @@ _CPU_BASE_IMAGE = os.environ.get(
 )
 _CPU_DOCKERFILE = Path(__file__).resolve().parent / "Dockerfile.cpu"
 
+_CONTAINER_ID_RE = re.compile(r"[0-9a-f]{64}")
 _GPU_CACHE_SECONDS = 60
 _gpu_report_cache: Optional[tuple[float, dict]] = None
 _cpu_image_ready = False
@@ -76,6 +78,8 @@ async def inspect_containers(container_names: list[str]) -> dict[str, dict]:
     )
     result = {}
     for line in out.splitlines():
+        if not line.strip():
+            continue
         name, running, image, requests, cmd = (line.split("|", 4) + ["", "", "", ""])[:5]
         result[name.lstrip("/")] = {
             "running": running == "true",
@@ -87,15 +91,17 @@ async def inspect_containers(container_names: list[str]) -> dict[str, dict]:
     return result
 
 
-async def _ensure_cpu_image(msight_path: Path) -> str:
+async def _ensure_cpu_image(msight_path: Path, progress: Optional[Progress] = None) -> str:
     """Build the CPU image from Dockerfile.cpu once per process (no prebuilt CPU tag exists)."""
     global _cpu_image_ready
     if not _cpu_image_ready:
         code, _ = await run_cmd("docker", "image", "inspect", CPU_IMAGE_TAG)
         if code != 0:
+            if progress:
+                await progress(f"No GPU available -- building the CPU-only image {CPU_IMAGE_TAG} (first time only)...")
             code, out = await run_cmd("docker", "build", "-f", str(_CPU_DOCKERFILE),
                                       "--build-arg", f"BASE_IMAGE={_CPU_BASE_IMAGE}",
-                                      "-t", CPU_IMAGE_TAG, str(msight_path))
+                                      "-t", CPU_IMAGE_TAG, str(msight_path), on_line=progress)
             if code != 0:
                 raise RuntimeError(f"Failed to build the CPU-only image ({CPU_IMAGE_TAG}): {out[-2000:]}")
         _cpu_image_ready = True
@@ -114,7 +120,8 @@ Mount = tuple[str, str, str]  # (host_path, container_path, "ro"|"rw")
 @runtime_checkable
 class Executor(Protocol):
     async def start(self, name: str, cmd: list[str], cwd: Path, env: dict[str, str],
-                     needs_gpu: bool = False, mounts: Optional[list[Mount]] = None) -> ExecutorHandle: ...
+                    needs_gpu: bool = False, mounts: Optional[list[Mount]] = None,
+                    progress: Optional[Progress] = None) -> ExecutorHandle: ...
     async def stop(self, handle: ExecutorHandle) -> None: ...
     async def logs(self, handle: ExecutorHandle, tail: int = 200) -> str: ...
     async def is_alive(self, handle: ExecutorHandle) -> bool: ...
@@ -136,10 +143,11 @@ class DockerExecutor:
     """
 
     async def start(self, name: str, cmd: list[str], cwd: Path, env: dict[str, str],
-                     needs_gpu: bool = False, mounts: Optional[list[Mount]] = None) -> DockerHandle:
+                    needs_gpu: bool = False, mounts: Optional[list[Mount]] = None,
+                    progress: Optional[Progress] = None) -> DockerHandle:
         use_gpu = needs_gpu and await has_gpu()
         image = (os.environ.get("MSIGHT_VISION_IMAGE", "michigantrafficlab/msight-vision:latest")
-                 if use_gpu or not needs_gpu else await _ensure_cpu_image(cwd))
+                 if use_gpu or not needs_gpu else await _ensure_cpu_image(cwd, progress))
         cname = container_name(name)
 
         # Remove any leftover container with this name (--restart precludes --rm).
@@ -154,7 +162,13 @@ class DockerExecutor:
             args += ["-e", f"{key}={value}"]
         args += [image, "/bin/bash", "-c", "exec " + shlex.join(cmd)]
 
-        code, out = await run_cmd(*args, cwd=str(cwd))
+        # Streams the image pull (the slow part of a first start) when progress is given;
+        # the container id `docker run -d` prints last is noise in a chat, so it's dropped.
+        async def pull_progress(line: str) -> None:
+            if progress and not _CONTAINER_ID_RE.fullmatch(line):
+                await progress(line)
+
+        code, out = await run_cmd(*args, cwd=str(cwd), on_line=pull_progress if progress else None)
         if code != 0:
             raise RuntimeError(f"docker run failed for '{name}': {out.strip()}")
         return DockerHandle(cname)
@@ -219,7 +233,8 @@ class SupervisorExecutor:
         self._active: dict[str, asyncio.subprocess.Process] = {}
 
     async def start(self, name: str, cmd: list[str], cwd: Path, env: dict[str, str],
-                     needs_gpu: bool = False, mounts: Optional[list[Mount]] = None) -> SupervisorHandle:
+                    needs_gpu: bool = False, mounts: Optional[list[Mount]] = None,
+                    progress: Optional[Progress] = None) -> SupervisorHandle:
         # mounts are docker-only; a subprocess already sees the host filesystem.
         running = self._active.get(name)
         if running is not None and running.returncode is None:
@@ -245,12 +260,16 @@ class SupervisorExecutor:
 
     async def stop(self, handle: SupervisorHandle) -> None:
         if handle.process is not None:
-            handle.process.terminate()
-            try:
-                await asyncio.wait_for(handle.process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                handle.process.kill()
-                await handle.process.wait()
+            # A crashed node has already exited; terminate() would raise and skip the cleanup below.
+            if handle.process.returncode is None:
+                try:
+                    handle.process.terminate()
+                    await asyncio.wait_for(handle.process.wait(), timeout=5)
+                except ProcessLookupError:
+                    pass  # exited between the check and the signal
+                except asyncio.TimeoutError:
+                    handle.process.kill()
+                    await handle.process.wait()
         elif handle.pid is not None:
             # Recovered from a pidfile: no Process wrapper, signal directly.
             try:

@@ -166,7 +166,10 @@ async def start_msight_pipeline(
 
     sensor = sensor_name or "gs_mcity_1"
     try:
-        await get_control_plane().recompose(_fixed_pipeline(*_resolve_video_source(video_input, rtsp_url, sensor), sensor))
+        await get_control_plane().recompose(
+            _fixed_pipeline(*_resolve_video_source(video_input, rtsp_url, sensor), sensor),
+            progress=ctx.log if ctx else None,
+        )
     except Exception as e:
         return error_json(_friendly_error(str(e)) or f"Failed to start MSight_Vision pipeline: {e}")
     return ok_json("MSight_Vision pipeline started.", viewer_url=_viewer_url())
@@ -180,9 +183,17 @@ async def stop_msight_pipeline() -> str:
         # Explicit names, not recompose([]), so this still works after a server restart.
         for name in FIXED_PIPELINE_NODES:
             await get_control_plane().delete_node(name)
+        # Nodes added separately aren't part of the pipeline, so they're left running.
+        others = await get_control_plane().live_node_names()
     except Exception as e:
         return error_json(f"Failed to stop MSight_Vision pipeline: {e}")
-    return ok_json("MSight_Vision pipeline stopped.")
+    if not others:
+        return ok_json("MSight_Vision pipeline stopped. No other MSight nodes are running.")
+    return ok_json(
+        f"MSight_Vision pipeline stopped. These separately added nodes are still running: "
+        f"{', '.join(others)}. Tell the user, and ask whether to remove them too.",
+        other_nodes_still_running=others,
+    )
 
 
 @mcp.tool()

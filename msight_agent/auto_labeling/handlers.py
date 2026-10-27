@@ -130,6 +130,12 @@ def _parse_cvat_task_ids(text: str) -> list[int]:
     return [int(x.strip()) for x in ids_part.split(",") if x.strip()]
 
 
+def _strip_sentinel(message: str) -> str:
+    """A tool's error text without its leading "SENTINEL_NAME:" (that's for routing, not users)."""
+    head, sep, rest = message.partition(":")
+    return rest.strip() if sep and head.isupper() and " " not in head else message.strip()
+
+
 def _backend_label(backend: str) -> str:
     return "Label Studio" if backend == LabelingBackend.LABEL_STUDIO else "CVAT"
 
@@ -476,6 +482,12 @@ class AutoLabelingHandlers:
                     f"Otherwise ask the user for class names."
                 )]
             else:  # auto
+                if al.auto_labeling_complete and not (al.cvat_task_ids or al.ls_task_ids):
+                    return [HardStop(
+                        f"The annotation backend is now **{backend_label}**. The predictions from your "
+                        f"last run are ready — say \"export\" and I'll send them to {backend_label} "
+                        f"(no need to re-run the model)."
+                    )]
                 if al.model_configured:
                     model_name     = al.model_name or "?"
                     model_source   = al.model_source or "?"
@@ -701,11 +713,14 @@ class AutoLabelingHandlers:
                 self.state.auto_labeling = AutoLabelingState()
 
             if self.state.auto_labeling.labeling_path == LabelingPath.AUTO and not with_predictions:
-                msg = (
-                    "Export is handled automatically after auto-labeling completes. "
-                    "Please run the auto-labeling workflow first."
-                )
-                return msg, [FallThrough()]
+                if not self.state.auto_labeling.auto_labeling_complete:
+                    msg = (
+                        "Export is handled automatically after auto-labeling completes. "
+                        "Please run the auto-labeling workflow first."
+                    )
+                    return msg, [FallThrough()]
+                # Retrying an export that failed after a successful run: send the predictions.
+                with_predictions = fn_args["with_predictions"] = True
 
             if not self.state.auto_labeling.labeling_path:
                 self.state.auto_labeling.labeling_path = LabelingPath.MANUAL if not with_predictions else LabelingPath.AUTO
@@ -790,10 +805,13 @@ class AutoLabelingHandlers:
     def _handle_export_success(
         self, result: str, fn_args: dict, is_ls: bool
     ) -> tuple[str, list[ToolRouting]]:
-        """Record new task id(s) and move to the ANNOTATING phase."""
+        """Record new task id(s) and lock the workflow until the import."""
         al = self.state.auto_labeling
         if not al:
             return result, [FallThrough()]
+        # Predictions (auto path) await review like a finished run; a manual export awaits annotation.
+        exported_phase = (AutoLabelingPhase.TRAINING if fn_args.get("with_predictions")
+                          else AutoLabelingPhase.ANNOTATING)
 
         if is_ls and "Project ID" in result:
             al.ls_task_ids = _ls_task_ids_from_registry(fn_args.get("dataset_name", "")) or al.ls_task_ids
@@ -804,7 +822,7 @@ class AutoLabelingHandlers:
                     "Studio directly for your project, or retry the export. If the problem "
                     "persists, contact support."
                 )]
-            al.phase = AutoLabelingPhase.ANNOTATING
+            al.phase = exported_phase
             self.state.save()
             return result, [HardStop(
                 f"{result.strip()}\n\n"
@@ -814,7 +832,7 @@ class AutoLabelingHandlers:
         if not is_ls and "Task IDs:" in result:
             try:
                 al.cvat_task_ids = _parse_cvat_task_ids(result)
-                al.phase = AutoLabelingPhase.ANNOTATING
+                al.phase = exported_phase
                 self.state.save()
                 return result, [HardStop(
                     f"{result.strip()}\n\n"
@@ -1128,9 +1146,10 @@ class AutoLabelingHandlers:
 
     async def _do_post_run_export(
         self, backend: str, dataset_name: str, mcp_client
-    ) -> tuple[str, bool]:
-        """Export after auto-labeling. Returns (text to append to the run reply, images
-        reached the annotation tool); False makes the caller treat the run as failed."""
+    ) -> tuple[str, str]:
+        """Export after auto-labeling. Returns (text for the run reply, outcome): "ok", "empty"
+        (0 images -- the run produced nothing) or "error" (the backend refused; the
+        predictions are still in FiftyOne, so only the export needs retrying)."""
         is_ls = backend == LabelingBackend.LABEL_STUDIO
         tool_name, backend_label = _export_tool(backend), _backend_label(backend)
 
@@ -1153,18 +1172,16 @@ class AutoLabelingHandlers:
                     logging.warning(f"[PIPELINE] Could not parse CVAT task ids: {e}")
             self.state.save()
 
+        if export_empty(export_msg):
+            return f"\n\n{export_msg}", "empty"
         if not success:
-            return (
-                f"\n\n{export_msg}"
-                f"\n\nExport to {backend_label} did not complete — the predictions were not uploaded.",
-                False,
-            )
+            return _strip_sentinel(export_msg), "error"
 
         return (
             f"\n\n{export_msg}"
             f"\n\nPlease review and correct the predictions in {backend_label}. "
             f"Let me know when you're done and I'll import the labels back.",
-            True,
+            "ok",
         )
 
     async def _finalize_auto_labeling(self, tool_output: str, mcp_client) -> str:
@@ -1194,24 +1211,35 @@ class AutoLabelingHandlers:
             if self._progress_cb:
                 await self._progress_cb("status", {"message": f"Exporting predictions to {backend_label}..."})
             try:
-                export_note, exported = await self._do_post_run_export(backend, dataset_name, mcp_client)
+                export_note, outcome = await self._do_post_run_export(backend, dataset_name, mcp_client)
             except Exception as e:
                 logging.warning(f"[PIPELINE] Post-run export to {backend_label} raised: {e}")
-                export_note, exported = f"\n\nNote: {backend_label} export failed: {e}", False
+                export_note, outcome = str(e), "error"
         else:
-            export_note, exported = "\n\nNote: Could not determine dataset name for export.", False
+            export_note, outcome = "Could not determine the dataset name for the export.", "error"
 
-        # Lock only once predictions reached the annotation tool; otherwise the run
-        # counts as failed and the workflow stays reconfigurable.
-        if not exported:
+        al.run_confirmed = False
+        al.run_awaiting_confirmation = False
+        if outcome == "empty":
+            # Nothing to annotate: the run itself counts as failed and stays reconfigurable.
             al.auto_labeling_complete = False
             al.phase = AutoLabelingPhase.PENDING
-            al.run_confirmed = False
-            al.run_awaiting_confirmation = False
             return self._handle_empty_export(backend_label, reply + export_note)
 
-        al.phase = AutoLabelingPhase.TRAINING
         self.state.record_run("auto_labeling", failed=False)
+        if outcome == "error":
+            # The predictions are saved; only the export failed. Stay unlocked (no phase) with
+            # auto_labeling_complete set, so the export can be retried without re-running the model.
+            al.phase = AutoLabelingPhase.PENDING
+            self.state.save()
+            return (
+                f"{reply}\n\n**The predictions are saved, but the export to {backend_label} failed:** "
+                f"{export_note}\n\nOnce that's sorted, tell me to export again and I'll send the existing "
+                f"predictions — no need to re-run the model. I can also switch to "
+                f"{'CVAT' if backend == LabelingBackend.LABEL_STUDIO else 'Label Studio'} instead."
+            )
+        al.phase = AutoLabelingPhase.TRAINING
+        self.state.save()
         return reply + export_note
 
     def _finalize_import(self, fn_args: dict, tool_output: str) -> str:

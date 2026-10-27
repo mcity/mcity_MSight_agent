@@ -20,9 +20,9 @@ from msight_agent.msight.runtime.executors import (
     DockerHandle, Executor, ExecutorHandle, container_name, gpu_report, inspect_containers,
     recover_supervisor_handle, resolve_executor,
 )
-from msight_agent.msight.runtime.node_catalog import NODE_CATALOG, resolve_cmd
+from msight_agent.msight.runtime.node_catalog import NODE_CATALOG, node_type_for_binary, resolve_cmd
 from msight_agent.msight.runtime.paths import get_msight_path
-from msight_agent.msight.runtime.utils import ago, redis_kwargs, run_cmd, topic_list
+from msight_agent.msight.runtime.utils import Progress, ago, redis_kwargs, run_cmd, topic_list
 
 NODES_REDIS_KEY = "MSIGHT:NODES"  # matches msight_core.nodes.REDIS_NODES_FIELD
 _URL_SCHEMES = ("rtsp://", "rtsps://", "http://", "https://", "rtmp://")
@@ -34,6 +34,9 @@ class _TrackedNode:
     handle: ExecutorHandle
     node_type: str
     invocation: str
+    # From the config it was started with: known before the node registers in Redis
+    # (RF-DETR takes several seconds to load its model first).
+    publish_topics: tuple[str, ...] = ()
 
 
 def _resolve_msight_path() -> Path:
@@ -109,7 +112,8 @@ class MSightControlPlane:
         return self._executors[invocation]
 
     async def add_node(self, node_type: str, name: Optional[str] = None,
-                       config: Optional[dict] = None) -> ExecutorHandle:
+                       config: Optional[dict] = None, progress: Optional[Progress] = None) -> ExecutorHandle:
+        """Start a node (reusing a live one of the same name). `progress` gets status lines."""
         if node_type not in NODE_CATALOG:
             raise ValueError(f"Unknown node_type '{node_type}'. Known: {sorted(NODE_CATALOG)}")
         spec = NODE_CATALOG[node_type]
@@ -141,9 +145,14 @@ class MSightControlPlane:
         env = {"MSIGHT_EDGE_DEVICE_NAME": os.environ.get("MSIGHT_EDGE_DEVICE_NAME", "mcity_edge")}
 
         await self._ensure_redis()
+        if progress:
+            await progress(f"Starting {name} ({node_type})...")
         handle = await self._executor_for(spec.invocation).start(
-            name, cmd, msight_path, env, needs_gpu=spec.needs_gpu, mounts=mounts)
-        self._nodes[name] = _TrackedNode(handle=handle, node_type=node_type, invocation=spec.invocation)
+            name, cmd, msight_path, env, needs_gpu=spec.needs_gpu, mounts=mounts, progress=progress)
+        if progress:
+            await progress(f"{name} started.")
+        self._nodes[name] = _TrackedNode(handle=handle, node_type=node_type, invocation=spec.invocation,
+                                         publish_topics=tuple(topic_list(config.get("publish_topic"))))
         self._record_change("added", name, node_type)
         return handle
 
@@ -170,7 +179,7 @@ class MSightControlPlane:
         if existed or tracked is not None:
             self._record_change("removed", name, tracked.node_type if tracked else None, publish_topics)
 
-    async def recompose(self, desired: list[dict]) -> None:
+    async def recompose(self, desired: list[dict], progress: Optional[Progress] = None) -> None:
         """Make the tracked set match `desired`: [{"node_type", "name"?, "config"?}]."""
         desired_by_name = {
             d.get("name") or NODE_CATALOG[d["node_type"]].default_name or d["node_type"]: d
@@ -178,6 +187,8 @@ class MSightControlPlane:
         }
         for name in list(self._nodes):
             if name not in desired_by_name:
+                if progress:
+                    await progress(f"Stopping {name} (not part of the new pipeline)...")
                 await self.delete_node(name)
 
         for name, d in desired_by_name.items():
@@ -186,9 +197,11 @@ class MSightControlPlane:
                 # Keep only a live node of the same type; dead or retyped ones are replaced.
                 if (tracked.node_type == d["node_type"]
                         and await self._executor_for(tracked.invocation).is_alive(tracked.handle)):
+                    if progress:
+                        await progress(f"{name} is already running.")
                     continue
                 await self.delete_node(name)
-            await self.add_node(d["node_type"], name=name, config=d.get("config"))
+            await self.add_node(d["node_type"], name=name, config=d.get("config"), progress=progress)
 
     async def _ensure_redis(self) -> None:
         """Start a Redis container only if nothing is listening (Redis isn't in NODE_CATALOG)."""
@@ -255,6 +268,30 @@ class MSightControlPlane:
             else:
                 out[name] = {"alive": False, "device": None}
         return out
+
+    async def node_type_of(self, name: str) -> Optional[str]:
+        """A node's catalog type: tracked here, else from its container's or process's command line."""
+        if (tracked := self._nodes.get(name)) is not None:
+            return tracked.node_type
+        if info := (await inspect_containers([container_name(name)])).get(container_name(name)):
+            return node_type_for_binary(info["cmd"])
+        if (recovered := recover_supervisor_handle(name)) is not None:
+            try:
+                return node_type_for_binary(
+                    Path(f"/proc/{recovered.pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace"))
+            except OSError:
+                return None
+        return None
+
+    def started_publishers(self) -> dict[str, tuple[str, str]]:
+        """{topic: (node name, node type)} for nodes started here, registered or not yet."""
+        return {t: (name, n.node_type) for name, n in self._nodes.items() for t in n.publish_topics}
+
+    async def live_node_names(self) -> list[str]:
+        """Every node actually running: registered or tracked here, and alive."""
+        names = sorted({n["name"] for n in self.get_status()} | set(self._nodes))
+        snap = await self.snapshot(names)
+        return [n for n in names if snap[n]["alive"]]
 
     async def is_alive(self, name: str) -> bool:
         return (await self.snapshot([name]))[name]["alive"]

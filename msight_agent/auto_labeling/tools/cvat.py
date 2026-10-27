@@ -280,13 +280,17 @@ async def export_to_cvat(
             existing_task_count = len(client.tasks.list())
             available_slots = CVAT_MAX_CONCURRENT_TASKS - existing_task_count
             batches = _compute_cvat_batches(image_paths, available_slots)
+            if available_slots <= 0:
+                return (
+                    f"CVAT_TASK_LIMIT_REACHED: This CVAT account allows {CVAT_MAX_CONCURRENT_TASKS} tasks "
+                    f"and already has {existing_task_count}, so there is no room for '{dataset_name}'. "
+                    f"Delete some existing tasks at {CVAT_URL}, or use Label Studio instead."
+                )
             if not batches:
                 return (
-                    f"CVAT export not possible for '{dataset_name}': {len(image_paths)} images "
-                    f"need more than {available_slots} task(s) to fit at the ~{CVAT_UPLOAD_HARD_LIMIT}-file "
-                    f"per-task upload limit. This CVAT account allows {CVAT_MAX_CONCURRENT_TASKS} tasks "
-                    f"total, and {existing_task_count} already exist. "
-                    f"Please delete some existing tasks at {CVAT_URL}, use Label Studio instead, "
+                    f"CVAT_TASK_LIMIT_REACHED: '{dataset_name}' has {len(image_paths)} images, more than "
+                    f"the {available_slots} free CVAT task(s) can hold (~{CVAT_UPLOAD_HARD_LIMIT} files "
+                    f"each). Delete some existing tasks at {CVAT_URL}, use Label Studio instead, "
                     f"or export a smaller subset."
                 )
             num_batches = len(batches)

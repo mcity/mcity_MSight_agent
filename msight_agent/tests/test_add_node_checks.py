@@ -52,3 +52,38 @@ def test_non_web_node_is_untouched(busy_ports):
 ])
 def test_web_port_from_cmd(cmd, port):
     assert web_port_from_cmd(cmd) == port
+
+
+def test_live_untracked_node_is_reused_untouched(monkeypatch):
+    """A node still running from before a restart must not be recreated (that dropped its port)."""
+    import asyncio
+    import json
+
+    class FakeCP:
+        added = False
+
+        async def snapshot(self, names):
+            return {n: {"alive": True, "device": None, "web_port": 9011} for n in names}
+
+        async def add_node(self, *a, **k):
+            FakeCP.added = True
+
+    monkeypatch.setattr(nodes, "get_control_plane", FakeCP)
+    monkeypatch.setattr(nodes, "get_msight_path", lambda: ("/msight", None))
+    monkeypatch.setattr(nodes, "resolve_host", lambda: "localhost")
+    fn = getattr(nodes.add_msight_node, "fn", nodes.add_msight_node)
+    result = json.loads(asyncio.run(fn("detection_viewer", name="second_viewer")))
+    assert result["already_running"] and result["url"] == "http://localhost:9011"
+    assert not FakeCP.added
+
+
+def test_rfdetr_det_configs_has_a_default():
+    from msight_agent.msight.runtime.node_catalog import missing_config, with_defaults
+    spec = NODE_CATALOG["rfdetr_detector"]
+    assert missing_config(spec, with_defaults(spec, {})) == ["publish_topic", "subscribe_topic"]
+
+
+def test_second_publisher_on_a_live_topic_is_refused():
+    problem = nodes._output_topic_problem({"publish_topic": "detection/gs_mcity_1"}, PUBLISHED, "rfdetr_2")
+    assert "detection/gs_mcity_1_rfdetr_2" in problem
+    assert nodes._output_topic_problem({"publish_topic": "detection/b"}, PUBLISHED, "rfdetr_2") is None

@@ -2,13 +2,17 @@
 import asyncio
 import os
 import socket
-from typing import Optional
+from typing import Awaitable, Callable, Optional
+
+# Receives one line of progress text (e.g. an MCP tool's ctx.log).
+Progress = Callable[[str], Awaitable[None]]
 
 
 async def run_cmd(*argv: str, timeout: Optional[float] = None, merge_stderr: bool = True,
-                  cwd: Optional[str] = None) -> tuple[Optional[int], str]:
+                  cwd: Optional[str] = None, on_line: Optional[Progress] = None) -> tuple[Optional[int], str]:
     """Run a command without a shell. Returns (exit code, output); the code is
-    None on timeout and 127 if the program isn't installed."""
+    None on timeout and 127 if the program isn't installed. `on_line` also gets
+    each output line as it arrives."""
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv, cwd=cwd, stdout=asyncio.subprocess.PIPE,
@@ -16,8 +20,21 @@ async def run_cmd(*argv: str, timeout: Optional[float] = None, merge_stderr: boo
         )
     except FileNotFoundError:
         return 127, f"'{argv[0]}' is not installed on this host."
+
+    async def collect() -> bytes:
+        if on_line is None:
+            out, _ = await proc.communicate()
+            return out
+        chunks = []
+        while raw := await proc.stdout.readline():
+            chunks.append(raw)
+            if text := raw.decode(errors="replace").rstrip():
+                await on_line(text)
+        await proc.wait()
+        return b"".join(chunks)
+
     try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        out = await asyncio.wait_for(collect(), timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()

@@ -1,6 +1,7 @@
 """MSight-pipeline handlers, mixed into ChatPipeline (shares its `self`)."""
 import json
 import logging
+import re
 import time
 
 from msight_agent.shared.host_utils import resolve_host
@@ -14,6 +15,13 @@ from msight_agent.agent.routing import (
 from msight_agent.agent.state import MsightPipelineState
 
 _PENDING_LABEL = "will start automatically once the pipeline starts"
+
+# Stopping is never a recovery step the model may take on its own: the user's message
+# must ask for it, or answer "yes" to a reply that offered it.
+_STOP_REQUEST_RE = re.compile(
+    r"\b(stop|end|shut\s*down|kill|halt|terminate|tear\s*down|turn\s*off|restart|replace|"
+    r"instead|switch|clean\s*up)\b", re.IGNORECASE)
+_AFFIRMATIVE_RE = re.compile(r"^\s*(yes|yeah|yep|sure|ok|okay|go ahead|do it|please do|confirm)\b", re.IGNORECASE)
 
 
 def _response(status: str, message: str) -> str:
@@ -249,10 +257,23 @@ class MsightPipelineHandlers:
         self.state.save()
         return result, routings
 
+    def _user_asked_to_stop(self) -> bool:
+        current = self._user_texts[-1] if self._user_texts else ""
+        if _STOP_REQUEST_RE.search(current):
+            return True
+        return bool(_AFFIRMATIVE_RE.search(current) and re.search(r"\bstop", self._last_assistant_text, re.IGNORECASE))
+
     async def _handle_stop_msight_pipeline(
         self, fn_args: dict, mcp_client
     ) -> tuple[str, list[ToolRouting]]:
-        """Clears pipeline_running on success."""
+        """Clears pipeline_running on success. Refused unless the user asked to stop."""
+        if not self._user_asked_to_stop():
+            logging.warning("[PIPELINE] stop_msight_pipeline BLOCKED — the user didn't ask to stop")
+            return _response("error", "Not stopped: the user didn't ask to stop the pipeline."), [Injection(
+                "stop_msight_pipeline was blocked: the user's message doesn't ask to stop the pipeline, and "
+                "stopping is never a way to recover from another tool's error. Do NOT call it again this "
+                "turn. Report what actually happened, and if a stop would help, ask the user first."
+            )]
         result = unwrap_tool_output(await mcp_client.call_tool("stop_msight_pipeline", fn_args))
         if tool_status(result) == "ok":
             mp = self._msight_state()

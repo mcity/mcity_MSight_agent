@@ -511,8 +511,12 @@ tools = [
             "function": {
                 "name": "start_msight_pipeline",
                 "description": (
-                    "Start the MSight_Vision RF-DETR camera-detection pipeline (redis, "
-                    "video_source, rfdetr_detector, detection_viewer) as detached Docker "
+                    "Start -- or REPLACE, if one is running -- THE standard MSight_Vision "
+                    "pipeline (video_source -> rfdetr_detector -> detection_viewer). Use it only "
+                    "when the user wants that pipeline started or its video swapped. To add an "
+                    "EXTRA source (an mp4 folder, image or RTSP source next to the running "
+                    "pipeline, with its own topic) use add_msight_node instead -- this tool "
+                    "would replace the running pipeline. Runs the nodes as detached Docker "
                     "containers, driven from whatever MSight_Vision checkout MSIGHT_VISION_PATH "
                     "points at (this repo does not vendor a copy of MSight_Vision's docker files). "
                     "Provide exactly one of video_input (path to a video file or folder of .mp4 "
@@ -565,7 +569,7 @@ tools = [
             "type": "function",
             "function": {
                 "name": "stop_msight_pipeline",
-                "description": "Stop the fixed pipeline's three nodes (video_source, rfdetr_detector, detection_viewer). Nodes added with add_msight_node keep running -- remove those with remove_msight_node.",
+                "description": "Stop the fixed pipeline's three nodes (video_source, rfdetr_detector, detection_viewer). Only when the user asks to stop (or confirms a stop you offered) -- never to recover from another tool's error; it's refused otherwise. Nodes added with add_msight_node keep running -- remove those with remove_msight_node.",
                 "parameters": {"type": "object", "properties": {}}
             }
         },
@@ -737,8 +741,10 @@ tools = [
                 "name": "add_msight_node",
                 "description": (
                     "Start one additional MSight node beyond the fixed pipeline/record/archive "
-                    "nodes — e.g. a second camera source, an alternate sink, or any other "
-                    "cataloged node_type. IMPORTANT: if `name` is omitted, it defaults to the "
+                    "nodes, running alongside them — e.g. an extra source (video_source_mp4_folder "
+                    "for a folder of videos, local_image, video_source_rtsp), an alternate sink, or "
+                    "any other cataloged node_type. 'add a ... source/node' means this tool, never "
+                    "start_msight_pipeline (which replaces the running pipeline). IMPORTANT: if `name` is omitted, it defaults to the "
                     "catalog's default_name — the SAME name every other node of that node_type "
                     "gets by default. Reusing a name that's already running is idempotent (a "
                     "safe no-op — it does NOT start a second node, even with different config) "

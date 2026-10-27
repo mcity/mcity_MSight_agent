@@ -417,6 +417,11 @@ class WorkflowState(BaseModel):
                 return base | {"run_auto_labeling"}
             if al.labels_imported:
                 return ALWAYS | {"launch_voxel51_session"}
+            if not (al.cvat_task_ids or al.ls_task_ids):
+                # The run finished but its export failed: retry the export, switch backend, or re-run.
+                export_tool = "export_to_label_studio" if ls else "export_to_cvat"
+                run_tool = "confirm_run" if al.run_awaiting_confirmation and not al.run_confirmed else "run_auto_labeling"
+                return ALWAYS | {export_tool, "set_labeling_backend", run_tool}
             import_tool = "import_from_label_studio" if ls else "import_from_cvat"
             return ALWAYS | {import_tool}
         return ALWAYS

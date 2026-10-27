@@ -89,3 +89,25 @@ def test_failed_run_hint_survives_migrate():
                         "attempts": 1, "stale_key": True}}
     state = WorkflowState.model_validate(WorkflowState._migrate(raw))
     assert state.failed_run().error == "x"
+
+
+def test_export_error_keeps_predictions_and_offers_export_only(pipeline):
+    limit = ("CVAT_TASK_LIMIT_REACHED: This CVAT account allows 3 tasks and already has 3, "
+             "so there is no room for 'ds'. Delete some existing tasks.")
+    reply = asyncio.run(pipeline._finalize_auto_labeling(SUCCESS, _client(limit)))
+    al = pipeline.state.auto_labeling
+    assert al.auto_labeling_complete and al.phase == AutoLabelingPhase.PENDING
+    assert pipeline.state.failed_run() is None          # the run itself succeeded
+    assert "CVAT_TASK_LIMIT_REACHED" not in reply and "already has 3" in reply
+    assert "0 images" not in reply and "export again" in reply
+
+
+def test_retrying_the_export_sends_predictions_without_rerunning(pipeline, monkeypatch):
+    pipeline.state.auto_labeling.auto_labeling_complete = True
+    monkeypatch.setenv("CVAT_ACCESS_TOKEN", "tok")
+    client = _client("Exported.\nTask IDs: 9\nImages: 30\n")
+    asyncio.run(pipeline._handle_export_generic("cvat", {"dataset_name": "ds"}, client))
+    args = client.call_tool.call_args[0]
+    assert args[0] == "export_to_cvat" and args[1]["with_predictions"] is True
+    al = pipeline.state.auto_labeling
+    assert al.cvat_task_ids == [9] and al.phase == AutoLabelingPhase.TRAINING

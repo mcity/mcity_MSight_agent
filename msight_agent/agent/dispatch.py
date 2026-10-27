@@ -42,6 +42,7 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
         }
         self._progress_cb = None  # async (event_type: str, data: dict) -> None
         self._user_texts: list[str] = []  # set by run(); read by the provenance guards
+        self._last_assistant_text = ""  # the reply the current user message answers
         # Lets Demo start inject a fallback intro if send_intro was skipped.
         self._intro_sent_this_turn = False
         # Any WRITE_TOOLS success this turn drops send_reply's source tag.
@@ -89,6 +90,9 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
         self.state = WorkflowState.load()
         self._progress_cb = progress_cb
         self._user_texts = user_texts(messages)
+        self._last_assistant_text = next(
+            (m.get("content") or "" for m in reversed(messages)
+             if m.get("role") == "assistant" and isinstance(m.get("content"), str) and m.get("content")), "")
 
         # Sync caches from WORKFLOWS so displayed values reflect prior-request changes.
         try:

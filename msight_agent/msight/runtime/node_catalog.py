@@ -5,7 +5,7 @@ resolve_cmd() adds the shared base flags (--name, --publish-topic,
 what's node-specific. To add a node type, add a NodeSpec after checking its
 real flags in MSight_Vision/cli/launch_*.py.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 
@@ -36,8 +36,19 @@ class NodeSpec:
     fixed_mounts: tuple[tuple[str, str, str], ...] = ()
     # Nodes that serve a web page: the port they use when config["port"] isn't given.
     web_port: int | None = None
+    # Config values filled in when the caller leaves them out (there's only one sensible value).
+    default_config: dict[str, object] = field(default_factory=dict)
+    # Data kinds ("image", "detections", "video", "bytes", "pointcloud", "sequence") this node
+    # reads and writes, where msight_core's code confirms them. Empty/None = unchecked.
+    consumes: tuple[str, ...] = ()
+    produces: str | None = None
 
 
+# Left out: they can't run on msight_core 2.0.0 whatever they're connected to (found by
+# launching each one). sdsm_encoder's launcher fails to import SDSMEncoderNode;
+# detection_results_viewer reads DetectionResultsData.detection_object_list, and
+# buffering_sort / bytes_viewer read data.event_timestamp (and data.bytes), none of which
+# exist. Re-add them once msight_core fixes those nodes.
 NODE_CATALOG: dict[str, NodeSpec] = {
     # --- docker-compose.yml's fixed stack (docker-executed) ---
     "video_source_rtsp": NodeSpec(
@@ -75,6 +86,7 @@ NODE_CATALOG: dict[str, NodeSpec] = {
         # The whole folder, so the config's relative paths (calibration, weights) resolve
         # whatever layout this MSight_Vision version uses; rw so downloaded weights persist.
         fixed_mounts=(("examples/rfdetr", "/configs", "rw"),),
+        default_config={"det_configs": "/configs/rfdetr_config.yaml"},
     ),
     "detection_viewer": NodeSpec(
         node_type="detection_viewer",
@@ -107,6 +119,8 @@ NODE_CATALOG: dict[str, NodeSpec] = {
             "fps": "--fps",
         },
         default_name="video_aggregator",
+        # The launcher requires both; these are what recording uses.
+        default_config={"buffer_size": 40, "overlap_size": 0},
     ),
     "video_local_dumper": NodeSpec(
         node_type="video_local_dumper",
@@ -139,20 +153,6 @@ NODE_CATALOG: dict[str, NodeSpec] = {
         required_config=("bucket_name",),
         arg_map={"bucket_name": "--bucket-name", "prefix": "--prefix", "aws_region": "--aws-region"},
         positional_flags=("use_dualstack_endpoint",),
-    ),
-    "buffering_sort": NodeSpec(
-        node_type="buffering_sort", category=NodeCategory.PROCESSING,
-        binary="msight_launch_buffering_sort", invocation="supervisor",
-        arg_map={"max_buffer_size": "--max-buffer-size"},
-    ),
-    "bytes_viewer": NodeSpec(
-        node_type="bytes_viewer", category=NodeCategory.SINK,
-        binary="msight_launch_bytes_viewer", invocation="supervisor",
-        arg_map={"filter_sensor_name": "--filter-sensor-name"},
-    ),
-    "detection_results_viewer": NodeSpec(
-        node_type="detection_results_viewer", category=NodeCategory.SINK,
-        binary="msight_launch_detection_results_viewer", invocation="supervisor",
     ),
     "http_sink": NodeSpec(
         node_type="http_sink", category=NodeCategory.SINK,
@@ -194,15 +194,6 @@ NODE_CATALOG: dict[str, NodeSpec] = {
         arg_map={
             "filter_sensor_name": "--filter-sensor-name",
             "voxel_downsample": "--voxel-downsample", "color_mode": "--color-mode",
-        },
-    ),
-    "sdsm_encoder": NodeSpec(
-        node_type="sdsm_encoder", category=NodeCategory.PROCESSING,
-        binary="msight_launch_sdsm_encoder", invocation="supervisor",
-        required_config=("map_center", "source_id"),
-        arg_map={
-            "map_center": "--map-center", "source_id": "--source-id",
-            "max_obj_list_length": "--max-obj-list-length",
         },
     ),
     "udp_server": NodeSpec(
@@ -267,27 +258,74 @@ NODE_CATALOG: dict[str, NodeSpec] = {
 }
 
 
+# (consumes, produces) per node type, from what each msight_core/msight_vision node reads
+# and builds. Wiring a node to a topic of another kind crashes it on the first message.
+_DATA_KINDS: dict[str, tuple[tuple[str, ...], str | None]] = {
+    "video_source_rtsp":        ((), "image"),
+    "video_source_mp4_folder":  ((), "image"),
+    "local_image":              ((), "image"),
+    "udp_server":               ((), "bytes"),
+    "websocket_client":         ((), "bytes"),
+    "velodyne_lidar":           ((), "pointcloud"),
+    "rfdetr_detector":          (("image",), "detections"),
+    "yolo_onestage_detection":  (("image",), "detections"),
+    "frame_annotator":          (("detections",), "image"),
+    "video_aggregator":         (("image",), "video"),
+    "aggregator":               ((), "sequence"),
+    "detection_viewer":         (("detections",), None),
+    "image_viewer":             (("image",), None),
+    "video_local_dumper":       (("video",), None),
+    "aws_video_pusher":         (("video",), None),
+    "pointcloud_local_dumper":  (("pointcloud",), None),
+    "pointcloud_viewer":        (("pointcloud",), None),
+}
+NODE_CATALOG = {
+    name: replace(spec, consumes=_DATA_KINDS[name][0], produces=_DATA_KINDS[name][1])
+    if name in _DATA_KINDS else spec
+    for name, spec in NODE_CATALOG.items()
+}
+
+
+def node_type_for_binary(cmd: str) -> str | None:
+    """The catalog node type whose launcher appears in a running process's command line."""
+    parts = cmd.split()
+    for name, spec in NODE_CATALOG.items():
+        # Script nodes run under a generic interpreter, so only their script path identifies them.
+        marker = str(spec.script_path) if spec.script_path else spec.binary
+        if any(p == marker or p.endswith("/" + marker) for p in parts):
+            return name
+    return None
+
+
+def with_defaults(spec: NodeSpec, config: dict) -> dict:
+    return {**spec.default_config, **config}
+
+
+def missing_config(spec: NodeSpec, config: dict) -> list[str]:
+    """Every required key `config` lacks (catalog-specific plus the per-category topics)."""
+    required = list(spec.required_config)
+    if spec.category in (NodeCategory.SOURCE, NodeCategory.PROCESSING):
+        required.append("publish_topic")
+    if spec.category in (NodeCategory.PROCESSING, NodeCategory.SINK):
+        required.append("subscribe_topic")
+    if spec.category == NodeCategory.SOURCE:
+        required.append("sensor_name")
+    return [k for k in required if k not in config]
+
+
 def resolve_cmd(spec: NodeSpec, name: str, config: dict) -> list[str]:
     """Build a node's argv; binary path resolution is left to MSightControlPlane."""
-    missing = [k for k in spec.required_config if k not in config]
-    if missing:
-        raise ValueError(
-            f"node_type '{spec.node_type}' is missing required config: {missing}"
-        )
+    config = with_defaults(spec, config)
+    if missing := missing_config(spec, config):
+        raise ValueError(f"node_type '{spec.node_type}' is missing required config: {missing}")
 
     args = [spec.binary, "--name", name]
 
     if spec.category in (NodeCategory.SOURCE, NodeCategory.PROCESSING):
-        if "publish_topic" not in config:
-            raise ValueError(f"node_type '{spec.node_type}' requires 'publish_topic'")
         args += ["--publish-topic", config["publish_topic"]]
     if spec.category in (NodeCategory.PROCESSING, NodeCategory.SINK):
-        if "subscribe_topic" not in config:
-            raise ValueError(f"node_type '{spec.node_type}' requires 'subscribe_topic'")
         args += ["--subscribe-topic", config["subscribe_topic"]]
     if spec.category == NodeCategory.SOURCE:
-        if "sensor_name" not in config:
-            raise ValueError(f"node_type '{spec.node_type}' requires 'sensor_name'")
         args += ["--sensor-name", config["sensor_name"]]
     elif spec.category == NodeCategory.PROCESSING and "sensor_name" in config:
         args += ["--sensor-name", config["sensor_name"]]
