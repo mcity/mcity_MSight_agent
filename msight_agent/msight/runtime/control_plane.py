@@ -18,7 +18,7 @@ import redis
 from msight_agent.msight.runtime.diagnosis import diagnose_from_health, sample_topic_rates, structural_findings
 from msight_agent.msight.runtime.executors import (
     DockerHandle, Executor, ExecutorHandle, container_name, gpu_report, inspect_containers,
-    recover_supervisor_handle, resolve_executor,
+    recover_supervisor_handle, resolve_executor, started_node_names,
 )
 from msight_agent.msight.runtime.node_catalog import NODE_CATALOG, node_type_for_binary, resolve_cmd
 from msight_agent.msight.runtime.paths import get_msight_path
@@ -288,8 +288,9 @@ class MSightControlPlane:
         return {t: (name, n.node_type) for name, n in self._nodes.items() for t in n.publish_topics}
 
     async def live_node_names(self) -> list[str]:
-        """Every node actually running: registered or tracked here, and alive."""
-        names = sorted({n["name"] for n in self.get_status()} | set(self._nodes))
+        """Every node actually running -- registered, tracked here, or just started by another
+        process (not registered yet) -- and alive."""
+        names = sorted({n["name"] for n in self.get_status()} | set(self._nodes) | await started_node_names())
         snap = await self.snapshot(names)
         return [n for n in names if snap[n]["alive"]]
 

@@ -301,6 +301,21 @@ def with_defaults(spec: NodeSpec, config: dict) -> dict:
     return {**spec.default_config, **config}
 
 
+def valid_config_keys(spec: NodeSpec) -> set[str]:
+    """Every config key this node type understands."""
+    keys = set(spec.required_config) | set(spec.arg_map) | set(spec.positional_flags) | set(spec.default_config)
+    if spec.category in (NodeCategory.SOURCE, NodeCategory.PROCESSING):
+        keys |= {"publish_topic", "sensor_name"}
+    if spec.category in (NodeCategory.PROCESSING, NodeCategory.SINK):
+        keys.add("subscribe_topic")
+    return keys
+
+
+def unknown_config(spec: NodeSpec, config: dict) -> list[str]:
+    """Keys the node would silently ignore (a typo or a guessed name)."""
+    return sorted(set(config) - valid_config_keys(spec))
+
+
 def missing_config(spec: NodeSpec, config: dict) -> list[str]:
     """Every required key `config` lacks (catalog-specific plus the per-category topics)."""
     required = list(spec.required_config)

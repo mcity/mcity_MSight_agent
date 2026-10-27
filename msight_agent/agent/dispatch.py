@@ -3,6 +3,7 @@ import logging
 
 from fastmcp import Client
 
+from msight_agent.agent.guards import confirmation_question, destructive_allowed
 from msight_agent.agent.routing import (
     Sentinels, HardStop, Injection, FallThrough, ToolRouting, WRITE_TOOLS,
     format_reply, tool_status, unwrap_tool_output, TOOL_STATUS_MESSAGES,
@@ -12,6 +13,7 @@ from msight_agent.msight.handlers import MsightPipelineHandlers
 from msight_agent.agent.state import (
     WorkflowState, AutoLabelingPhase, WORKFLOW_SPECS, validate_tool_input,
 )
+from msight_agent.shared.mcp_connection import MCPCallInterrupted, MCPUnavailable
 from msight_agent.shared.progress_relay import clear_active_progress_cb, set_active_progress_cb
 
 
@@ -195,6 +197,20 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
             await progress_cb("status", {"message": status})
 
         failed = False
+        current = self._user_texts[-1] if self._user_texts else ""
+        if not destructive_allowed(fn_name, fn_args, current, self._last_assistant_text):
+            logging.warning(f"[PIPELINE] {fn_name}({fn_args}) BLOCKED — the user didn't ask for it")
+            question = confirmation_question(fn_name, fn_args)
+            result = json.dumps({"status": "error", "message": f"Not run: the user didn't ask for {fn_name}."})
+            routings = [Injection(
+                f"{fn_name} was blocked: the user's current message doesn't ask for it, and destructive "
+                f"actions are never a way to recover from another tool's error. Do NOT call it again this "
+                f"turn. If it would help, ask the user to confirm first, naming exactly what happens -- "
+                f"e.g. \"{question}\" -- and only call it after they agree."
+            )]
+            messages.append({"role": "tool", "tool_call_id": call.id, "name": fn_name, "content": result})
+            return result, routings, False
+
         try:
             handlers = self._build_dispatch_table(fn_name, fn_args, mcp_client, messages, progress_cb)
             handler = handlers.get(fn_name)
@@ -205,8 +221,28 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
                 result = unwrap_tool_output(await mcp_client.call_tool(fn_name, fn_args))
                 routings = [FallThrough()]
 
+        except MCPUnavailable:
+            logging.warning(f"[PIPELINE] {fn_name}: MCP server unreachable")
+            result = json.dumps({"status": "error", "message": "The MSight backend (MCP server) isn't reachable."})
+            routings = [HardStop(
+                "I can't reach the MSight backend right now (the MCP server on port 8000), so I "
+                "couldn't do that. Please check that mcp_server is running, then try again."
+            )]
+            failed = True
+        except MCPCallInterrupted:
+            logging.warning(f"[PIPELINE] {fn_name}: connection dropped mid-call (reconnected)")
+            result = json.dumps({"status": "error", "message": (
+                f"The connection to the MSight backend dropped while {fn_name} was running, so it may "
+                f"or may not have completed. The connection is back.")})
+            routings = [Injection(
+                f"{fn_name} was interrupted by a dropped connection and may have partly run. Do NOT "
+                f"repeat it blindly: call get_msight_status first to see what actually happened, "
+                f"then tell the user."
+            )]
+            failed = True
         except Exception as e:
-            err_str = str(e)
+            # Some transport errors have an empty message; never hand the model a blank result.
+            err_str = str(e) or type(e).__name__
             if "WORKFLOW_STATE" in err_str or "WorkflowState" in err_str or "config.py" in err_str:
                 logging.warning(f"[PIPELINE] State save failed in {fn_name}: {e}")
                 result   = f"STATE_SAVE_ERROR: {err_str}"
@@ -382,7 +418,23 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
         self.state = WorkflowState()
         self.state.save()
         logging.warning("[PIPELINE] reset_workflow_state: local state cleared and saved")
-        return result, [HardStop(result)]
+        # Resetting the chat session doesn't stop anything; say so rather than leave it silent.
+        reply = result
+        if running := await self._running_msight_nodes():
+            reply += (f"\n\nNote: the MSight pipeline nodes are still running ({', '.join(running)}). "
+                      f"Say \"stop the pipeline\" or \"remove all the nodes\" if you want them stopped.")
+        return result, [HardStop(reply)]
+
+    async def _running_msight_nodes(self) -> list[str]:
+        try:
+            from msight_agent.msight.runtime.control_plane import get_control_plane
+            from msight_agent.msight.runtime.paths import get_msight_path
+            if get_msight_path()[1]:
+                return []
+            return await get_control_plane().live_node_names()
+        except Exception as e:
+            logging.warning(f"[PIPELINE] Could not list running MSight nodes: {e}")
+            return []
 
     def _orchestrate(self, all_routings: list[list], messages: list) -> str | None:
         """Two-pass: inject all context first, then return last HardStop."""

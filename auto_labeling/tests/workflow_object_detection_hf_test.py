@@ -1,5 +1,6 @@
 import logging
 import os
+from pathlib import Path
 import shutil
 
 import fiftyone as fo
@@ -64,16 +65,12 @@ def dataset_hf(dataset_v51):
     return hf_dataset
 
 
-# Known failures (also on the pre-audit code): "inference" finds no checkpoint-* folder
-# from the train step, and "inference_hf" asks Hugging Face for a model repo that 404s.
-_KNOWN_HF_FAILURE = pytest.mark.xfail(reason="see comment above: engine HF inference needs fixing", strict=False)
+# A trained model that is actually published (this test's own trainings aren't uploaded:
+# HF_DO_UPLOAD is off), so inference_hf really exercises loading from the Hub.
+PUBLISHED_HF_MODEL = "mcity-data-engine/fisheye8k_microsoft_conditional-detr-resnet-50"
 
 
-@pytest.mark.parametrize("mode", [
-    "train",
-    pytest.param("inference", marks=_KNOWN_HF_FAILURE),
-    pytest.param("inference_hf", marks=_KNOWN_HF_FAILURE),
-])
+@pytest.mark.parametrize("mode", ["train", "inference", "inference_hf"])
 def test_hf_object_detection(dataset_v51, dataset_hf, mode):
     """Test object detection by running workflow_auto_labeling_hf with a HuggingFace model across different modes (train/eval/inference)."""
     try:
@@ -110,24 +107,30 @@ def test_hf_object_detection(dataset_v51, dataset_hf, mode):
             "inference_settings": {
                 "do_eval": True,
                 "inference_on_test": True,
-                "model_hf": None,  # None (automatic selection) or Hugging Face ID
+                # None (automatic selection) or a Hugging Face ID
+                "model_hf": PUBLISHED_HF_MODEL if mode == "inference_hf" else None,
                 "detection_threshold": 0.2,
             },
         }
 
-        # Delete existing field
-        try:
-            dataset_v51.delete_sample_field(
-                "pred_od_microsoft_conditional_detr_resnet_50_fisheye8k_v51_hf_od_test"
-            )
-        except Exception as e:
-            print(f"Field was not deleted: {e}")
+        # Each mode must start without an earlier mode's predictions or evaluations
+        # (field names depend on the model's dataset, so clear them all).
+        for eval_key in dataset_v51.list_evaluations():
+            dataset_v51.delete_evaluation(eval_key)
+        for field in list(dataset_v51.get_field_schema()):
+            if field.startswith("pred_"):
+                dataset_v51.delete_sample_field(field)
 
         workflow_auto_labeling_hf(
             dataset_v51, dataset_hf, run_config, wandb_activate=False
         )
 
-        if mode != "train":
+        if mode == "train":
+            # The workflow logs training errors instead of raising them, so check the output.
+            model_root = Path("output/models/object_detection_hf", dataset_v51.name,
+                              MODEL_NAME.replace("/", "_").replace("-", "_"))
+            assert list(model_root.glob("checkpoint-*")), f"training wrote no checkpoint under {model_root}"
+        else:
             # Check results
             # Get fields with predictions
             predictions_fields = []

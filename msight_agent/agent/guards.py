@@ -33,6 +33,58 @@ HEALTH_QUESTION_RE = re.compile(
 )
 
 
+# Destructive tools run only when the user asked for that action: in their current message,
+# or by agreeing to a reply that asked about it. Never as the model's own recovery step.
+_STOP = r"stop|end|shut\s*down|kill|halt|terminate|tear\s*down|turn\s*off|finish"
+DESTRUCTIVE_INTENT: dict[str, tuple[str, str]] = {
+    # tool: (words that ask for it, words a confirmation question about it contains)
+    "stop_msight_pipeline": (_STOP + r"|restart|replace|instead|switch|clean\s*up", r"stop|shut|replace"),
+    "remove_msight_node": (r"remove|delete|drop|get\s*rid\s*of|clean\s*up|take\s*(it\s*)?(out|down)|"
+                           r"tear\s*down|kill|stop", r"remove|delete|stop"),
+    "stop_msight_recording": (_STOP, r"stop"),
+    "stop_msight_archiving": (_STOP, r"stop"),
+    # Also the designed way to leave a workflow ("that's all", "I'm finished"): it clears
+    # only the chat session, never the pipeline or its nodes.
+    "reset_workflow_state": (r"reset|start\s*over|from\s*scratch|clear\s*(everything|it\s*all)|wipe|"
+                             r"new\s*session|discard|that'?s\s*all|i'?m\s*(done|finished)|exit|"
+                             r"leave\s*(the|this)\s*workflow", r"reset|start\s*over|discard|exit"),
+}
+# Only a negation right before the verb ("don't stop", "no need to remove it"): "it's not
+# working, stop it" is still a request.
+_NEGATED = r"\b(don'?t|do\s*not|never|no\s*need\s*to)\s+(\w+\s+){0,2}?(%s)"
+_AFFIRMATIVE_RE = re.compile(r"^\s*(yes|yeah|yep|sure|ok|okay|go\s*ahead|do\s*it|please\s*do|confirm|"
+                             r"correct|that'?s\s*right)\b", re.IGNORECASE)
+
+
+def _target(fn_name: str, fn_args: dict) -> str:
+    return fn_args.get("name", "") if fn_name == "remove_msight_node" else ""
+
+
+def destructive_allowed(fn_name: str, fn_args: dict, user_message: str, last_reply: str) -> bool:
+    """Whether the user asked for this destructive call (see DESTRUCTIVE_INTENT)."""
+    if fn_name not in DESTRUCTIVE_INTENT:
+        return True
+    asks, question = DESTRUCTIVE_INTENT[fn_name]
+    message = user_message.lower()
+    if re.search(rf"\b({asks})", message) and not re.search(_NEGATED % asks, message):
+        return True
+    # "yes" counts only for a reply that asked about this action -- and this target, if any.
+    target = _target(fn_name, fn_args).lower()
+    reply = last_reply.lower()
+    return bool(_AFFIRMATIVE_RE.search(message) and re.search(rf"\b({question})", reply)
+                and (not target or target in reply))
+
+
+def confirmation_question(fn_name: str, fn_args: dict) -> str:
+    return {
+        "stop_msight_pipeline": "Should I stop the pipeline?",
+        "remove_msight_node": f"Should I remove {_target(fn_name, fn_args) or 'that node'}?",
+        "stop_msight_recording": "Should I stop the recording?",
+        "stop_msight_archiving": "Should I stop archiving?",
+        "reset_workflow_state": "Should I reset the session and discard all progress?",
+    }[fn_name]
+
+
 def without_writes(tool_list: list) -> list:
     return [t for t in tool_list if t["function"]["name"] not in WRITE_TOOLS]
 

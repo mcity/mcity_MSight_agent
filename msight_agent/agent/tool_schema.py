@@ -697,7 +697,7 @@ tools = [
             "type": "function",
             "function": {
                 "name": "stop_msight_recording",
-                "description": "Stop local video recording. Independent of archiving — if archiving is still active, the shared upstream aggregator node keeps running for it.",
+                "description": "Stop local video recording -- only when the user asked to stop it (refused otherwise). Independent of archiving — if archiving is still active, the shared upstream aggregator node keeps running for it.",
                 "parameters": {"type": "object", "properties": {}}
             }
         },
@@ -705,7 +705,7 @@ tools = [
             "type": "function",
             "function": {
                 "name": "stop_msight_archiving",
-                "description": "Stop pushing video to S3. Independent of local recording — if recording is still active, the shared upstream aggregator node keeps running for it.",
+                "description": "Stop pushing video to S3 -- only when the user asked to stop it (refused otherwise). Independent of local recording — if recording is still active, the shared upstream aggregator node keeps running for it.",
                 "parameters": {"type": "object", "properties": {}}
             }
         },
@@ -788,8 +788,12 @@ tools = [
             "function": {
                 "name": "remove_msight_node",
                 "description": (
-                    "Stop and untrack one node by name. Cheap, fast, and reversible — no "
-                    "confirmation needed, same as stop_msight_pipeline/stop_msight_recording. "
+                    "Stop and untrack one node by name. Only when the user asked to remove it "
+                    "(or agreed when you asked) -- it's refused otherwise, so never use it to "
+                    "recover from another tool's error. 'The additional/extra/added nodes' means the "
+                    "ones listed as 'added' (and recording/archiving if the user means those) -- never "
+                    "video_source, rfdetr_detector or detection_viewer, which are the standard pipeline "
+                    "(stop_msight_pipeline stops those). "
                     "If other still-running nodes were subscribed to this node's output, they "
                     "simply receive no more data — nothing else crashes, but say so if you know "
                     "of a downstream dependency."
