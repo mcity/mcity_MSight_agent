@@ -1181,7 +1181,6 @@ class HuggingFaceObjectDetection:
         training_args = TrainingArguments(
             run_name=self.model_name,
             output_dir=self.model_root,
-            overwrite_output_dir=overwrite_output,
             num_train_epochs=self.config["epochs"],
             fp16=True,
             per_device_train_batch_size=self.config["batch_size"],
@@ -1199,7 +1198,6 @@ class HuggingFaceObjectDetection:
             save_total_limit=1,
             remove_unused_columns=False,
             eval_do_concat_batches=False,
-            save_safetensors=False,  # Does not work with all models
             hub_model_id=self.hf_hub_model_id,
             hub_private_repo=True,
             push_to_hub=HF_DO_UPLOAD,
@@ -1217,7 +1215,7 @@ class HuggingFaceObjectDetection:
             args=training_args,
             train_dataset=hf_dataset[Split.TRAIN],
             eval_dataset=hf_dataset[Split.VALIDATION],
-            tokenizer=image_processor,
+            processing_class=image_processor,  # "tokenizer" before transformers 5
             data_collator=self.collate_fn,
             callbacks=[early_stopping_callback],
             # compute_metrics=eval_compute_metrics_fn,

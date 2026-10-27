@@ -17,9 +17,25 @@ from msight_agent.msight.runtime.calibration import calibration_mismatch
 from msight_agent.msight.runtime.control_plane import get_control_plane
 from msight_agent.msight.runtime.executors import has_gpu
 from msight_agent.msight.runtime.paths import get_msight_path
+from msight_agent.msight.tools.record_archive import AGGREGATOR_NODE, ANNOTATOR_NODE, DUMPER_NODE, PUSHER_NODE
 
 VIEWER_PORT = 9010
 FIXED_PIPELINE_NODES = ("video_source", "rfdetr_detector", "detection_viewer")
+_RECORD_ARCHIVE_NODES = (ANNOTATOR_NODE, AGGREGATOR_NODE, DUMPER_NODE, PUSHER_NODE)
+ROLE_LABELS = {"pipeline": "standard pipeline", "record_archive": "recording/archiving", "added": "added"}
+
+
+def node_role(name: str) -> str:
+    """"pipeline" (started by start_msight_pipeline), "record_archive", or "added" (by add_msight_node)."""
+    if name in FIXED_PIPELINE_NODES:
+        return "pipeline"
+    return "record_archive" if name in _RECORD_ARCHIVE_NODES else "added"
+
+
+def describe_by_role(names: list[str]) -> str:
+    """'standard pipeline: a, b; added: c' -- so "the extra nodes" can't be mistaken for pipeline ones."""
+    groups = {role: [n for n in names if node_role(n) == role] for role in ROLE_LABELS}
+    return "; ".join(f"{ROLE_LABELS[role]}: {', '.join(ns)}" for role, ns in groups.items() if ns)
 _BUILD_TIMEOUT = 600  # image build takes ~206s locally
 _MAX_LOG_CHARS = 8000
 
@@ -190,8 +206,8 @@ async def stop_msight_pipeline() -> str:
     if not others:
         return ok_json("MSight_Vision pipeline stopped. No other MSight nodes are running.")
     return ok_json(
-        f"MSight_Vision pipeline stopped. These separately added nodes are still running: "
-        f"{', '.join(others)}. Tell the user, and ask whether to remove them too.",
+        f"MSight_Vision pipeline stopped. These separately started nodes are still running -- "
+        f"{describe_by_role(others)}. Tell the user, and ask whether to remove them too.",
         other_nodes_still_running=others,
     )
 
@@ -216,6 +232,7 @@ async def get_msight_status() -> str:
             **node,
             **({"seconds_since_heartbeat": max(0, int(now - hb))} if isinstance(hb, (int, float)) else {}),
             "alive": snap[node["name"]]["alive"],  # Redis status never expires
+            "role": ROLE_LABELS[node_role(node["name"])],
         })
 
     extra: dict = {"services": services}

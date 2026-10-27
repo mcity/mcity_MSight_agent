@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
-from msight_agent.shared.mcp_connection import mcp_session
+from msight_agent.shared.mcp_connection import MCPCallInterrupted, MCPUnavailable, mcp_session
 from msight_agent.agent.routing import unwrap_tool_output
 
 
@@ -43,7 +43,14 @@ async def _json_body(request: Request) -> dict:
 
 async def _call_tool(request: Request, name: str, args: dict) -> JSONResponse:
     # No newline unescaping: the text is re-parsed as JSON.
-    text = unwrap_tool_output(await request.app.state.mcp_client.call_tool(name, args), unescape_newlines=False)
+    try:
+        raw = await request.app.state.mcp_client.call_tool(name, args)
+    except MCPUnavailable:
+        return JSONResponse({"status": "error", "message": "The MCP server isn't reachable."}, status_code=503)
+    except MCPCallInterrupted:
+        return JSONResponse({"status": "error", "message": f"The connection dropped during {name}; it may have "
+                             "partly run. Check the status before retrying."}, status_code=502)
+    text = unwrap_tool_output(raw, unescape_newlines=False)
     try:
         data = json.loads(text)
     except (TypeError, ValueError):

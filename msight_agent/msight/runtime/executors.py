@@ -136,6 +136,19 @@ def container_name(node_name: str) -> str:
     return f"msight-{node_name}"
 
 
+_NOT_NODES = {"redis"}  # msight-redis is the broker _ensure_redis may start, not a node
+
+
+async def started_node_names() -> set[str]:
+    """Nodes that exist on this host whoever started them: msight-* containers and node
+    pidfiles. Seen from the moment a node starts, unlike the Redis registry it joins later."""
+    _, out = await run_cmd("docker", "ps", "--format", "{{.Names}}", "--filter", "name=msight-",
+                           merge_stderr=False)
+    names = {line.strip().removeprefix("msight-") for line in out.splitlines() if line.strip().startswith("msight-")}
+    names |= {p.stem for p in NODE_LOG_DIR.glob("*.pid")} if NODE_LOG_DIR.is_dir() else set()
+    return names - _NOT_NODES
+
+
 class DockerExecutor:
     """One `docker run` per node on the prebuilt msight-vision image.
 
