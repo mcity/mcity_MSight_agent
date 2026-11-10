@@ -46,10 +46,12 @@ def decode(entry: dict) -> Optional[dict]:
 
 
 def apply(state: Optional[dict], event: dict) -> dict:
-    """One incident's state after one more event."""
-    state = dict(state or {"id": event["incident"], "status": "open", "stage": "detected",
-                           "detected_at": event["at"], "steps": []})
+    """One incident's state after one more event. Readers only see the stream's recent end:
+    an incident first seen after its "detected" event has an unknown history (it may have
+    closed before the window), so it is never treated as open."""
     stage = event["stage"]
+    state = dict(state or {"id": event["incident"], "status": "open" if stage == "detected" else "unknown",
+                           "stage": stage, "detected_at": event["at"], "steps": []})
     state.update({k: v for k, v in event.items() if k not in ("incident", "stage", "at", "text")})
     state["updated_at"] = event["at"]
     if stage == "progress":

@@ -142,3 +142,12 @@ def test_docker_start_waits_out_a_name_still_in_use(monkeypatch, tmp_path):
     monkeypatch.setattr(executors.asyncio, "sleep", no_sleep)
     handle = asyncio.run(executors.DockerExecutor().start("x", ["true"], tmp_path, {}))
     assert handle.container_name.endswith("x") and calls.count(("docker", "run")) == 2
+
+
+def test_host_process_nodes_dont_inherit_the_agents_python_setup(monkeypatch):
+    from msight_agent.msight.runtime import executors
+    monkeypatch.setenv("PYTHONPATH", ".")          # e.g. the servers started with PYTHONPATH=.
+    monkeypatch.setenv("VIRTUAL_ENV", "/agent/.venv")
+    monkeypatch.setenv("MSIGHT_VISION_PATH", "/mv")
+    env = executors.node_environment()
+    assert "PYTHONPATH" not in env and "VIRTUAL_ENV" not in env and env["MSIGHT_VISION_PATH"] == "/mv"

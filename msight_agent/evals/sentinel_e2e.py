@@ -121,7 +121,8 @@ class Feed:
                 self.states[event["incident"]] = incidents.apply(self.states.get(event["incident"]), event)
 
     def since(self, t0: float) -> list[dict]:
-        return sorted((s for s in self.states.values() if s["detected_at"] >= t0 and not s["id"].startswith("FEED-")),
+        return sorted((s for s in self.states.values() if s["detected_at"] >= t0 and s["status"] != "unknown"
+                       and not s["id"].startswith("FEED-")),
                       key=lambda s: s["detected_at"])
 
     def open_count(self) -> int:

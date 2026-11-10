@@ -33,7 +33,7 @@ def summarize(state: dict) -> dict:
     diagnosis_keys = ("summary", "root_cause", "category", "confidence", "suggested_fix")
     return {
         "id": state["id"],
-        "status": state["status"],          # open | resolved | dismissed
+        "status": state["status"],          # open | resolved | dismissed | unknown (only its end was read)
         "stage": state["stage"],
         "node": state.get("node"),
         "kind": state.get("kind"),

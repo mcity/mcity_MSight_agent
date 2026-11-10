@@ -249,6 +249,16 @@ def recover_supervisor_handle(name: str) -> Optional[SupervisorHandle]:
     return SupervisorHandle(name=name, pid=pid)
 
 
+# The agent's own Python setup must not reach MSight_Vision's processes: they run in its venv
+# with cwd=MSight_Vision, where a relative PYTHONPATH (e.g. "PYTHONPATH=. python -m ...")
+# makes its cli/ folder shadow msight_core's cli package, and the node fails to import.
+_AGENT_PYTHON_VARS = ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV")
+
+
+def node_environment() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if k not in _AGENT_PYTHON_VARS}
+
+
 class SupervisorExecutor:
     """Runs each node as a detached local subprocess."""
 
@@ -268,7 +278,7 @@ class SupervisorExecutor:
         with open(log_path, "wb") as log_file:
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdout=log_file, stderr=asyncio.subprocess.STDOUT,
-                env={**os.environ, **env}, cwd=str(cwd), start_new_session=True,
+                env={**node_environment(), **env}, cwd=str(cwd), start_new_session=True,
             )
 
         await asyncio.sleep(_STARTUP_GRACE_SECONDS)

@@ -603,3 +603,21 @@ def test_redis_notice_appears_only_after_a_few_seconds_down(monkeypatch):
     since, notice, sent = routes.track_redis_outage(since, None)
     assert notice["id"] == "FEED-redis-1000" and sent
     assert routes.track_redis_outage(since, notice)[2] == ""                # shown once
+
+
+def test_an_incident_whose_start_fell_outside_the_window_is_never_open():
+    # The window read begins after INC-1 was resolved, but includes the "fixed" event that
+    # the autofix publishes just after the watcher closes it.
+    window = [stage("INC-1", "fixed", 10, text="Fixed automatically"),
+              stage("INC-2", "detected", 11, node="x", kind="CONTAINER_KILLED")]
+    states = incidents.fold(window)
+    assert states["INC-1"]["status"] == "unknown" and incidents.fix_action(states["INC-1"]) is None
+    assert states["INC-2"]["status"] == "open"
+    _, opened, _ = feed_start([("1-0", window[0]), ("2-0", window[1])])
+    assert [s["id"] for s in opened] == ["INC-2"]
+
+
+def test_a_late_event_of_an_incident_from_before_the_page_is_not_sent():
+    from msight_agent.msight.routes import new_events_sse
+    chunk, cursor = new_events_sse([(b"9-0", incidents.encode("INC-OLD", "fixed", {"text": "x"}))], {}, "8-0")
+    assert chunk == "" and cursor == "9-0"

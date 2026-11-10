@@ -253,8 +253,9 @@ def new_events_sse(entries: list, states: dict[str, dict], cursor: str) -> tuple
         cursor = stream_id.decode() if isinstance(stream_id, bytes) else stream_id
         event = incidents.decode(fields)
         if event and event.get("incident"):
-            states[event["incident"]] = incidents.apply(states.get(event["incident"]), event)
-            out.append(_incident_sse(states[event["incident"]], cursor))
+            state = states[event["incident"]] = incidents.apply(states.get(event["incident"]), event)
+            if state["status"] != "unknown":    # a late event of an incident from before this page
+                out.append(_incident_sse(state, cursor))
     return "".join(out), cursor
 
 
