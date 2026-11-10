@@ -123,14 +123,14 @@ def autofix_decision(incident: dict, report: Optional[dict], warnings: list[str]
     the diagnosis is missing, doubtful, says a person is needed, or the node keeps failing."""
     if not report:
         return False, "There is no diagnosis to act on."
+    if incident.get("kind") == "SERVICE_DOWN":   # the most specific reason, whatever the report says
+        return False, "Agent services and Redis can't be restarted from the pipeline tools."
     if report.get("requires_human"):
         return False, report.get("human_action") or "The diagnosis says a person needs to handle this."
     if warnings:
         return False, "The diagnosis failed the consistency checks, so it isn't safe to act on automatically."
     if report.get("confidence") == "low":
         return False, "The diagnosis has low confidence."
-    if incident.get("kind") == "SERVICE_DOWN":
-        return False, "Agent services and Redis can't be restarted from the pipeline tools."
     recent = [t for t in past_fixes if now - t < FLAP_WINDOW_SECONDS]
     if len(recent) >= max_fixes:
         return False, (f"'{incident.get('node')}' was already fixed automatically {len(recent)} times in the last "

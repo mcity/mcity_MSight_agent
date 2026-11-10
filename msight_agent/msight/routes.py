@@ -208,8 +208,8 @@ def redis_outage_notice(down_since: float) -> dict:
             "note": "Live updates are paused; the monitor's findings will appear here once Redis is back."}
 
 
-def notices_sse(active_ids: list[str]) -> str:
-    return f"event: notices\ndata: {json.dumps(active_ids)}\n\n"
+def notices_sse(active_ids: list[str], event_id: str = "") -> str:
+    return (f"id: {event_id}\n" if event_id else "") + f"event: notices\ndata: {json.dumps(active_ids)}\n\n"
 
 
 def _resolved_sse(notice: dict, text: str) -> str:
@@ -217,15 +217,29 @@ def _resolved_sse(notice: dict, text: str) -> str:
                                                   "at": time.time(), "text": text}), "")
 
 
-def track_redis_outage(down_since: Optional[float], notice: Optional[dict]
-                       ) -> tuple[float, Optional[dict], str]:
-    """After one failed read: when Redis went down, its card (shown once it has been down
-    a few seconds, so a blip shows nothing), and what to send ("" if nothing changed)."""
-    down_since = down_since or time.time()
+# When Redis went down, shared by every connection: each ends after 30 s and the browser
+# reconnects, and one outage must stay one card (its id is built from this time).
+_redis_down_since: Optional[float] = None
+
+
+def redis_read_failed() -> float:
+    global _redis_down_since
+    _redis_down_since = _redis_down_since or time.time()
+    return _redis_down_since
+
+
+def redis_read_ok() -> None:
+    global _redis_down_since
+    _redis_down_since = None
+
+
+def track_redis_outage(down_since: float, notice: Optional[dict]) -> tuple[Optional[dict], str]:
+    """After a failed read: the outage card (shown once Redis has been down a few seconds,
+    so a blip shows nothing), and what to send ("" if nothing changed)."""
     if notice is None and time.time() - down_since >= _REDIS_NOTICE_AFTER_SECONDS:
         notice = redis_outage_notice(down_since)
-        return down_since, notice, _incident_sse(notice, "")
-    return down_since, notice, ""
+        return notice, _incident_sse(notice, "")
+    return notice, ""
 
 
 def track_monitor(offline_since: Optional[float], notice: Optional[dict]) -> tuple[Optional[dict], str]:
@@ -239,11 +253,13 @@ def track_monitor(offline_since: Optional[float], notice: Optional[dict]) -> tup
 
 
 def connected_sse(opened: list[dict], cursor: str, monitor_notice: Optional[dict]) -> str:
-    """A fresh connection's start: the open incidents, then which notice cards still stand.
-    Notices belong to no stream entry, and one may have cleared while the browser was
-    between connections."""
+    """A connection's start: the open incidents, then which notice cards still stand (notices
+    belong to no stream entry, and one may have cleared between connections). The notices
+    event carries the cursor as its id, so the browser's next reconnect resumes from here
+    even if nothing else was sent -- events published meanwhile (held during a Redis outage)
+    then still arrive."""
     active = [monitor_notice["id"]] if monitor_notice else []
-    return "".join(_incident_sse(state, cursor) for state in opened) + notices_sse(active)
+    return "".join(_incident_sse(state, cursor) for state in opened) + notices_sse(active, cursor)
 
 
 def new_events_sse(entries: list, states: dict[str, dict], cursor: str) -> tuple[str, str]:
@@ -290,7 +306,7 @@ async def incidents_stream(request: Request):
 
     async def generate():
         states, opened, cursor = {}, [], None    # cursor stays None until the first successful read
-        redis_down_since, redis_notice = None, None
+        redis_notice = None
         monitor_notice = None                    # the sentinel-offline card, while one is shown
         ends_at = time.monotonic() + _FEED_CONNECTION_SECONDS
         yield "retry: 1000\n\n"                # reconnect after 1s (default ~3s)
@@ -304,12 +320,12 @@ async def incidents_stream(request: Request):
                     result = await _feed_call(client.xread, {incidents.STREAM_KEY: cursor},
                                               count=100, block=_FEED_BLOCK_MS)
             except redis.RedisError:
-                redis_down_since, redis_notice, update = track_redis_outage(redis_down_since, redis_notice)
+                redis_notice, update = track_redis_outage(redis_read_failed(), redis_notice)
                 if update:
                     yield update
                 await asyncio.sleep(3)
                 continue
-            redis_down_since = None
+            redis_read_ok()
             if redis_notice is not None:
                 yield _resolved_sse(redis_notice, "Redis is reachable again; live updates have resumed.")
                 redis_notice = None

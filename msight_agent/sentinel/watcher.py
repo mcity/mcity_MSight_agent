@@ -53,6 +53,7 @@ SLOW_NODE_QUIET_SECONDS = 300  # a node found working slowly isn't re-checked as
 REPORT_DEDUPE_SECONDS = 30  # two detection paths seeing the same fault at nearly the same time
 SERVICES = {"mcp_server": 8000, "msight_api": 8003, "chat_server": 8001}
 REDIS_OUTAGE_SPAN_SECONDS = 60  # node deaths this soon after a Redis outage are its symptoms
+REDIS_RECOVERY_CHECK_SECONDS = 10  # after Redis is back: time for surviving nodes to reconnect
 LOG_TAIL_LINES = 40
 CAMERA_REFERENCE_DIR = LOG_DIR / "camera_reference"  # learned normal view per camera topic
 CAMERA_KINDS_PREFIX = "CAMERA_"  # closed by the camera checks, not by the data-flow sweep
@@ -88,6 +89,11 @@ class Incident:
     @property
     def id(self) -> str:
         return self._id
+
+    @property
+    def nodes(self) -> set[str]:
+        """Every node the incident is about: its node field joins several with '+'."""
+        return set(self.node.split("+"))
 
     def to_dict(self) -> dict:
         return {"id": self.id, **asdict(self)}
@@ -222,13 +228,17 @@ def classify_container(name: str, events: list[dict], state: dict) -> tuple[str,
 # --- pipeline sweep (pure, unit-tested) -------------------------------------------------
 
 def degraded_key(diagnosis: dict) -> Optional[frozenset]:
-    """Identity of a degraded verdict's root causes, or None when not degraded."""
+    """Identity of a degraded verdict: its root causes, plus downstream nodes that are dead
+    themselves (not just starved) -- they won't come back when their upstream does. None
+    when not degraded."""
     if diagnosis.get("verdict") != "degraded":
         return None
     # A missing publisher is reported under the starved subscriber's name; the node to
     # bring back (and the one Fix-it should restart) is the removed publisher.
-    return frozenset((c.get("kind"), c.get("removed_publisher") or c.get("node") or c.get("topic") or "?")
-                     for c in diagnosis.get("root_causes") or [])
+    causes = {(c.get("kind"), c.get("removed_publisher") or c.get("node") or c.get("topic") or "?")
+              for c in diagnosis.get("root_causes") or []}
+    dead = {("DEAD", a["node"]) for a in diagnosis.get("affected") or [] if a.get("health") == "DEAD"}
+    return frozenset(causes | dead)
 
 
 def _still_flowing(diagnosis: dict, node: str) -> Optional[float]:
@@ -525,7 +535,7 @@ class Watcher:
     def _announce(self, incident: Incident) -> None:
         """Tell the chat right away, before the facts are settled."""
         self.open[incident.id] = incident
-        self._reported_at[incident.node] = time.time()
+        self._reported_at.update(dict.fromkeys(incident.nodes, time.time()))
         self.publish(incident.id, "detected", node=incident.node, kind=incident.kind,
                      summary=incident.summary, first_event_at=incident.first_event_at)
         self.say(f"[detect] {incident.node}: {incident.summary}")
@@ -535,7 +545,7 @@ class Watcher:
         if incident.id not in self.open:
             self._announce(incident)
         self._classified.add(incident.id)
-        self._reported_at[incident.node] = time.time()
+        self._reported_at.update(dict.fromkeys(incident.nodes, time.time()))
         self.publish(incident.id, "classified", kind=incident.kind, summary=incident.summary,
                      timeline=incident.timeline)
         self.queue.put_nowait(incident)
@@ -550,7 +560,7 @@ class Watcher:
         """Already covered: an open incident on this node, or one reported moments ago by
         another path. Not a long cooldown -- a new fault on a node that just recovered
         (frozen right after being restarted) must still be reported."""
-        if any(i.node == node for i in self.open.values()):
+        if any(node in i.nodes for i in self.open.values()):
             return True
         return time.time() - self._reported_at.get(node, 0) < REPORT_DEDUPE_SECONDS
 
@@ -656,10 +666,11 @@ class Watcher:
                 continue
             self._redis_reachable()
             for node in self.heartbeats.update(nodes, time.time()):
-                # A death is already handled from Docker's events, and a node just found
-                # working slowly would only be dismissed again.
+                # A death is already handled from Docker's events, a node just found working
+                # slowly would only be dismissed again, and right after a Redis outage what is
+                # still broken is reported by _after_redis_outage.
                 if (self.grouper.is_open(CONTAINER_PREFIX + node) or self._recently_reported(node)
-                        or self._slow_until.get(node, 0) > time.time()):
+                        or self._slow_until.get(node, 0) > time.time() or self._redis_outage(time.time())):
                     continue
                 self._spawn(self._unresponsive(node, nodes[node]["heartbeat"]))
 
@@ -683,8 +694,31 @@ class Watcher:
         self._redis_failures = 0
         if self._redis_incident is not None:
             self._close(self._redis_incident, "resolved", "Redis is reachable again.")
+            self._spawn(self._after_redis_outage(self._redis_incident.first_event_at))
             self._redis_incident = None
             self._redis_outage_ended = time.time()
+
+    async def _after_redis_outage(self, outage_started: float) -> None:
+        """Nodes that died while Redis was down were only its symptoms. Once it's back, what is
+        still broken is one problem: report it at once, not node by node as heartbeats lapse."""
+        await asyncio.sleep(REDIS_RECOVERY_CHECK_SECONDS)
+        try:
+            diagnosis = await asyncio.to_thread(self._get_json, "/diagnose", 60)
+        except Exception:  # noqa: BLE001 -- the regular sweep will find it
+            return
+        key = degraded_key(diagnosis)
+        if key is None:
+            return
+        nodes = sorted({node for _, node in key})
+        if any(i.nodes & set(nodes) for i in self.open.values()):
+            return
+        self._reported_key = key   # the sweep must not report it again
+        now = time.time()
+        self._emit(Incident(
+            kind="PIPELINE_DEGRADED", node="+".join(nodes), first_event_at=outage_started,
+            summary=f"Still broken after the Redis outage: {diagnosis.get('summary')}",
+            timeline=[f"{clock(outage_started)} Redis unreachable", f"{clock(now)} Redis back, pipeline still degraded"],
+            evidence={"diagnosis": compact_diagnosis(diagnosis)}))
 
     def _redis_outage(self, now: float) -> Optional[str]:
         """While Redis is down (or just back), node deaths are its symptoms, not new faults."""
@@ -817,7 +851,7 @@ class Watcher:
         nodes = sorted({node for _, node in key})
         # Covered if any node already has an open incident: one fault often shows up as
         # several root causes (a dead detector also leaves the viewer with no publisher).
-        open_nodes = {i.node for i in self.open.values()}
+        open_nodes = {n for i in self.open.values() for n in i.nodes}
         if any(n in open_nodes or self.grouper.is_open(CONTAINER_PREFIX + n) for n in nodes) \
                 or all(self._recently_reported(n) for n in nodes):
             return
@@ -993,9 +1027,9 @@ class Watcher:
         """Down or restarting: another check's incident, not a frame-rate problem. This
         check's own open alerts don't count, or they could never clear."""
         own = {i.id for i in self._rate_alerts.values()}
-        if any(i.node == node and i.id not in own for i in self.open.values()):
+        if any(node in i.nodes and i.id not in own for i in self.open.values()):
             return True
-        owned = any(i.node == node for i in self._rate_alerts.values())
+        owned = any(node in i.nodes for i in self._rate_alerts.values())
         return not owned and time.time() - self._reported_at.get(node, 0) < REPORT_DEDUPE_SECONDS
 
     async def _check_rates(self, topic: str, camera: dict) -> bool:

@@ -358,8 +358,18 @@ def test_redis_outage_is_one_incident_and_resolves(quiet_watcher, monitor_events
     w._redis_unreachable(redis_lib.ConnectionError("refused"))
     assert [a[1] for a, _ in monitor_events] == ["detected", "classified"]
     assert w.queue.get_nowait().node == "redis"
-    w._redis_reachable()
+    checked = []
+
+    async def after_outage(started):
+        checked.append(started)
+
+    async def recover():
+        w._after_redis_outage = after_outage
+        w._redis_reachable()
+        await asyncio.sleep(0)               # let the spawned recovery check run
+    asyncio.run(recover())
     assert [a[1] for a, _ in monitor_events][-1] == "resolved"
+    assert len(checked) == 1                 # what is still broken gets checked once Redis is back
 
 
 def test_node_deaths_during_a_redis_outage_are_its_symptoms(quiet_watcher, monitor_events, monkeypatch):
@@ -596,13 +606,38 @@ def test_new_stream_entries_fold_into_state_and_advance_the_cursor():
 
 def test_redis_notice_appears_only_after_a_few_seconds_down(monkeypatch):
     from msight_agent.msight import routes
+    monkeypatch.setattr(routes, "_redis_down_since", None)
     monkeypatch.setattr(routes.time, "time", lambda: 1000.0)
-    since, notice, sent = routes.track_redis_outage(None, None)
-    assert (since, notice, sent) == (1000.0, None, "")                     # a blip shows nothing
+    notice, sent = routes.track_redis_outage(routes.redis_read_failed(), None)
+    assert (notice, sent) == (None, "")                                      # a blip shows nothing
     monkeypatch.setattr(routes.time, "time", lambda: 1004.0)
-    since, notice, sent = routes.track_redis_outage(since, None)
+    notice, sent = routes.track_redis_outage(routes.redis_read_failed(), None)
     assert notice["id"] == "FEED-redis-1000" and sent
-    assert routes.track_redis_outage(since, notice)[2] == ""                # shown once
+    assert routes.track_redis_outage(routes.redis_read_failed(), notice)[1] == ""   # shown once
+
+
+def test_one_redis_outage_is_one_card_across_reconnects(monkeypatch):
+    # Each connection ends after 30 s; a new one during the same outage must reuse the card.
+    from msight_agent.msight import routes
+    monkeypatch.setattr(routes, "_redis_down_since", None)
+    monkeypatch.setattr(routes.time, "time", lambda: 1000.0)
+    routes.redis_read_failed()
+    monkeypatch.setattr(routes.time, "time", lambda: 1040.0)                 # a later connection
+    first, _ = routes.track_redis_outage(routes.redis_read_failed(), None)
+    monkeypatch.setattr(routes.time, "time", lambda: 1075.0)                 # and another
+    second, _ = routes.track_redis_outage(routes.redis_read_failed(), None)
+    assert first["id"] == second["id"] == "FEED-redis-1000"
+    routes.redis_read_ok()
+    monkeypatch.setattr(routes.time, "time", lambda: 2000.0)                 # the next outage
+    since = routes.redis_read_failed()
+    monkeypatch.setattr(routes.time, "time", lambda: 2005.0)
+    assert routes.track_redis_outage(since, None)[0]["id"] == "FEED-redis-2000"
+
+
+def test_a_connection_start_carries_an_id_so_reconnects_resume_from_it():
+    from msight_agent.msight.routes import connected_sse
+    sent = connected_sse([], "1793-5", None)
+    assert "id: 1793-5\nevent: notices" in sent
 
 
 def test_an_incident_whose_start_fell_outside_the_window_is_never_open():
@@ -621,3 +656,55 @@ def test_a_late_event_of_an_incident_from_before_the_page_is_not_sent():
     from msight_agent.msight.routes import new_events_sse
     chunk, cursor = new_events_sse([(b"9-0", incidents.encode("INC-OLD", "fixed", {"text": "x"}))], {}, "8-0")
     assert chunk == "" and cursor == "9-0"
+
+
+def test_after_a_redis_outage_what_is_still_broken_is_one_incident(quiet_watcher, monitor_events, monkeypatch):
+    # The detector and the viewer both used up Docker's restarts while Redis was down.
+    w = quiet_watcher
+    diagnosis = {"status": "ok", "verdict": "degraded", "summary": "Two nodes are not running.",
+                 "root_causes": [{"kind": "NOT_RUNNING", "node": "rfdetr_detector"},
+                                 {"kind": "NOT_RUNNING", "node": "detection_viewer"}]}
+    monkeypatch.setattr(w, "_get_json", lambda path, timeout: diagnosis)
+    monkeypatch.setattr(watcher_mod.asyncio, "sleep", _no_sleep)
+    asyncio.run(w._after_redis_outage(100.0))
+    incident = w.queue.get_nowait()
+    assert (incident.kind, incident.node) == ("PIPELINE_DEGRADED", "detection_viewer+rfdetr_detector")
+    assert w.queue.empty() and w._reported_key == watcher_mod.degraded_key(diagnosis)
+
+    # Nodes going quiet right after the outage are left to that check, not reported one by one.
+    w._redis_outage_ended = watcher_mod.time.time()
+    assert w._redis_outage(watcher_mod.time.time())
+
+
+def test_nothing_is_reported_after_a_redis_outage_if_the_pipeline_recovered(quiet_watcher, monkeypatch):
+    w = quiet_watcher
+    monkeypatch.setattr(w, "_get_json", lambda path, timeout: {"status": "ok", "verdict": "healthy"})
+    monkeypatch.setattr(watcher_mod.asyncio, "sleep", _no_sleep)
+    asyncio.run(w._after_redis_outage(100.0))
+    assert w.queue.empty()
+
+
+def test_a_dead_downstream_node_is_part_of_the_incident_not_just_affected(quiet_watcher, monkeypatch):
+    # After a Redis outage both nodes exited; the diagnosis ranks the viewer as "affected"
+    # by the dead detector, but it is dead itself and needs its own restart.
+    w = quiet_watcher
+    diagnosis = {"status": "ok", "verdict": "degraded", "summary": "'rfdetr_detector' is not running.",
+                 "root_causes": [{"kind": "DEAD", "node": "rfdetr_detector"}],
+                 "affected": [{"node": "detection_viewer", "health": "DEAD", "caused_by": "rfdetr_detector"}]}
+    monkeypatch.setattr(w, "_get_json", lambda path, timeout: diagnosis)
+    monkeypatch.setattr(watcher_mod.asyncio, "sleep", _no_sleep)
+    asyncio.run(w._after_redis_outage(100.0))
+    assert w.queue.get_nowait().node == "detection_viewer+rfdetr_detector"
+    starved = {**diagnosis, "affected": [{"node": "detection_viewer", "health": "STARVED", "caused_by": "x"}]}
+    assert watcher_mod.degraded_key(starved) == frozenset({("DEAD", "rfdetr_detector")})   # starved: not its own fault
+
+
+def test_a_node_in_a_multi_node_incident_counts_as_already_handled(quiet_watcher):
+    # The restarted detector warms up with 0 detections/s: not a frame-rate fault while its
+    # incident (which also covers the viewer) is still open.
+    w = quiet_watcher
+    both = Incident(kind="PIPELINE_DEGRADED", node="detection_viewer+rfdetr_detector", summary="s",
+                    first_event_at=1)
+    w._emit(both)
+    assert w._recently_reported("rfdetr_detector") and w._rate_busy("rfdetr_detector")
+    assert not w._rate_busy("video_source")
