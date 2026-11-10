@@ -15,8 +15,10 @@ from msight_agent.shared.host_utils import resolve_host
 from msight_agent.shared.mcp import error_json, mcp, ok_json
 from msight_agent.msight.runtime.calibration import calibration_mismatch
 from msight_agent.msight.runtime.control_plane import get_control_plane
+from msight_agent.msight.runtime.diagnosis import sample_topic_rates
 from msight_agent.msight.runtime.executors import has_gpu
 from msight_agent.msight.runtime.paths import get_msight_path
+from msight_agent.msight.runtime.utils import topic_list
 from msight_agent.msight.tools.record_archive import AGGREGATOR_NODE, ANNOTATOR_NODE, DUMPER_NODE, PUSHER_NODE
 
 VIEWER_PORT = 9010
@@ -189,6 +191,68 @@ async def start_msight_pipeline(
     except Exception as e:
         return error_json(_friendly_error(str(e)) or f"Failed to start MSight_Vision pipeline: {e}")
     return ok_json("MSight_Vision pipeline started.", viewer_url=_viewer_url())
+
+
+def _running_sensor() -> str:
+    """The sensor the running pipeline uses, from video_source's registered topic."""
+    for node in get_control_plane().get_status():
+        topic = node.get("publish_topic")
+        if node["name"] == "video_source" and isinstance(topic, str) and topic.startswith("camera/"):
+            return topic.removeprefix("camera/")
+    return "gs_mcity_1"
+
+
+@mcp.tool()
+async def restart_msight_node(name: str, ctx: Context = None) -> str:
+    """Recreate one standard pipeline node with its normal settings, leaving the rest running.
+    A fresh node also drops anything done to the old one by hand (paused, memory cap)."""
+    msight_path, err = get_msight_path()
+    if err:
+        return error_json(err)
+    if name not in FIXED_PIPELINE_NODES:
+        return error_json(f"'{name}' isn't a standard pipeline node, so its settings aren't known here: "
+                          "remove it and add it again with add_msight_node.")
+    env = dotenv_values(msight_path / ".env")
+    video_input, rtsp_url = env.get("VIDEO_INPUT") or None, env.get("RTSP_URL") or None
+    if not video_input and not rtsp_url:
+        return error_json("MSight_Vision's .env sets neither VIDEO_INPUT nor RTSP_URL, so the node's settings "
+                          "aren't known; start the pipeline instead.")
+    cp = get_control_plane()
+    try:
+        sensor = _running_sensor()
+        spec = next(d for d in _fixed_pipeline(*_resolve_video_source(video_input, rtsp_url, sensor), sensor)
+                    if d["name"] == name)
+        await cp.delete_node(name)
+        await cp.add_node(spec["node_type"], name=name, config=spec["config"], progress=ctx.log if ctx else None)
+        ready_after = await _wait_until_working(name, topic_list(spec["config"].get("publish_topic")), ctx)
+    except Exception as e:
+        return error_json(_friendly_error(str(e)) or f"Failed to restart '{name}': {e}")
+    if ready_after is None:
+        return ok_json(f"Restarted '{name}' with its normal settings, but it hasn't started working within "
+                       f"{_RESTART_READY_SECONDS}s. Check its logs before telling the user it's fixed.")
+    return ok_json(f"Restarted '{name}' with its normal settings; it was working again after {ready_after:.0f}s and "
+                   "the rest of the pipeline kept running. Call diagnose_msight_pipeline to confirm.")
+
+
+_RESTART_READY_SECONDS = 90  # RF-DETR loads its model before it publishes (~7s on GPU, longer on CPU)
+
+
+async def _wait_until_working(name: str, publish_topics: list[str], ctx: Optional[Context]) -> Optional[float]:
+    """Seconds until a restarted node registers and (if it publishes) its topic carries data,
+    so the agent's follow-up diagnosis doesn't catch it still loading. None on timeout."""
+    start = time.monotonic()
+    while (elapsed := time.monotonic() - start) < _RESTART_READY_SECONDS:
+        registered = any(n["name"] == name for n in get_control_plane().get_status())
+        if registered and not publish_topics:
+            return elapsed
+        if registered:
+            rates = await asyncio.to_thread(sample_topic_rates, publish_topics, 3.0)
+            if any(r.get("messages") for r in rates.values()):
+                return time.monotonic() - start
+        elif ctx:
+            await ctx.log(f"Waiting for {name} to come back up ({elapsed:.0f}s)...")
+        await asyncio.sleep(1)
+    return None
 
 
 @mcp.tool()

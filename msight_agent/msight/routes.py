@@ -1,5 +1,6 @@
-"""MSight file endpoints served by chat_server.py for the chat UI: calibration and
-video uploads, recording download, and the recording-progress badge."""
+"""MSight endpoints served by chat_server.py for the chat UI: calibration and video
+uploads, recording download, the recording-progress badge, and the live incident feed."""
+import asyncio
 import io
 import json
 import os
@@ -7,11 +8,14 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from fastapi import APIRouter, File, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+import redis
+from fastapi import APIRouter, File, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
+from msight_agent.msight.runtime import incidents
 from msight_agent.msight.runtime.calibration import calibration_status, locmap_problem, write_calibration
 from msight_agent.msight.runtime.paths import get_msight_path
+from msight_agent.msight.runtime.utils import redis_kwargs
 from msight_agent.msight.tools.record_archive import (
     DEFAULT_SENSOR_NAME, DOWNLOAD_DIR, active_sensor_name, recording_segment_status,
 )
@@ -136,3 +140,71 @@ async def record_status():
                    f"(most recent {seg['seconds_since_last']}s ago). Stop recording to download.")
     return JSONResponse({"status": "ok", "recording_active": True, "recording_pending": False, **seg,
                          "message": message})
+
+
+# --- live incident feed (written by the sentinel) ---------------------------------------
+
+_FEED_BLOCK_MS = 15000  # also the keepalive interval
+
+
+def _stream_id(value) -> tuple[int, int]:
+    ms, _, seq = (value.decode() if isinstance(value, bytes) else str(value)).partition("-")
+    return int(ms or 0), int(seq or 0)
+
+
+def _sse(event: str, data: dict, event_id: str = "") -> str:
+    return (f"id: {event_id}\n" if event_id else "") + f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
+
+
+def _incident_sse(state: dict, event_id: str) -> str:
+    return _sse("incident", {**state, "fix": incidents.fix_action(state)}, event_id)
+
+
+def feed_start(recent: list[tuple[str, dict]], last_event_id: str = "") -> tuple[dict[str, dict], list[dict], str]:
+    """(folded states, incidents to send now, cursor to read from) for a new connection.
+
+    A fresh page gets every open incident. A reconnect (the browser sends the last id
+    it saw) gets nothing up front: it resumes from that id, and states are folded only
+    up to it so resumed events aren't applied twice."""
+    if last_event_id:
+        upto = _stream_id(last_event_id)
+        states = incidents.fold(e for sid, e in recent if _stream_id(sid) <= upto)
+        return states, [], last_event_id
+    states = incidents.fold(e for _, e in recent)
+    opened = sorted((s for s in states.values() if s["status"] == "open"), key=lambda s: s["detected_at"])
+    return states, opened, recent[-1][0] if recent else "0-0"
+
+
+@router.get("/incidents/stream")
+async def incidents_stream(request: Request):
+    """Server-sent events: each event is one incident's full current state."""
+    client = redis.Redis(**redis_kwargs(), socket_timeout=_FEED_BLOCK_MS / 1000 + 15)
+
+    async def generate():
+        try:
+            recent = await asyncio.to_thread(incidents.read_recent, client)
+        except redis.RedisError:
+            recent = []
+        states, opened, cursor = feed_start(recent, request.headers.get("last-event-id", ""))
+        for state in opened:
+            yield _incident_sse(state, cursor)
+        yield ": connected\n\n"
+        while not await request.is_disconnected():
+            try:
+                result = await asyncio.to_thread(client.xread, {incidents.STREAM_KEY: cursor},
+                                                 count=100, block=_FEED_BLOCK_MS)
+            except redis.RedisError:
+                await asyncio.sleep(3)
+                continue
+            if not result:
+                yield ": keepalive\n\n"
+                continue
+            for stream_id, fields in result[0][1]:
+                cursor = stream_id.decode() if isinstance(stream_id, bytes) else stream_id
+                event = incidents.decode(fields)
+                if event and event.get("incident"):
+                    states[event["incident"]] = incidents.apply(states.get(event["incident"]), event)
+                    yield _incident_sse(states[event["incident"]], cursor)
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

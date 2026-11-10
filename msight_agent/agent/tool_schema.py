@@ -603,6 +603,46 @@ tools = [
         {
             "type": "function",
             "function": {
+                "name": "get_recent_incidents",
+                "description": (
+                    "Read what the background monitor detected on its own: open incidents with what it "
+                    "saw, Claude's diagnosis (root cause, evidence, suggested fix), consistency checks and "
+                    "the fix action. Call this FIRST when the user mentions an incident (e.g. 'Fix incident "
+                    "INC-...'), asks what went wrong / what the alert was, or when SESSION_STATE lists "
+                    "OPEN_INCIDENTS -- then fix with your pipeline tools following `fix_guidance`, and "
+                    "confirm with diagnose_msight_pipeline. Read-only."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "incident_id": {"type": "string", "description": "Optional: one incident, e.g. INC-20261027-153306-rfdetr_detector."},
+                        "include_resolved": {"type": "boolean", "description": "Also list resolved/dismissed incidents (default false)."}
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "restart_msight_node",
+                "description": (
+                    "Recreate ONE standard pipeline node (video_source, rfdetr_detector or detection_viewer) "
+                    "with its normal settings, leaving the other nodes running. The right fix when a single "
+                    "node is down, was OOM-killed, or is running but frozen/stuck -- e.g. for 'Fix incident "
+                    "...: restart <node>'. Prefer it over stopping and starting the whole pipeline, which "
+                    "interrupts healthy nodes. Only when the user asked for a restart/fix. Afterwards call "
+                    "diagnose_msight_pipeline to confirm."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string", "description": "The node to restart, e.g. rfdetr_detector."}},
+                    "required": ["name"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "get_msight_logs",
                 "description": "Fetch recent MSight_Vision pipeline logs, e.g. to diagnose why detections aren't showing up in the viewer.",
                 "parameters": {

@@ -11,6 +11,7 @@ from msight_agent.auto_labeling.tools import (  # noqa: F401
 from msight_agent.msight.tools import (  # noqa: F401
     calibration,
     host_inspect,
+    incidents,
     nodes,
     pipeline,
     record_archive,

@@ -181,6 +181,23 @@ border-radius:10px;border:1px solid #1d273f;font-family: ui-monospace, SFMono-Re
 .log-line.error{color:#fca5a5}
 .log-line.agent{color:#a7f3d0}
 
+/* ── Incidents from the background monitor ───────────────── */
+.bubble.incident{border-left:4px solid #f97316;min-width:min(75%,520px)}
+.bubble.incident.resolved{border-left-color:#22c55e}
+.bubble.incident.dismissed{border-left-color:var(--muted);opacity:.75}
+.incident-head{display:flex;align-items:center;gap:8px;font-weight:700}
+.incident-pill{margin-left:auto;font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px;
+border:1px solid var(--border);color:var(--muted);white-space:nowrap}
+.incident-summary{margin-top:6px}
+.incident-section{margin-top:10px}
+.incident-label{font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:2px}
+.incident-steps{font-size:13px;color:var(--muted);margin-top:8px}
+.incident-checks{font-size:13px;color:#fdba74}
+.incident-closed{margin-top:10px;font-size:13px;color:var(--muted)}
+.incident-actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+.incident-actions button{padding:6px 12px;min-width:0;min-height:32px}
+.incident-actions button.secondary{background:transparent}
+
 /* ── Source footnote ─────────────────────────────────────── */
 .msg-source {
   font-size: 11px;
@@ -974,6 +991,129 @@ videoSubmitBtn.addEventListener("click", async () => {
     } finally {
         videoSubmitBtn.disabled = false;
     }
+});
+
+// ── Live incidents from the background monitor (msight_agent/sentinel) ─────
+// The monitor speaks up on its own: an incident appears here seconds after a fault,
+// updates in place while Claude investigates, and offers a Fix-it action that the
+// chat agent carries out. Incident text can quote untrusted log lines, so it is only
+// ever set with textContent, never as HTML.
+const incidentLines = new Map();      // incident id -> chat line element
+const fixRequested  = new Set();
+const DISMISSED_KEY = "mcity_dismissed_incidents";
+const dismissedIncidents = new Set((() => {
+    try { return JSON.parse(sessionStorage.getItem(DISMISSED_KEY) || "[]"); } catch { return []; }
+})());
+const INCIDENT_KINDS = {
+    CONTAINER_OOM: "ran out of memory", CONTAINER_KILLED: "was killed", CONTAINER_CRASHED: "crashed",
+    CONTAINER_EXITED: "exited", PROCESS_DIED: "stopped", NODE_UNRESPONSIVE: "stopped responding",
+    PIPELINE_DEGRADED: "is degraded", SERVICE_DOWN: "is down",
+};
+
+function textEl(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text) e.textContent = text;
+    return e;
+}
+
+function incidentPill(s) {
+    if (s.status !== "open") return s.status === "resolved" ? "Resolved" : "Dismissed";
+    if (s.stage === "diagnosed") return "Diagnosed";
+    if (s.stage === "investigating" || s.stage === "progress") return "Investigating…";
+    return s.stage === "classified" ? "Confirmed" : "Just detected";
+}
+
+function incidentSection(label, text, cls) {
+    const sec = textEl("div", "incident-section");
+    sec.appendChild(textEl("div", "incident-label", label));
+    sec.appendChild(textEl("div", cls || "", text));
+    return sec;
+}
+
+function notifyIncident(s) {
+    if (!("Notification" in window)) return;
+    const fire = () => new Notification(`MSight: ${s.node} ${INCIDENT_KINDS[s.kind] || "has a problem"}`,
+                                        { body: s.summary || "", tag: s.id });
+    if (Notification.permission === "granted") fire();
+    else if (Notification.permission !== "denied") {
+        Notification.requestPermission().then((perm) => { if (perm === "granted") fire(); });
+    }
+}
+
+function requestIncidentFix(s, button) {
+    if (sendBtn.disabled) {
+        button.textContent = "Assistant is busy — try again in a moment";
+        return;
+    }
+    fixRequested.add(s.id);
+    renderIncident(s);
+    chatSend(s.fix.message);
+}
+
+function renderIncident(s) {
+    if (dismissedIncidents.has(s.id)) return;
+    let line = incidentLines.get(s.id);
+    const isNew = !line;
+    if (isNew) {
+        line = textEl("div", "msg agent");
+        incidentLines.set(s.id, line);
+        chatEl.appendChild(line);
+        // Only alert for something that just happened, not when a reload replays it.
+        if (s.status === "open" && Date.now() / 1000 - s.detected_at < 60) notifyIncident(s);
+    }
+    const bubble = textEl("div", `bubble incident ${s.status}`);
+    const head = textEl("div", "incident-head");
+    head.appendChild(textEl("span", "", s.status === "resolved" ? "✅" : s.status === "dismissed" ? "ℹ️" : "⚠️"));
+    head.appendChild(textEl("span", "", `Monitor: ${s.node} ${INCIDENT_KINDS[s.kind] || ""}`));
+    head.appendChild(textEl("span", "incident-pill", incidentPill(s)));
+    bubble.appendChild(head);
+    bubble.appendChild(textEl("div", "incident-summary", s.summary || ""));
+
+    const r = s.report;
+    if (r) {
+        bubble.appendChild(incidentSection(`Root cause · ${r.category} · ${r.confidence} confidence`, r.root_cause));
+        bubble.appendChild(incidentSection("What's needed to fix it", r.suggested_fix));
+        if (s.checks && s.checks.length) {
+            bubble.appendChild(incidentSection("Checks", s.checks.map(c => `⚠ ${c}`).join("\n"), "incident-checks"));
+        }
+    } else if (s.error) {
+        bubble.appendChild(incidentSection("Investigation failed", s.error));
+    } else if (s.status === "open") {
+        const steps = textEl("div", "incident-steps");
+        const recent = (s.steps || []).slice(-4);
+        steps.textContent = [...recent.map(t => `• ${t}`),
+                             s.stage === "detected" ? "Watching what Docker does next…" : "Claude is investigating…"].join("\n");
+        bubble.appendChild(steps);
+    }
+    if (s.status !== "open" && s.closed_reason) bubble.appendChild(textEl("div", "incident-closed", s.closed_reason));
+
+    if (s.status === "open") {
+        const actions = textEl("div", "incident-actions");
+        if (s.fix) {
+            const fix = textEl("button", "", fixRequested.has(s.id) ? "Fix requested — see below" : s.fix.label);
+            fix.disabled = fixRequested.has(s.id);
+            fix.addEventListener("click", () => requestIncidentFix(s, fix));
+            actions.appendChild(fix);
+        }
+        const dismiss = textEl("button", "secondary", "Dismiss");
+        dismiss.addEventListener("click", () => {
+            dismissedIncidents.add(s.id);
+            try { sessionStorage.setItem(DISMISSED_KEY, JSON.stringify([...dismissedIncidents])); } catch { /* per-tab only */ }
+            line.remove();
+            incidentLines.delete(s.id);
+        });
+        actions.appendChild(dismiss);
+        bubble.appendChild(actions);
+    }
+    line.replaceChildren(bubble);
+    if (isNew || s.stage === "diagnosed") chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+// EventSource reconnects on its own and resumes from the last event id it saw.
+const incidentFeed = new EventSource(`${CHAT_BASE}/msight/incidents/stream`);
+incidentFeed.addEventListener("incident", (e) => {
+    try { renderIncident(JSON.parse(e.data)); } catch { /* malformed event -- skip */ }
 });
 
 // ── MSight recording status polling (independent of the chat/LLM loop) ─────

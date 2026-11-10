@@ -41,6 +41,7 @@ DESTRUCTIVE_INTENT: dict[str, tuple[str, str]] = {
     "stop_msight_pipeline": (_STOP + r"|restart|replace|instead|switch|clean\s*up", r"stop|shut|replace"),
     "remove_msight_node": (r"remove|delete|drop|get\s*rid\s*of|clean\s*up|take\s*(it\s*)?(out|down)|"
                            r"tear\s*down|kill|stop", r"remove|delete|stop"),
+    "restart_msight_node": (r"restart|re-?start|relaunch|reboot|bring\s*(it\s*)?back|fix", r"restart"),
     "stop_msight_recording": (_STOP, r"stop"),
     "stop_msight_archiving": (_STOP, r"stop"),
     # Also the designed way to leave a workflow ("that's all", "I'm finished"): it clears
@@ -57,7 +58,7 @@ _AFFIRMATIVE_RE = re.compile(r"^\s*(yes|yeah|yep|sure|ok|okay|go\s*ahead|do\s*it
 
 
 def _target(fn_name: str, fn_args: dict) -> str:
-    return fn_args.get("name", "") if fn_name == "remove_msight_node" else ""
+    return fn_args.get("name", "") if fn_name in ("remove_msight_node", "restart_msight_node") else ""
 
 
 def destructive_allowed(fn_name: str, fn_args: dict, user_message: str, last_reply: str) -> bool:
@@ -79,6 +80,7 @@ def confirmation_question(fn_name: str, fn_args: dict) -> str:
     return {
         "stop_msight_pipeline": "Should I stop the pipeline?",
         "remove_msight_node": f"Should I remove {_target(fn_name, fn_args) or 'that node'}?",
+        "restart_msight_node": f"Should I restart {_target(fn_name, fn_args) or 'that node'}?",
         "stop_msight_recording": "Should I stop the recording?",
         "stop_msight_archiving": "Should I stop archiving?",
         "reset_workflow_state": "Should I reset the session and discard all progress?",

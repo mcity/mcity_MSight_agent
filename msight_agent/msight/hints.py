@@ -1,13 +1,18 @@
 """MSight's part of the per-turn SESSION_STATE hint: the checklist, live liveness
-(the persisted *_active flags drift when things change outside the chat), and any
-structural pipeline problems."""
+(the persisted *_active flags drift when things change outside the chat), any
+structural pipeline problems, and incidents the background monitor has open."""
+import asyncio
 import logging
+
+import redis
 
 from msight_agent.agent.prompts import STATE_HINTS
 from msight_agent.agent.state import WorkflowState
 from msight_agent.msight.runtime.calibration import calibration_label
 from msight_agent.msight.runtime.control_plane import get_control_plane
+from msight_agent.msight.runtime.incidents import recent_incidents
 from msight_agent.msight.runtime.paths import get_msight_path
+from msight_agent.msight.runtime.utils import redis_kwargs
 from msight_agent.msight.tools.pipeline import FIXED_PIPELINE_NODES
 from msight_agent.msight.tools.record_archive import DUMPER_NODE, PUSHER_NODE
 
@@ -50,6 +55,20 @@ async def _msight_problems_hint() -> str:
     )
 
 
+async def _open_incidents_hint() -> str:
+    """Incidents the background monitor found (already shown to the user in the chat)."""
+    try:
+        states = await asyncio.to_thread(recent_incidents, redis.Redis(**redis_kwargs(), socket_timeout=2))
+    except Exception:
+        return ""
+    if not states:
+        return ""
+    items = "; ".join(f"{s['id']} ({s.get('node')}: {s.get('kind')}, "
+                      f"{'diagnosed' if s.get('report') else s['stage']})" for s in states[:3])
+    return (" | OPEN_INCIDENTS (found by the background monitor and already shown to the user): " + items
+            + " -- call get_recent_incidents before answering about them or fixing them.")
+
+
 def _extra_nodes_hint(live: dict) -> str:
     """Nodes that outlive a pipeline stop, so the agent can remind the user about them."""
     if not live["extra_nodes"]:
@@ -71,7 +90,7 @@ async def msight_hint(state: WorkflowState) -> str:
     if mp is None:
         hint = (f"msight_checklist(mode=not set, source=not set, {calibration_label(prefixed=True)}, "
                 "recording=not active, archiving=not active)")
-        return hint + _extra_nodes_hint(live)
+        return hint + _extra_nodes_hint(live) + await _open_incidents_hint()
 
     parts = [f"mode={mp.mode or 'not set'}", f"source={_source_label(mp) or 'not set'}",
              calibration_label(prefixed=True)]
@@ -99,4 +118,4 @@ async def msight_hint(state: WorkflowState) -> str:
         hint += " | " + STATE_HINTS["msight_run_awaiting_confirm"]
     elif live["pipeline"]:
         hint += " | " + STATE_HINTS["msight_pipeline_running"].format(source=_source_label(mp))
-    return hint + _extra_nodes_hint(live) + await _msight_problems_hint()
+    return hint + _extra_nodes_hint(live) + await _msight_problems_hint() + await _open_incidents_hint()

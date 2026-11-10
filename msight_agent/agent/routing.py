@@ -28,6 +28,8 @@ TOOL_STATUS_MESSAGES: dict[str, str] = {
     "launch_voxel51_session":                "Launching Voxel51 visualization...",
     "diagnose_msight_pipeline":              "Diagnosing pipeline — sampling live data flow (~5-10s)...",
     "inspect_host":                          "Inspecting the host...",
+    "get_recent_incidents":                  "Reading the monitor's incident report...",
+    "restart_msight_node":                   "Restarting the node with its normal settings...",
 }
 
 # Strip ANSI escape codes and bare CR from subprocess output.
@@ -37,7 +39,7 @@ ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]|\r')
 # and counts as real progress when the iteration budget runs out.
 WRITE_TOOLS: frozenset[str] = frozenset({
     "start_msight_pipeline", "stop_msight_pipeline",
-    "add_msight_node", "remove_msight_node",
+    "add_msight_node", "remove_msight_node", "restart_msight_node",
     "start_msight_recording", "stop_msight_recording",
     "start_msight_archiving", "stop_msight_archiving",
 })

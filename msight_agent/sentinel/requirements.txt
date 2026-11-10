@@ -1,0 +1,5 @@
+# Sentinel only, in its own venv (.venv-sentinel): claude-agent-sdk needs mcp>=1.23,
+# which conflicts with the fastmcp pin in the main requirements.txt.
+claude-agent-sdk==0.2.174
+python-dotenv
+redis
