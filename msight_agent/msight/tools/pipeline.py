@@ -13,13 +13,16 @@ from fastmcp import Context
 
 from msight_agent.shared.host_utils import resolve_host
 from msight_agent.shared.mcp import error_json, mcp, ok_json
+from msight_agent.msight.runtime import started_source
 from msight_agent.msight.runtime.calibration import calibration_mismatch
 from msight_agent.msight.runtime.control_plane import get_control_plane
 from msight_agent.msight.runtime.diagnosis import sample_topic_rates
 from msight_agent.msight.runtime.executors import has_gpu
 from msight_agent.msight.runtime.paths import get_msight_path
 from msight_agent.msight.runtime.utils import topic_list
-from msight_agent.msight.tools.record_archive import AGGREGATOR_NODE, ANNOTATOR_NODE, DUMPER_NODE, PUSHER_NODE
+from msight_agent.msight.tools.record_archive import (
+    AGGREGATOR_NODE, ANNOTATOR_NODE, DEFAULT_SENSOR_NAME, DUMPER_NODE, PUSHER_NODE,
+)
 
 VIEWER_PORT = 9010
 FIXED_PIPELINE_NODES = ("video_source", "rfdetr_detector", "detection_viewer")
@@ -38,7 +41,10 @@ def describe_by_role(names: list[str]) -> str:
     """'standard pipeline: a, b; added: c' -- so "the extra nodes" can't be mistaken for pipeline ones."""
     groups = {role: [n for n in names if node_role(n) == role] for role in ROLE_LABELS}
     return "; ".join(f"{ROLE_LABELS[role]}: {', '.join(ns)}" for role, ns in groups.items() if ns)
+
+
 _BUILD_TIMEOUT = 600  # image build takes ~206s locally
+_RESTART_READY_SECONDS = 90  # RF-DETR loads its model before it publishes (~7s on GPU, longer on CPU)
 _MAX_LOG_CHARS = 8000
 
 _DOUBLED_ENV_RE = re.compile(r'^\s*([A-Za-z_]\w*)\s*=\s*\1\s*=', re.MULTILINE)
@@ -182,7 +188,7 @@ async def start_msight_pipeline(
     if build and (build_err := await _compose_build(msight_path, ctx)):
         return error_json(build_err)
 
-    sensor = sensor_name or "gs_mcity_1"
+    sensor = sensor_name or DEFAULT_SENSOR_NAME
     try:
         await get_control_plane().recompose(
             _fixed_pipeline(*_resolve_video_source(video_input, rtsp_url, sensor), sensor),
@@ -190,7 +196,17 @@ async def start_msight_pipeline(
         )
     except Exception as e:
         return error_json(_friendly_error(str(e)) or f"Failed to start MSight_Vision pipeline: {e}")
+    started_source.save(video_input, rtsp_url, sensor)
     return ok_json("MSight_Vision pipeline started.", viewer_url=_viewer_url())
+
+
+def _started_source(msight_path: Path) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """(video_input, rtsp_url, sensor) the pipeline was last started with, else from .env."""
+    saved = started_source.load()
+    if saved.get("video_input") or saved.get("rtsp_url"):
+        return saved.get("video_input"), saved.get("rtsp_url"), saved.get("sensor")
+    env = dotenv_values(msight_path / ".env")
+    return env.get("VIDEO_INPUT") or None, env.get("RTSP_URL") or None, None
 
 
 def _running_sensor() -> str:
@@ -199,27 +215,29 @@ def _running_sensor() -> str:
         topic = node.get("publish_topic")
         if node["name"] == "video_source" and isinstance(topic, str) and topic.startswith("camera/"):
             return topic.removeprefix("camera/")
-    return "gs_mcity_1"
+    return DEFAULT_SENSOR_NAME
 
 
 @mcp.tool()
 async def restart_msight_node(name: str, ctx: Context = None) -> str:
     """Recreate one standard pipeline node with its normal settings, leaving the rest running.
     A fresh node also drops anything done to the old one by hand (paused, memory cap)."""
+    if name in (ANNOTATOR_NODE, AGGREGATOR_NODE, DUMPER_NODE):
+        return error_json(f"'{name}' is part of the recording, not the pipeline: call start_msight_recording, "
+                          "which brings back whichever recording nodes are missing with their normal settings.")
     msight_path, err = get_msight_path()
     if err:
         return error_json(err)
     if name not in FIXED_PIPELINE_NODES:
         return error_json(f"'{name}' isn't a standard pipeline node, so its settings aren't known here: "
                           "remove it and add it again with add_msight_node.")
-    env = dotenv_values(msight_path / ".env")
-    video_input, rtsp_url = env.get("VIDEO_INPUT") or None, env.get("RTSP_URL") or None
+    video_input, rtsp_url, started_sensor = _started_source(msight_path)
     if not video_input and not rtsp_url:
-        return error_json("MSight_Vision's .env sets neither VIDEO_INPUT nor RTSP_URL, so the node's settings "
-                          "aren't known; start the pipeline instead.")
+        return error_json("The pipeline's video source isn't known (never started here, and MSight_Vision's .env "
+                          "sets neither VIDEO_INPUT nor RTSP_URL); start the pipeline instead.")
     cp = get_control_plane()
     try:
-        sensor = _running_sensor()
+        sensor = started_sensor or _running_sensor()
         spec = next(d for d in _fixed_pipeline(*_resolve_video_source(video_input, rtsp_url, sensor), sensor)
                     if d["name"] == name)
         await cp.delete_node(name)
@@ -232,9 +250,6 @@ async def restart_msight_node(name: str, ctx: Context = None) -> str:
                        f"{_RESTART_READY_SECONDS}s. Check its logs before telling the user it's fixed.")
     return ok_json(f"Restarted '{name}' with its normal settings; it was working again after {ready_after:.0f}s and "
                    "the rest of the pipeline kept running. Call diagnose_msight_pipeline to confirm.")
-
-
-_RESTART_READY_SECONDS = 90  # RF-DETR loads its model before it publishes (~7s on GPU, longer on CPU)
 
 
 async def _wait_until_working(name: str, publish_topics: list[str], ctx: Optional[Context]) -> Optional[float]:
@@ -278,6 +293,10 @@ async def stop_msight_pipeline() -> str:
 
 @mcp.tool()
 async def get_msight_status() -> str:
+    """Which pipeline containers are up (running/exited/...), the viewer URL, `problems`
+    such as dead nodes or inputs with no publisher, the CPU/GPU each node got, and recent
+    node changes. It says which processes run, not whether data flows: use
+    diagnose_msight_pipeline for that."""
     if err := get_msight_path()[1]:
         return error_json(err)
     cp = get_control_plane()
@@ -323,6 +342,10 @@ async def get_msight_status() -> str:
 
 @mcp.tool()
 async def diagnose_msight_pipeline() -> str:
+    """Why the pipeline isn't working: measures live data flow on every topic (~5-10s) and
+    walks the node graph. Returns ranked `root_causes` (upstream first, each with evidence
+    and a suggested fix), `affected` nodes that only fail as a consequence, a one-line
+    `summary` and a healthy/degraded `verdict`. Use it before reading logs."""
     if err := get_msight_path()[1]:
         return error_json(err)
     try:
@@ -342,6 +365,8 @@ def _seconds_since_last_log_line(text: str) -> Optional[int]:
 
 @mcp.tool()
 async def get_msight_logs(service: Optional[str] = None, tail: int = 200) -> str:
+    """Recent logs of one pipeline node (`service`, e.g. "rfdetr_detector") or of all of
+    them, last `tail` lines (at most 2000)."""
     if err := get_msight_path()[1]:
         return error_json(err)
     tail = max(1, min(tail, 2000))

@@ -615,8 +615,10 @@ tools = [
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "incident_id": {"type": "string", "description": "Optional: one incident, e.g. INC-20261027-153306-rfdetr_detector."},
-                        "include_resolved": {"type": "boolean", "description": "Also list resolved/dismissed incidents (default false)."}
+                        "incident_id": {"type": "string",
+                                        "description": "Optional: one incident, e.g. INC-20261027-153306-rfdetr_detector."},
+                        "include_resolved": {"type": "boolean",
+                                             "description": "Also list resolved/dismissed incidents (default false)."}
                     }
                 }
             }

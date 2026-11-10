@@ -10,7 +10,10 @@ Each signal becomes an Incident on a queue:
                   hung), against a threshold learned per node
   /diagnose       faults the others can't see: a node that heartbeats but publishes
                   nothing (two bad sweeps in a row); also notices recovery
-  ports           the agent's own services (mcp_server, msight_api)
+  ports           the agent's own services (mcp_server, msight_api, chat_server)
+  Redis           the message broker; node deaths during its outage are its symptoms
+  camera picture  black, covered, defocused, frozen or moved (camera_watch.py)
+  frame rates     a camera delivering far fewer frames, or a detector falling behind
 
 Every stage is published to the live feed (msight/runtime/incidents.py) for the chat.
 """
@@ -26,9 +29,19 @@ from typing import Callable, Optional
 
 import redis
 
-from msight_agent.msight.runtime.incidents import recent_incidents
+from msight_agent.msight.runtime import started_source
+from msight_agent.msight.runtime.incidents import (
+    SENTINEL_HEARTBEAT_KEY, SENTINEL_HEARTBEAT_TTL, SENTINEL_SEEN_KEY, recent_incidents,
+)
+from msight_agent.msight.runtime.utils import topic_list
 from msight_agent.sentinel.incident_log import append_event
-from msight_agent.shared.paths import NODE_LOG_DIR
+from msight_agent.shared.paths import LOG_DIR, NODE_LOG_DIR
+
+try:  # numpy, pillow, msgpack: without them the camera picture and frame-rate checks are off
+    from msight_agent.sentinel import camera_watch as cw
+    _CAMERA_CHECKS_OFF = ""
+except ImportError as e:
+    cw, _CAMERA_CHECKS_OFF = None, str(e)
 
 CONTAINER_PREFIX = "msight-"
 NODES_REDIS_KEY = "MSIGHT:NODES"  # the msight_core node registry (see msight/runtime/control_plane.py)
@@ -36,13 +49,20 @@ SETTLE_SECONDS = 12      # Docker's on-failure restarts of a node come ~7s apart
 ANNOUNCE_GRACE_SECONDS = 2   # a deliberate stop removes the container well within this
 HEARTBEAT_STALE_SECONDS = 5  # msight_core nodes refresh their registry heartbeat ~1/s
 OPEN_SWEEP_SECONDS = 10  # health sweep while an incident is open, to notice recovery quickly
-COOLDOWN_SECONDS = 600   # a node just reported isn't reported again by the sweep
-SERVICES = {"mcp_server": 8000, "msight_api": 8003}
+SLOW_NODE_QUIET_SECONDS = 300  # a node found working slowly isn't re-checked as frozen for this long
+REPORT_DEDUPE_SECONDS = 30  # two detection paths seeing the same fault at nearly the same time
+SERVICES = {"mcp_server": 8000, "msight_api": 8003, "chat_server": 8001}
+REDIS_OUTAGE_SPAN_SECONDS = 60  # node deaths this soon after a Redis outage are its symptoms
 LOG_TAIL_LINES = 40
+CAMERA_REFERENCE_DIR = LOG_DIR / "camera_reference"  # learned normal view per camera topic
+CAMERA_KINDS_PREFIX = "CAMERA_"  # closed by the camera checks, not by the data-flow sweep
 _OPENING_ACTIONS = {"oom", "kill", "die"}  # start/create/update alone are normal lifecycle
 _SIGNALS = {"9": "SIGKILL", "15": "SIGTERM", "2": "SIGINT", "1": "SIGHUP"}
 
 Say = Callable[[str], None]
+
+
+_ISSUED_IDS: set[str] = set()
 
 
 @dataclass
@@ -55,9 +75,19 @@ class Incident:
     timeline: list[str] = field(default_factory=list)
     evidence: dict = field(default_factory=dict)
 
+    def __post_init__(self):
+        # Detection second + node, made unique: one camera can start two conditions at once.
+        base = f"INC-{time.strftime('%Y%m%d-%H%M%S', time.localtime(self.detected_at))}-{self.node}"
+        candidate, n = base, 1
+        while candidate in _ISSUED_IDS:
+            n += 1
+            candidate = f"{base}-{n}"
+        _ISSUED_IDS.add(candidate)
+        self._id = candidate
+
     @property
     def id(self) -> str:
-        return f"INC-{time.strftime('%Y%m%d-%H%M%S', time.localtime(self.detected_at))}-{self.node}"
+        return self._id
 
     def to_dict(self) -> dict:
         return {"id": self.id, **asdict(self)}
@@ -201,6 +231,21 @@ def degraded_key(diagnosis: dict) -> Optional[frozenset]:
                      for c in diagnosis.get("root_causes") or [])
 
 
+def _still_flowing(diagnosis: dict, node: str) -> Optional[float]:
+    """The node's message rate if the diagnosis saw it healthy and moving data, else None."""
+    for entry in diagnosis.get("nodes") or []:
+        if entry.get("name") == node and entry.get("health") == "OK":
+            rate = max(entry.get("out_rate_hz") or 0, entry.get("in_rate_hz") or 0)
+            return rate if rate > 0 else None
+    return None
+
+
+def _starved_by(diagnosis: dict, node: str) -> list[str]:
+    """The nodes the diagnosis says leave `node` without input, if it is only starved."""
+    return sorted({a.get("caused_by") for a in diagnosis.get("affected") or []
+                   if a.get("node") == node and a.get("health") == "STARVED"} - {None, node})
+
+
 def compact_diagnosis(diagnosis: dict) -> dict:
     keep = ("name", "health", "alive", "in_rate_hz", "out_rate_hz", "seconds_since_heartbeat")
     return {
@@ -250,6 +295,7 @@ class HeartbeatWatch:
             if previous is not None and 0 < hb - previous < 600:
                 self._gaps.setdefault(name, deque(maxlen=20)).append(hb - previous)
             self._last[name] = hb
+
         def limit(name: str) -> float:
             # Until its heartbeat first advances, a (re)started node may still be loading.
             proven = name in self._ok_since
@@ -258,10 +304,8 @@ class HeartbeatWatch:
         was_stale = self._stale
         self._stale = {name for name, info in nodes.items() if isinstance(info.get("heartbeat"), (int, float))
                        and now - info["heartbeat"] > limit(name)}
-        # A node that (re)registers or comes back from stale gets a fresh heartbeat before
-        # it does any work (a restarted detector still has to load its model), so it only
-        # counts as working once its heartbeat advances -- every 10 messages it processes.
-        # A running node that merely goes stale keeps its status (and normal threshold).
+        # A (re)started node heart-beats before it works (a detector still loads its model):
+        # it counts as working once that heartbeat advances. Going stale doesn't reset it.
         for name in set(self._first_hb) - set(nodes):
             self._first_hb.pop(name, None)
             self._ok_since.pop(name, None)
@@ -302,13 +346,6 @@ class HeartbeatWatch:
         return node in self._stale
 
 
-def _topics(value) -> list[str]:
-    """msight_core registers topics as a string, a list, or null."""
-    if not value:
-        return []
-    return [value] if isinstance(value, str) else [t for t in value if t]
-
-
 def nodes_from_registry(rows: dict) -> dict[str, dict]:
     """{node: {"heartbeat", "publish", "subscribe"}} from an HGETALL of the node registry."""
     out = {}
@@ -319,8 +356,8 @@ def nodes_from_registry(rows: dict) -> dict[str, dict]:
         except (TypeError, ValueError):
             info = {}
         info = info if isinstance(info, dict) else {}
-        out[name] = {"heartbeat": info.get("last_heartbeat"), "publish": _topics(info.get("publish_topic")),
-                     "subscribe": _topics(info.get("subscribe_topic"))}
+        out[name] = {"heartbeat": info.get("last_heartbeat"), "publish": topic_list(info.get("publish_topic")),
+                     "subscribe": topic_list(info.get("subscribe_topic"))}
     return out
 
 
@@ -376,6 +413,21 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def sd_notify(message: str) -> None:
+    """systemd's notify protocol (Type=notify, WatchdogSec=): no-op outside systemd."""
+    address = os.environ.get("NOTIFY_SOCKET")
+    if not address:
+        return
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.connect(address)
+            sock.sendall(message.encode())
+    except OSError:
+        pass
+
+
 def _container_condition(state: Optional[dict]) -> str:
     if state is None:
         return "it has no container (host process or removed)"
@@ -408,9 +460,20 @@ class Watcher:
         self._dead_pids: set[tuple[str, int]] = set()
         self._down_counts = {s: 0 for s in SERVICES}
         self._down_reported: set[str] = set()
+        self._empty_sweeps = 0
+        self._redis_failures = 0
+        self._redis_incident: Optional[Incident] = None
+        self._redis_outage_ended = 0.0
         self._pending_key: Optional[frozenset] = None
         self._pending_count = 0
         self._reported_key: Optional[frozenset] = None
+        self._tasks: set[asyncio.Task] = set()
+        self._slow_until: dict[str, float] = {}       # node -> until when its quiet heartbeat is known slowness
+        # Camera checks: learned per topic, kept here so a restarted check doesn't lose them.
+        self._camera_health: dict = {}                # camera topic -> cw.CameraHealth
+        self._camera_alerts: dict[tuple[str, str], Incident] = {}   # (topic, condition) -> open incident
+        self._rate_baselines: dict = {}               # topic -> cw.RateBaseline
+        self._rate_alerts: dict[str, Incident] = {}   # topic -> open frame-rate incident
 
     def close_orphans(self) -> None:
         """Incidents left open by a previous sentinel run would stay open in the chat
@@ -429,8 +492,33 @@ class Watcher:
 
     async def run(self) -> None:
         self.close_orphans()
-        await asyncio.gather(self._docker_events(), self._settle_loop(), self._pidfile_loop(),
-                             self._heartbeat_loop(), self._sweep_loop())
+        loops = {"docker events": self._docker_events, "settle": self._settle_loop, "pidfile": self._pidfile_loop,
+                 "heartbeat": self._heartbeat_loop, "sweep": self._sweep_loop, "camera": self._camera_loop,
+                 "frame rate": self._rate_loop, "alive": self._alive_loop}
+        await asyncio.gather(*(self._supervised(name, loop) for name, loop in loops.items()))
+
+    async def _supervised(self, name: str, loop: Callable) -> None:
+        """One check failing (a Redis error mid-sample, a bug) must not stop the whole monitor."""
+        while True:
+            try:
+                return await loop()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                self.say(f"[watch] the {name} check failed ({type(e).__name__}: {e}); restarting it in 5s")
+                await asyncio.sleep(5)
+
+    def _spawn(self, coro) -> None:
+        """A background task that is kept referenced (the loop holds tasks weakly) and whose
+        failure is reported instead of lost."""
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+
+        def done(t: asyncio.Task) -> None:
+            self._tasks.discard(t)
+            if not t.cancelled() and t.exception():
+                self.say(f"[watch] background check failed: {type(t.exception()).__name__}: {t.exception()}")
+        task.add_done_callback(done)
 
     # incident lifecycle -----------------------------------------------------------------
 
@@ -459,7 +547,12 @@ class Watcher:
         self.say(f"[{stage}] {incident.id}: {text}")
 
     def _recently_reported(self, node: str) -> bool:
-        return time.time() - self._reported_at.get(node, 0) < COOLDOWN_SECONDS
+        """Already covered: an open incident on this node, or one reported moments ago by
+        another path. Not a long cooldown -- a new fault on a node that just recovered
+        (frozen right after being restarted) must still be reported."""
+        if any(i.node == node for i in self.open.values()):
+            return True
+        return time.time() - self._reported_at.get(node, 0) < REPORT_DEDUPE_SECONDS
 
     # docker events --------------------------------------------------------------------
 
@@ -468,16 +561,21 @@ class Watcher:
             proc = await asyncio.create_subprocess_exec(
                 "docker", "events", "--filter", "type=container", "--format", "{{json .}}",
                 *self.replay.since_args(), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-            async for raw in proc.stdout:
-                parsed = parse_docker_event(raw.decode(errors="replace"))
-                if parsed is None or not self.replay.is_new(parsed[1]):
-                    continue
-                name, event = parsed
-                self.grouper.add(name, event)
-                if event["action"] == "destroy" and name in self._announced:
-                    self._close(self._announced.pop(name), "dismissed",
-                                "The container was removed on purpose (pipeline stop or node removal).")
-            await proc.wait()
+            try:
+                async for raw in proc.stdout:
+                    parsed = parse_docker_event(raw.decode(errors="replace"))
+                    if parsed is None or not self.replay.is_new(parsed[1]):
+                        continue
+                    name, event = parsed
+                    self.grouper.add(name, event)
+                    if event["action"] == "destroy" and name in self._announced:
+                        self._close(self._announced.pop(name), "dismissed",
+                                    "The container was removed on purpose (pipeline stop or node removal).")
+            finally:
+                # On shutdown, end the subprocess while the event loop still exists.
+                if proc.returncode is None:
+                    proc.kill()
+                    await proc.wait()
             self.say("[watch] docker events stream ended; reconnecting in 5s")
             await asyncio.sleep(5)
 
@@ -489,6 +587,8 @@ class Watcher:
     async def _settle_once(self, now: float) -> None:
         """Announce deaths past the grace period; classify groups that went quiet."""
         for name, events in self.grouper.announceable(now):
+            if self._redis_failures:
+                break  # hold: if Redis is down, these deaths are its symptoms (decided at settle)
             if name not in self._announced:
                 node = name.removeprefix(CONTAINER_PREFIX)
                 kind, what = describe_failure(events, {})
@@ -505,6 +605,13 @@ class Watcher:
                     self._close(incident, "dismissed", "The container was removed on purpose.")
                 continue
             kind, summary = classify_container(name, events, state)
+            if cause := self._redis_outage(now):
+                if incident:
+                    self._close(incident, "dismissed", f"A symptom of {cause}: {summary}")
+                if self._redis_incident:
+                    self._redis_incident.timeline.append(f"{clock(events[0]['at'])} also: {summary}")
+                self.say(f"[watch] {name}: folded into {cause}")
+                continue
             _, logs = await _run("docker", "logs", "--tail", str(LOG_TAIL_LINES), name)
             incident = incident or Incident(kind=kind, node=name.removeprefix(CONTAINER_PREFIX),
                                             summary=summary, first_event_at=events[0]["at"])
@@ -544,13 +651,48 @@ class Watcher:
             await asyncio.sleep(1)
             try:
                 nodes = nodes_from_registry(await asyncio.to_thread(self._redis.hgetall, NODES_REDIS_KEY))
-            except redis.RedisError:
+            except redis.RedisError as e:
+                self._redis_unreachable(e)
                 continue
+            self._redis_reachable()
             for node in self.heartbeats.update(nodes, time.time()):
-                # A death is already being handled from Docker's events.
-                if self.grouper.is_open(CONTAINER_PREFIX + node) or self._recently_reported(node):
+                # A death is already handled from Docker's events, and a node just found
+                # working slowly would only be dismissed again.
+                if (self.grouper.is_open(CONTAINER_PREFIX + node) or self._recently_reported(node)
+                        or self._slow_until.get(node, 0) > time.time()):
                     continue
-                asyncio.create_task(self._unresponsive(node, nodes[node]["heartbeat"]))
+                self._spawn(self._unresponsive(node, nodes[node]["heartbeat"]))
+
+    # Redis, the message broker everything (pipeline data and this feed) goes through ---------
+
+    def _redis_unreachable(self, error: Exception) -> None:
+        self._redis_failures += 1
+        if self._redis_failures != 2 or self._redis_incident is not None:
+            return
+        settings = self._redis.connection_pool.connection_kwargs
+        now = time.time()
+        self._redis_incident = Incident(
+            kind="SERVICE_DOWN", node="redis", first_event_at=now - 2,
+            summary=(f"The Redis message broker at {settings.get('host')}:{settings.get('port')} is unreachable. "
+                     "Every node's data and the node registry go through it, so the whole pipeline is affected."),
+            timeline=[f"{clock(now - 2)} first failed read", f"{clock(now)} still unreachable: {error}"],
+            evidence={"error": str(error), "host": settings.get("host"), "port": settings.get("port")})
+        self._emit(self._redis_incident)
+
+    def _redis_reachable(self) -> None:
+        self._redis_failures = 0
+        if self._redis_incident is not None:
+            self._close(self._redis_incident, "resolved", "Redis is reachable again.")
+            self._redis_incident = None
+            self._redis_outage_ended = time.time()
+
+    def _redis_outage(self, now: float) -> Optional[str]:
+        """While Redis is down (or just back), node deaths are its symptoms, not new faults."""
+        if self._redis_failures:
+            return self._redis_incident.id if self._redis_incident else "a Redis outage"
+        if now - self._redis_outage_ended < REDIS_OUTAGE_SPAN_SECONDS:
+            return "the Redis outage that just ended"
+        return None
 
     async def _unresponsive(self, node: str, last_heartbeat: float) -> None:
         now = time.time()
@@ -564,22 +706,52 @@ class Watcher:
             diagnosis = await asyncio.to_thread(self._get_json, "/diagnose", 60)
         except Exception as e:  # noqa: BLE001 -- still worth investigating without it
             diagnosis = {"error": str(e)}
-        if not self.heartbeats.is_stale(node) and degraded_key(diagnosis) is None:
+        # A paused container can't have recovered or be working, whatever one sample showed.
+        paused = bool((state or {}).get("Paused"))
+        if not paused and not self.heartbeats.is_stale(node) and degraded_key(diagnosis) is None:
             self._close(incident, "dismissed", f"'{node}' started responding again on its own.")
             return
+        if not paused and (rate := _still_flowing(diagnosis, node)):
+            # A slowed stream makes a working node's heartbeat look stale.
+            self._close(incident, "dismissed", f"'{node}' is still processing data, only slowly ({rate}/s); "
+                                               "a frame-rate drop is reported separately.")
+            self._slow_until[node] = time.time() + SLOW_NODE_QUIET_SECONDS
+            self._reported_at.pop(node, None)   # not an incident: the frame-rate check must still look at it
+            return
         self._reported_key = degraded_key(diagnosis) or self._reported_key
+        if causes := _starved_by(diagnosis, node):
+            self._reattribute(incident, causes, diagnosis, last_heartbeat)
+            return
         incident.summary = (f"Node '{node}' stopped responding (no heartbeat since {clock(last_heartbeat)}), "
                             f"and {_container_condition(state)}.")
         incident.evidence = {"heartbeat_age_s": round(time.time() - last_heartbeat, 1), "container_state": state,
                              "diagnosis": compact_diagnosis(diagnosis) if "error" not in diagnosis else diagnosis}
         self._emit(incident)
 
+    def _reattribute(self, incident: Incident, causes: list[str], diagnosis: dict, last_heartbeat: float) -> None:
+        """A quiet node that is only starved isn't frozen: report the node starving it, the
+        one a fix has to touch (a source whose stream stalled still heart-beats)."""
+        node, culprit = incident.node, "+".join(causes)
+        if any(self._recently_reported(c) or self.grouper.is_open(CONTAINER_PREFIX + c) for c in causes):
+            self._close(incident, "dismissed", f"'{node}' is only waiting for input from {culprit}, "
+                                               "which is already being handled.")
+            return
+        self._close(incident, "dismissed", f"'{node}' isn't frozen: it gets no input because of {culprit}. "
+                                           f"Reported as a problem with {culprit} instead.")
+        now = time.time()
+        self._emit(Incident(
+            kind="PIPELINE_DEGRADED", node=culprit, first_event_at=last_heartbeat,
+            summary=f"Pipeline degraded: {diagnosis.get('summary')}",
+            timeline=[f"{clock(last_heartbeat)} '{node}' last heartbeat", f"{clock(now)} {culprit} found to be the cause"],
+            evidence={"diagnosis": compact_diagnosis(diagnosis)}))
+
     # services + pipeline sweep ----------------------------------------------------------
 
     async def _sweep_loop(self) -> None:
         while True:
             self._check_services()
-            if "msight_api" not in self._down_reported and self._down_counts["msight_api"] == 0:
+            if (not self._redis_failures and "msight_api" not in self._down_reported
+                    and self._down_counts["msight_api"] == 0):
                 await self._check_pipeline()
             # Sweep faster while something is open, so recovery shows up quickly.
             await asyncio.sleep(OPEN_SWEEP_SECONDS if self.open else self.sweep_seconds)
@@ -607,10 +779,17 @@ class Watcher:
         (Docker may be mid-restart), nor service outages (closed by port). A stopped
         pipeline isn't a fixed one: those incidents are dismissed, not resolved."""
         if diagnosis.get("verdict") == "empty":
+            self._empty_sweeps += 1
+            if self._empty_sweeps < 2:
+                return  # a restart passes through "no nodes" briefly; a real stop persists
             stage, text = "dismissed", "The pipeline was stopped, so this was closed without being fixed."
         else:
+            self._empty_sweeps = 0
             stage, text = "resolved", "The pipeline is healthy again: every node is running and data is flowing."
         for incident in list(self.open.values()):
+            # Data flowing doesn't mean the picture is right: camera incidents close on their own checks.
+            if stage == "resolved" and incident.kind.startswith(CAMERA_KINDS_PREFIX):
+                continue
             if (incident.kind != "SERVICE_DOWN" and incident.id in self._classified
                     and not self.grouper.is_open(CONTAINER_PREFIX + incident.node)):
                 self._close(incident, stage, text)
@@ -636,8 +815,11 @@ class Watcher:
             return
         self._reported_key = key
         nodes = sorted({node for _, node in key})
-        # A container/process/heartbeat incident for the same node already covers it.
-        if all(self.grouper.is_open(CONTAINER_PREFIX + n) or self._recently_reported(n) for n in nodes):
+        # Covered if any node already has an open incident: one fault often shows up as
+        # several root causes (a dead detector also leaves the viewer with no publisher).
+        open_nodes = {i.node for i in self.open.values()}
+        if any(n in open_nodes or self.grouper.is_open(CONTAINER_PREFIX + n) for n in nodes) \
+                or all(self._recently_reported(n) for n in nodes):
             return
         now = time.time()
         self._emit(Incident(
@@ -645,6 +827,207 @@ class Watcher:
             summary=f"Pipeline degraded for two sweeps: {diagnosis.get('summary')}",
             timeline=[f"{clock(now - self.sweep_seconds)} first degraded sweep", f"{clock(now)} still degraded"],
             evidence={"diagnosis": compact_diagnosis(diagnosis)}))
+
+    # the sentinel's own liveness ----------------------------------------------------------
+
+    async def _alive_loop(self) -> None:
+        """Tell the chat (Redis heartbeat) and systemd (watchdog) that monitoring is running.
+        Driven by the event loop itself, so a hung sentinel stops reporting."""
+        sd_notify("READY=1")
+        while True:
+            now = time.time()
+            if self._redis is not None:
+                try:
+                    await asyncio.to_thread(self._mark_alive, now)
+                except redis.RedisError:
+                    pass  # Redis outages are reported by the heartbeat loop
+            sd_notify("WATCHDOG=1")
+            await asyncio.sleep(5)
+
+    def _mark_alive(self, now: float) -> None:
+        self._redis.set(SENTINEL_HEARTBEAT_KEY, json.dumps({"at": now, "pid": os.getpid()}), ex=SENTINEL_HEARTBEAT_TTL)
+        self._redis.set(SENTINEL_SEEN_KEY, now)
+
+    def mark_stopped(self) -> None:
+        """A clean shutdown: the chat should not report the monitor as crashed."""
+        if self._redis is not None:
+            try:
+                self._redis.delete(SENTINEL_HEARTBEAT_KEY, SENTINEL_SEEN_KEY)
+            except redis.RedisError:
+                pass
+
+    # the camera picture and frame rates -------------------------------------------------
+
+    def _camera_sources(self) -> dict[str, dict]:
+        """{camera topic: {"source": node, "detectors": {detector node: [its topics]}}} from the registry."""
+        try:
+            nodes = nodes_from_registry(self._redis.hgetall(NODES_REDIS_KEY))
+        except redis.RedisError:
+            return {}
+        cameras = {}
+        for name, info in nodes.items():
+            if info["subscribe"] or not info["publish"]:
+                continue
+            for topic in info["publish"]:
+                if topic.startswith("camera/"):
+                    cameras[topic] = {"source": name, "detectors": {}}
+        for name, info in nodes.items():
+            for topic in info["subscribe"]:
+                if topic in cameras and info["publish"]:
+                    cameras[topic]["detectors"][name] = info["publish"]
+        return cameras
+
+    def _one_message(self, topic: str, timeout: float = 3.0) -> Optional[bytes]:
+        """One message from the topic, or None (none in time, or Redis failed: the
+        heartbeat loop reports Redis itself)."""
+        pubsub = self._redis.pubsub(ignore_subscribe_messages=True)
+        try:
+            pubsub.subscribe(topic)
+            deadline = time.monotonic() + timeout
+            while (left := deadline - time.monotonic()) > 0:
+                message = pubsub.get_message(timeout=left)
+                if message and message["type"] == "message":
+                    return message["data"]
+            return None
+        except redis.RedisError:
+            return None
+        finally:
+            pubsub.close()
+
+    def _count_messages(self, topics: list[str], window: float) -> Optional[dict[str, float]]:
+        """Messages per second on each topic, or None if Redis failed during the window
+        (a partial count would look like a frame-rate drop)."""
+        pubsub = self._redis.pubsub(ignore_subscribe_messages=True)
+        counts = dict.fromkeys(topics, 0)
+        try:
+            pubsub.subscribe(*topics)
+            deadline = time.monotonic() + window
+            while (left := deadline - time.monotonic()) > 0:
+                message = pubsub.get_message(timeout=left)
+                if message and message["type"] == "message":
+                    channel = message["channel"].decode() if isinstance(message["channel"], bytes) else message["channel"]
+                    counts[channel] = counts.get(channel, 0) + 1
+        except redis.RedisError:
+            return None
+        finally:
+            pubsub.close()
+        return {t: round(n / window, 2) for t, n in counts.items()}
+
+    def _camera_incident(self, kind: str, node: str, summary: str, evidence: dict) -> Incident:
+        now = time.time()
+        incident = Incident(kind=kind, node=node, summary=summary, first_event_at=now,
+                            timeline=[f"{clock(now)} {summary}"], evidence=evidence)
+        self._emit(incident)
+        return incident
+
+    async def _camera_loop(self) -> None:
+        """Every few seconds, one frame per camera: frozen, black, covered, defocused, moved."""
+        if self._redis is None:
+            return
+        if cw is None:
+            self.say(f"[watch] camera picture checks disabled ({_CAMERA_CHECKS_OFF})")
+            return
+        while True:
+            await asyncio.sleep(cw.SAMPLE_SECONDS)
+            if self._redis_failures:
+                continue
+            for topic, camera in (await asyncio.to_thread(self._camera_sources)).items():
+                payload = await asyncio.to_thread(self._one_message, topic)
+                gray = cw.decode_frame(payload) if payload else None
+                if gray is not None:   # no frames at all is the data-flow checks' job
+                    self._check_picture(topic, camera["source"], payload, gray)
+
+    def _check_picture(self, topic: str, source_node: str, payload: bytes, gray) -> None:
+        health = self._picture_health(topic)
+        was_learned = health.learned
+        started, cleared = health.update(gray)
+        if health.learned and not was_learned:
+            health.save(CAMERA_REFERENCE_DIR, topic.replace("/", "_"))
+            self.say(f"[watch] {topic}: learned the camera's normal picture")
+        for condition in started:
+            incident = self._camera_incident(
+                f"CAMERA_{condition}", source_node, f"On {topic}, {cw.DESCRIPTIONS[condition]}.",
+                {"camera_topic": topic, "measurements": health.last,
+                 "normal_levels": {k: round(v, 3) for k, v in health.baseline.items()}})
+            images = LOG_DIR / "incidents"
+            incident.evidence["frame_image"] = cw.save_frame(payload, images / f"{incident.id}-frame.jpg")
+            incident.evidence["reference_image"] = cw.save_reference(
+                health.reference, images / f"{incident.id}-reference.png")
+            self._camera_alerts[(topic, condition)] = incident
+        for condition in cleared:
+            self._close_alert(self._camera_alerts.pop((topic, condition), None),
+                              "The camera picture looks normal again.")
+
+    def _picture_health(self, topic: str):
+        """The topic's learned picture, relearned when a different camera or video feeds it."""
+        source = started_source.source()
+        health = self._camera_health.get(topic)
+        if health is not None and health.source == source:
+            return health
+        if health is not None:   # its old view means nothing for the new source
+            for key in [k for k in self._camera_alerts if k[0] == topic]:
+                self._close_alert(self._camera_alerts.pop(key), "The camera source changed; relearning its "
+                                                                "normal picture.", stage="dismissed")
+        health = self._camera_health[topic] = cw.CameraHealth(source=source)
+        if health.load(CAMERA_REFERENCE_DIR, topic.replace("/", "_")):
+            self.say(f"[watch] {topic}: using the saved reference view")
+        return health
+
+    def _close_alert(self, incident: Optional[Incident], text: str, stage: str = "resolved") -> None:
+        if incident is not None and incident.id in self.open:
+            self._close(incident, stage, text)
+
+    async def _rate_loop(self) -> None:
+        """Every half minute, frame rates: the camera's, and its detectors' output."""
+        if self._redis is None or cw is None:
+            return
+        while True:
+            await asyncio.sleep(cw.FPS_EVERY_SECONDS)
+            if self._redis_failures:
+                continue
+            for topic, camera in (await asyncio.to_thread(self._camera_sources)).items():
+                if not await self._check_rates(topic, camera):
+                    break   # Redis failed mid-count: the heartbeat loop reports it
+
+    def _rate_busy(self, node: str) -> bool:
+        """Down or restarting: another check's incident, not a frame-rate problem. This
+        check's own open alerts don't count, or they could never clear."""
+        own = {i.id for i in self._rate_alerts.values()}
+        if any(i.node == node and i.id not in own for i in self.open.values()):
+            return True
+        owned = any(i.node == node for i in self._rate_alerts.values())
+        return not owned and time.time() - self._reported_at.get(node, 0) < REPORT_DEDUPE_SECONDS
+
+    async def _check_rates(self, topic: str, camera: dict) -> bool:
+        """Update one camera's frame-rate baselines; False if Redis failed mid-count."""
+        checks = [(topic, camera["source"], "LOW_FPS")] + [
+            (t, detector, "SLOW_DETECTOR") for detector, topics in camera["detectors"].items() for t in topics]
+        checks = [c for c in checks if not self._rate_busy(c[1])]
+        if not checks:
+            return True
+        # Always measure the camera: "detector slow" only means something while frames arrive.
+        rates = await asyncio.to_thread(self._count_messages, sorted({c[0] for c in checks} | {topic}),
+                                        cw.FPS_WINDOW_SECONDS)
+        if rates is None:
+            return False
+        camera_baseline = self._rate_baselines.get(topic)
+        camera_ok = (camera_baseline is not None and camera_baseline.normal is not None
+                     and rates.get(topic, 0.0) >= camera_baseline.factor * camera_baseline.normal)
+        for checked_topic, node, condition in checks:
+            rate = rates.get(checked_topic, 0.0)
+            baseline = self._rate_baselines.setdefault(checked_topic, cw.RateBaseline())
+            change = baseline.update(rate)
+            if change is True and condition == "SLOW_DETECTOR" and not camera_ok:
+                baseline.low, baseline.low_streak = False, 0   # the camera's problem; check again later
+            elif change is True:
+                self._rate_alerts[checked_topic] = self._camera_incident(
+                    f"CAMERA_{condition}", node,
+                    f"On {checked_topic}, {cw.DESCRIPTIONS[condition]}: {rate}/s vs {baseline.normal:.1f}/s normally.",
+                    {"topic": checked_topic, "rate_per_s": rate, "normal_rate_per_s": baseline.normal,
+                     "camera_rate_per_s": rates.get(topic)})
+            elif change is False:
+                self._close_alert(self._rate_alerts.pop(checked_topic, None), "The frame rate is back to normal.")
+        return True
 
     def _get_json(self, path: str, timeout: float) -> dict:
         with urllib.request.urlopen(self.api_url + path, timeout=timeout) as resp:

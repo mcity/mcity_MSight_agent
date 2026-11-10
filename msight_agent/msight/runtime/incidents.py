@@ -8,17 +8,25 @@ The sentinel appends each stage of an incident to a Redis Stream as it happens:
   investigating  Claude has started
   progress       one per investigation step
   diagnosed      Claude's report and the code-side checks
+  fixing         --autonomy fix: Claude is applying a fix
+  fixed          the fix was applied and the watcher saw the incident clear
+  escalated      a person must act (Claude's or the code's judgment, or the fix didn't work)
   resolved       the pipeline is healthy again
   dismissed      not a fault after all (removed on purpose, recovered on its own)
 
-fold() merges a stream's events into one current state per incident. Takes a redis
-client instead of creating one, so it works with either venv's redis-py.
+fold() merges a stream's events into one current state per incident. The readers take
+a redis client instead of creating one, so they work with either venv's redis-py.
 """
 import json
 import time
 from typing import Iterable, Optional
 
 STREAM_KEY = "MSIGHT:INCIDENTS"
+# The sentinel's own liveness: a heartbeat that expires, and a "last seen" marker that a clean
+# shutdown deletes. Heartbeat gone while the marker remains = the monitor died.
+SENTINEL_HEARTBEAT_KEY = "MSIGHT:SENTINEL:HEARTBEAT"
+SENTINEL_SEEN_KEY = "MSIGHT:SENTINEL:LAST_SEEN"
+SENTINEL_HEARTBEAT_TTL = 20
 STREAM_MAXLEN = 2000
 CLOSED = ("resolved", "dismissed")
 _MAX_STEPS = 12
@@ -47,6 +55,8 @@ def apply(state: Optional[dict], event: dict) -> dict:
     if stage == "progress":
         state["steps"] = (state["steps"] + [event.get("text", "")])[-_MAX_STEPS:]
         return state
+    if stage in ("fixed", "escalated"):
+        state["fix_outcome"], state["fix_text"] = stage, event.get("text", "")
     if stage in CLOSED:
         state["status"] = stage
         state[f"{stage}_at"] = event["at"]
@@ -72,22 +82,37 @@ def fix_action(state: dict) -> Optional[dict]:
     """{"label", "message"} for the chat's Fix-it button, or None when the chat agent
     can't fix it (a service outage) or there's nothing to fix yet.
 
-    The message is what the user sends by clicking, so it names the action itself:
-    the chat's write guards only let the agent remove or stop something the user's
-    own message asked for."""
-    if state.get("status") != "open" or not state.get("report"):
+    The message is what the user sends by clicking, and the chat's write guards treat
+    the user's words as consent. So it asks to recreate the named nodes and never says
+    "restart" or "stop", which would also allow stopping the pipeline or a recording."""
+    report = state.get("report")
+    if state.get("status") != "open" or not report or report.get("requires_human"):
+        return None
+    if state.get("autonomy") == "observe" or state.get("stage") == "fixing" or state.get("fix_outcome") == "fixed":
         return None
     node, kind, incident_id = state.get("node", ""), state.get("kind"), state["id"]
     if kind in _DOWN or (kind in _STUCK and "+" not in node):
         return {"label": f"Fix it: restart {node}",
-                # No "restart"/"stop": the guards would read those as consent to stop the whole pipeline.
                 "message": f"Fix incident {incident_id}: recreate {node} with its normal settings and keep "
                            "the rest of the pipeline running."}
     if kind in _STUCK:
-        return {"label": "Fix it: restart the pipeline",
-                "message": f"Fix incident {incident_id}: restart the pipeline -- stop it and start it again so "
-                           "every node comes back with its normal settings."}
+        nodes = [n for n in node.split("+") if n]
+        names = ", ".join(nodes[:-1]) + f" and {nodes[-1]}" if len(nodes) > 1 else node
+        return {"label": "Fix it: restart the stuck nodes",
+                "message": f"Fix incident {incident_id}: recreate {names} with their normal settings, one at a "
+                           "time, and keep the rest of the pipeline running."}
     return None
+
+
+def sentinel_offline_since(client) -> Optional[float]:
+    """When the sentinel was last seen, if it has since stopped without shutting down cleanly."""
+    if client.exists(SENTINEL_HEARTBEAT_KEY):
+        return None
+    seen = client.get(SENTINEL_SEEN_KEY)
+    try:
+        return float(seen) if seen is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def read_recent(client, count: int = 500) -> list[tuple[str, dict]]:

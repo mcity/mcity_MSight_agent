@@ -149,6 +149,9 @@ async def started_node_names() -> set[str]:
     return names - _NOT_NODES
 
 
+_NAME_CONFLICT_RETRIES = 3
+
+
 class DockerExecutor:
     """One `docker run` per node on the prebuilt msight-vision image.
 
@@ -181,7 +184,14 @@ class DockerExecutor:
             if progress and not _CONTAINER_ID_RE.fullmatch(line):
                 await progress(line)
 
-        code, out = await run_cmd(*args, cwd=str(cwd), on_line=pull_progress if progress else None)
+        for attempt in range(_NAME_CONFLICT_RETRIES + 1):
+            code, out = await run_cmd(*args, cwd=str(cwd), on_line=pull_progress if progress else None)
+            # The old container can still be on its way out (removing a just-stopped or
+            # unpaused container isn't instant): the name frees up within a few seconds.
+            if code == 0 or "is already in use" not in out or attempt == _NAME_CONFLICT_RETRIES:
+                break
+            await asyncio.sleep(2)
+            await run_cmd("docker", "rm", "-f", cname)
         if code != 0:
             raise RuntimeError(f"docker run failed for '{name}': {out.strip()}")
         return DockerHandle(cname)

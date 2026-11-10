@@ -998,6 +998,8 @@ videoSubmitBtn.addEventListener("click", async () => {
 // updates in place while Claude investigates, and offers a Fix-it action that the
 // chat agent carries out. Incident text can quote untrusted log lines, so it is only
 // ever set with textContent, never as HTML.
+// Temporarily off: set back to true to offer the Fix-it button on incident cards.
+const SHOW_FIX_BUTTON = false;
 const incidentLines = new Map();      // incident id -> chat line element
 const fixRequested  = new Set();
 const DISMISSED_KEY = "mcity_dismissed_incidents";
@@ -1019,6 +1021,9 @@ function textEl(tag, cls, text) {
 
 function incidentPill(s) {
     if (s.status !== "open") return s.status === "resolved" ? "Resolved" : "Dismissed";
+    if (s.stage === "fixing") return "Claude is fixing…";
+    if (s.stage === "fixed") return "Fixed by Claude";
+    if (s.stage === "escalated") return "Needs a person";
     if (s.stage === "diagnosed") return "Diagnosed";
     if (s.stage === "investigating" || s.stage === "progress") return "Investigating…";
     return s.stage === "classified" ? "Confirmed" : "Just detected";
@@ -1074,6 +1079,9 @@ function renderIncident(s) {
     if (r) {
         bubble.appendChild(incidentSection(`Root cause · ${r.category} · ${r.confidence} confidence`, r.root_cause));
         bubble.appendChild(incidentSection("What's needed to fix it", r.suggested_fix));
+        if (r.requires_human && r.human_action && s.fix_outcome !== "escalated") {
+            bubble.appendChild(incidentSection("Needs a person", r.human_action));
+        }
         if (s.checks && s.checks.length) {
             bubble.appendChild(incidentSection("Checks", s.checks.map(c => `⚠ ${c}`).join("\n"), "incident-checks"));
         }
@@ -1082,15 +1090,24 @@ function renderIncident(s) {
     } else if (s.status === "open") {
         const steps = textEl("div", "incident-steps");
         const recent = (s.steps || []).slice(-4);
-        steps.textContent = [...recent.map(t => `• ${t}`),
-                             s.stage === "detected" ? "Watching what Docker does next…" : "Claude is investigating…"].join("\n");
+        const waiting = s.note || (s.stage === "detected" ? "Checking what's wrong…" : "Claude is investigating…");
+        steps.textContent = [...recent.map(t => `• ${t}`), waiting].join("\n");
+        bubble.appendChild(steps);
+    }
+    if (s.fix_outcome === "fixed") bubble.appendChild(incidentSection("Fixed automatically", s.fix_text));
+    if (s.fix_outcome === "escalated") {
+        bubble.appendChild(incidentSection("Needs a person", [s.fix_text, s.human_action].filter(Boolean).join("\n")));
+    }
+    if (s.stage === "fixing") {
+        const steps = textEl("div", "incident-steps");
+        steps.textContent = [...(s.steps || []).slice(-3).map(t => `• ${t}`), "Claude is applying a fix…"].join("\n");
         bubble.appendChild(steps);
     }
     if (s.status !== "open" && s.closed_reason) bubble.appendChild(textEl("div", "incident-closed", s.closed_reason));
 
     if (s.status === "open") {
         const actions = textEl("div", "incident-actions");
-        if (s.fix) {
+        if (SHOW_FIX_BUTTON && s.fix) {
             const fix = textEl("button", "", fixRequested.has(s.id) ? "Fix requested — see below" : s.fix.label);
             fix.disabled = fixRequested.has(s.id);
             fix.addEventListener("click", () => requestIncidentFix(s, fix));
@@ -1110,10 +1127,36 @@ function renderIncident(s) {
     if (isNew || s.stage === "diagnosed") chatEl.scrollTop = chatEl.scrollHeight;
 }
 
-// EventSource reconnects on its own and resumes from the last event id it saw.
+// EventSource reconnects on its own and resumes from the last event id it saw. The server
+// ends each connection every 30s, so the badge only says "offline" if reconnecting fails.
 const incidentFeed = new EventSource(`${CHAT_BASE}/msight/incidents/stream`);
+let feedOfflineTimer = null;
+incidentFeed.addEventListener("open", () => { clearTimeout(feedOfflineTimer); setChatStatus(true); });
+incidentFeed.addEventListener("error", () => {
+    clearTimeout(feedOfflineTimer);
+    feedOfflineTimer = setTimeout(() => setChatStatus(false), 3000);
+});
+// The server's own notices (monitor offline, Redis unreachable) aren't in the incident stream;
+// on each connection it lists the ones still standing, and any other open notice is over.
+const feedNotices = new Map();
+const NOTICE_RECOVERED = {sentinel: "The monitor is running again.",
+                          redis: "Redis is reachable again; live updates have resumed."};
 incidentFeed.addEventListener("incident", (e) => {
-    try { renderIncident(JSON.parse(e.data)); } catch { /* malformed event -- skip */ }
+    try {
+        const s = JSON.parse(e.data);
+        if (s.id.startsWith("FEED-")) feedNotices.set(s.id, s);
+        renderIncident(s);
+    } catch { /* malformed event -- skip */ }
+});
+incidentFeed.addEventListener("notices", (e) => {
+    let active;
+    try { active = JSON.parse(e.data); } catch { return; }
+    for (const [id, s] of feedNotices) {
+        if (s.status !== "open" || active.includes(id)) continue;
+        const resolved = {...s, status: "resolved", stage: "resolved", closed_reason: NOTICE_RECOVERED[s.node] || ""};
+        feedNotices.set(id, resolved);
+        renderIncident(resolved);
+    }
 });
 
 // ── MSight recording status polling (independent of the chat/LLM loop) ─────

@@ -49,6 +49,9 @@ def summarize(state: dict) -> dict:
 
 @mcp.tool()
 async def get_recent_incidents(incident_id: Optional[str] = None, include_resolved: bool = False) -> str:
+    """What the background monitor detected on its own: open incidents (or one by
+    `incident_id`) with what it saw, Claude's diagnosis, the consistency checks and the
+    fix action, plus `fix_guidance`. `include_resolved` adds closed ones. Read-only."""
     client = redis.Redis(**redis_kwargs(), socket_timeout=5)
     try:
         states = await asyncio.to_thread(incidents.recent_incidents, client, include_resolved or bool(incident_id))

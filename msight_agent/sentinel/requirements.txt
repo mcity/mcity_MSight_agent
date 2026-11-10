@@ -3,3 +3,7 @@
 claude-agent-sdk==0.2.174
 python-dotenv
 redis
+msgpack
+numpy
+pillow
+pyzmq

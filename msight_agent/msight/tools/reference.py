@@ -15,6 +15,9 @@ _TOPICS: dict[str, str] = {
 
 @mcp.tool()
 def get_msight_reference(topic: str) -> str:
+    """Reference documentation by `topic`: node_catalog (node types with worked examples),
+    common_failure_modes (known errors and fixes), diagnosing_stalled_nodes (stuck vs dead
+    nodes), host_troubleshooting (drivers, disk, ports, Docker, Redis)."""
     if topic not in _TOPICS:
         return error_json(f"Unknown topic '{topic}'. Available: {sorted(_TOPICS)}")
     text = (_REFERENCE_DIR / _TOPICS[topic]).read_text()

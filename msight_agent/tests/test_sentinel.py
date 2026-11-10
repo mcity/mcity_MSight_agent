@@ -199,3 +199,47 @@ def test_a_removed_publisher_is_the_node_to_bring_back():
         {"kind": "MISSING_PUBLISHER", "node": "detection_viewer", "topic": "detection/s1",
          "removed_publisher": "rfdetr_detector"}]}
     assert degraded_key(removed) == frozenset({("MISSING_PUBLISHER", "rfdetr_detector")})
+
+
+def test_shutdown_in_prose_is_not_a_command():
+    # Live run: "graceful shutdown" in a prevention note was flagged as destructive.
+    prose = {**GOOD_OOM_REPORT, "prevention": "Handle SIGINT with a graceful shutdown and alert on exit 0."}
+    assert check_report(OOM_INCIDENT, prose) == []
+    command = {**GOOD_OOM_REPORT, "suggested_fix": "Raise the memory limit, then shutdown -r now."}
+    assert any("shutdown -r" in w for w in check_report(OOM_INCIDENT, command))
+
+
+@pytest.mark.parametrize("summary, flagged", [
+    # what blocked a correct fix: past tense, describing the node before it was killed
+    ("The rfdetr_detector container was killed with SIGKILL. It was running normally when it died. "
+     "Docker did not restart it, so it is down.", False),
+    ("rfdetr_detector died; video_source and detection_viewer are still running.", False),
+    ("rfdetr_detector is not running and has not recovered.", False),
+    ("rfdetr_detector is running again.", True),
+    ("The detector crashed but it is back up and running.", True),
+    ("GPU failure; the node recovered.", True),
+])
+def test_running_claims_are_about_the_node_now(summary, flagged):
+    incident = {"kind": "CONTAINER_KILLED", "node": "rfdetr_detector",
+                "evidence": {"container_state": {"Running": False, "OOMKilled": False}}}
+    report = {"category": "external_action", "summary": summary, "root_cause": "docker kill",
+              "confidence": "medium", "evidence": ["exit 137"], "suggested_fix": "restart it"}
+    assert any("not running" in w for w in check_report(incident, report)) is flagged
+
+
+def test_e2e_summary_reports_intervals_reliability_and_the_path():
+    from msight_agent.evals.sentinel_e2e import summarize, wilson
+    lo, hi = wilson(20, 20)
+    assert 0.83 < lo < 0.85 and hi == 1.0           # 20/20 is not "100%": it is at least ~84%
+    runs = [
+        {"scenario": "a", "detected": True, "node_ok": True, "diagnosed": True, "label_ok": True, "confidence": "high",
+         "fix_outcome": "fixed", "human_ok": True, "fix_ok": True, "closed": "resolved", "passed": True,
+         "actions": ["restart(a)"], "wasted_actions": 0, "cost_usd": 0.1},
+        {"scenario": "a", "detected": True, "node_ok": True, "diagnosed": True, "label_ok": False, "confidence": "high",
+         "fix_outcome": "escalated", "human_ok": True, "fix_ok": False, "closed": "resolved", "passed": False,
+         "actions": ["restart(a)"], "wasted_actions": 1, "cost_usd": 0.1},
+    ]
+    s = summarize(runs)
+    assert s["pass_at_k"].startswith("1/1") and s["pass_hat_k"].startswith("0/1") and s["flaky"] == ["a"]
+    assert s["wasted_actions"] == 1 and s["cost_per_pass_usd"] == 0.2
+    assert s["label_right_by_confidence"]["high"].startswith("1/2")

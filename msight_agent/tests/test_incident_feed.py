@@ -213,11 +213,23 @@ def test_fix_message_is_consent_for_a_targeted_restart(kind):
     assert not destructive_allowed("stop_msight_pipeline", {}, fix["message"], "")
 
 
+def test_multi_node_fix_message_restarts_nodes_without_consent_to_stop():
+    from msight_agent.agent.guards import destructive_allowed
+    fix = incidents.fix_action(_diagnosed("PIPELINE_DEGRADED", node="video_source+rfdetr_detector"))
+    assert "video_source and rfdetr_detector" in fix["message"]
+    assert destructive_allowed("restart_msight_node", {"name": "video_source"}, fix["message"], "")
+    for tool, args in [("stop_msight_pipeline", {}), ("stop_msight_recording", {}),
+                       ("remove_msight_node", {"name": "local_dumper"})]:
+        assert not destructive_allowed(tool, args, fix["message"], ""), tool
+
+
 def test_a_stopped_pipeline_dismisses_instead_of_resolving(quiet_watcher, monitor_events):
     w = quiet_watcher
     incident = Incident(kind="CONTAINER_KILLED", node="rfdetr_detector", summary="s", first_event_at=1)
     w.open[incident.id] = incident
     w._classified.add(incident.id)
+    w._resolve_recovered({"verdict": "empty"})
+    assert monitor_events == []                    # one empty sweep may be a restart in progress
     w._resolve_recovered({"verdict": "empty"})
     assert [a[1] for a, _ in monitor_events] == ["dismissed"]
 
@@ -292,3 +304,302 @@ def test_incidents_left_open_by_a_previous_run_are_closed(monitor_events, monkey
     w._redis = object()                                           # anything non-None; the read is patched
     w.close_orphans()
     assert [(a[0], a[1]) for a, _ in monitor_events] == [("INC-old", "dismissed")]
+
+
+# --- Redis outages and service checks --------------------------------------------------
+
+import redis as redis_lib  # noqa: E402
+
+from msight_agent.msight.routes import redis_outage_notice  # noqa: E402
+from msight_agent.sentinel import stream as stream_mod  # noqa: E402
+from msight_agent.sentinel.watcher import SERVICES  # noqa: E402
+
+
+class FlakyRedis:
+    """XADD fails while `down`, then records what it receives."""
+    def __init__(self, *args, **kwargs):
+        self.down, self.added = True, []
+
+    def xadd(self, key, fields, **kwargs):
+        if self.down:
+            raise redis_lib.ConnectionError("Connection refused")
+        self.added.append(json.loads(fields["data"])["stage"])
+
+
+def test_events_held_during_a_redis_outage_are_published_in_order(monkeypatch):
+    monkeypatch.setattr(stream_mod.redis, "Redis", FlakyRedis)
+    publish = stream_mod.IncidentPublisher({}, say=lambda line: None)
+    publish("INC-1", "detected")
+    publish("INC-1", "classified")
+    publish._client.down = False
+    publish("INC-1", "resolved")
+    assert publish._client.added == ["detected", "classified", "resolved"]
+
+
+def test_a_long_outage_keeps_the_newest_events_and_says_how_many_were_dropped(monkeypatch):
+    monkeypatch.setattr(stream_mod.redis, "Redis", FlakyRedis)
+    monkeypatch.setattr(stream_mod, "HELD_EVENTS", 2)
+    lines = []
+    publish = stream_mod.IncidentPublisher({}, say=lines.append)
+    for stage in ("detected", "classified", "investigating"):
+        publish("INC-1", stage)
+    publish._client.down = False
+    publish("INC-1", "diagnosed")
+    assert publish._client.added == ["investigating", "diagnosed"]
+    assert "oldest 2 were dropped" in lines[-1]
+
+
+def test_redis_outage_is_one_incident_and_resolves(quiet_watcher, monitor_events):
+    w = quiet_watcher
+    w._redis = redis_lib.Redis(host="localhost", port=6380)          # only its settings are read
+    w._redis_unreachable(redis_lib.ConnectionError("refused"))
+    assert monitor_events == []                                        # one failed read isn't an outage
+    w._redis_unreachable(redis_lib.ConnectionError("refused"))
+    w._redis_unreachable(redis_lib.ConnectionError("refused"))
+    assert [a[1] for a, _ in monitor_events] == ["detected", "classified"]
+    assert w.queue.get_nowait().node == "redis"
+    w._redis_reachable()
+    assert [a[1] for a, _ in monitor_events][-1] == "resolved"
+
+
+def test_node_deaths_during_a_redis_outage_are_its_symptoms(quiet_watcher, monitor_events, monkeypatch):
+    async def fake_inspect(name):
+        return {"Running": False, "ExitCode": 1}
+
+    monkeypatch.setattr(watcher_mod, "inspect_container", fake_inspect)
+    w = quiet_watcher
+    w._redis = redis_lib.Redis(host="localhost", port=6380)
+    w._redis_unreachable(redis_lib.ConnectionError("refused"))
+    w._redis_unreachable(redis_lib.ConnectionError("refused"))
+    w.queue.get_nowait()                                                # the Redis incident itself
+    w.grouper.add(DET, ev("die", 100.0, 1))
+    asyncio.run(w._settle_once(103.0))
+    assert len(monitor_events) == 2                                     # held: no announcement
+    asyncio.run(w._settle_once(113.0))
+    assert w.queue.empty()                                              # not investigated on its own
+    assert "rfdetr_detector" in w._redis_incident.timeline[-1]
+
+
+def test_the_chat_server_shows_its_own_redis_notice():
+    notice = redis_outage_notice(1000.0)
+    assert notice["status"] == "open" and notice["node"] == "redis" and incidents.fix_action(notice) is None
+    assert "paused" in notice["note"]
+
+
+def test_chat_server_is_watched():
+    assert SERVICES["chat_server"] == 8001
+
+
+def test_a_sweep_does_not_duplicate_an_open_incident(quiet_watcher, monitor_events, monkeypatch):
+    # Live run: the detector exited and deregistered; the sweep saw two root causes
+    # (detector down + viewer has no publisher) and raised a second card.
+    w = quiet_watcher
+    open_incident = Incident(kind="CONTAINER_EXITED", node="rfdetr_detector", summary="s", first_event_at=1)
+    w.open[open_incident.id] = open_incident
+    diagnosis = {"status": "ok", "verdict": "degraded", "summary": "detector down", "root_causes": [
+        {"kind": "DEAD", "node": "rfdetr_detector"},
+        {"kind": "MISSING_PUBLISHER", "node": "detection_viewer", "topic": "detection/s1"}]}
+    monkeypatch.setattr(w, "_get_json", lambda path, timeout: diagnosis)
+    asyncio.run(w._check_pipeline())
+    asyncio.run(w._check_pipeline())                      # two bad sweeps in a row
+    assert monitor_events == [] and w.queue.empty()
+
+
+def test_a_new_fault_on_a_recently_fixed_node_is_reported(quiet_watcher, monkeypatch):
+    # Live run: the detector was restarted (incident resolved), then frozen a minute later;
+    # a 10-minute cooldown silently swallowed the freeze.
+    w = quiet_watcher
+    w._reported_at["rfdetr_detector"] = __import__("time").time() - 60   # fixed a minute ago
+    assert not w._recently_reported("rfdetr_detector")
+    still_open = Incident(kind="NODE_UNRESPONSIVE", node="rfdetr_detector", summary="s", first_event_at=1)
+    w.open[still_open.id] = still_open
+    assert w._recently_reported("rfdetr_detector")                       # but never twice while open
+
+
+# --- robustness (code review) -----------------------------------------------------------
+
+def test_two_incidents_for_one_node_in_one_second_get_distinct_ids():
+    a = Incident(kind="CAMERA_BLACK", node="cam_src", summary="s", first_event_at=1, detected_at=1000.0)
+    b = Incident(kind="CAMERA_COVERED", node="cam_src", summary="s", first_event_at=1, detected_at=1000.0)
+    assert a.id != b.id and a.id == a.id and a.to_dict()["id"] == a.id
+
+
+def test_a_failing_check_is_restarted_not_fatal(quiet_watcher, monkeypatch):
+    lines, calls = [], []
+    quiet_watcher.say = lines.append
+    monkeypatch.setattr(watcher_mod.asyncio, "sleep", _no_sleep)
+
+    async def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise redis_lib.ConnectionError("Redis went away mid-sample")
+
+    asyncio.run(quiet_watcher._supervised("camera", flaky))
+    assert len(calls) == 2 and "camera check failed" in lines[0]
+
+
+async def _no_sleep(_seconds):
+    return None
+
+
+def test_frame_counts_during_a_redis_failure_are_discarded_not_zero(quiet_watcher):
+    class BrokenPubSub:
+        def subscribe(self, *topics):
+            raise redis_lib.ConnectionError("down")
+
+        def close(self):
+            pass
+
+    quiet_watcher._redis = type("R", (), {"pubsub": lambda self, **kw: BrokenPubSub()})()
+    # Zeros would read as a frame-rate collapse and raise a false LOW_FPS alert.
+    assert quiet_watcher._count_messages(["camera/x"], 0.01) is None
+    assert quiet_watcher._one_message("camera/x", 0.01) is None
+
+
+def test_reconnect_lists_the_notices_that_still_stand():
+    from msight_agent.msight.routes import notices_sse
+    assert notices_sse([]) == "event: notices\ndata: []\n\n"
+    assert '"FEED-sentinel-5"' in notices_sse(["FEED-sentinel-5"])
+
+
+def test_a_starved_node_is_reported_as_its_upstream(quiet_watcher, monitor_events, monkeypatch):
+    # A stalled camera stream: video_source keeps heart-beating, the detector goes quiet.
+    w = quiet_watcher
+    diagnosis = {"status": "ok", "verdict": "degraded", "summary": "'video_source' published nothing.",
+                 "root_causes": [{"kind": "STALLED", "node": "video_source"}],
+                 "affected": [{"node": "rfdetr_detector", "health": "STARVED", "caused_by": "video_source"}]}
+
+    async def fake_inspect(name):
+        return {"Running": True, "Paused": False}
+    monkeypatch.setattr(watcher_mod, "inspect_container", fake_inspect)
+    monkeypatch.setattr(w, "_get_json", lambda path, timeout: diagnosis)
+    monkeypatch.setattr(w.heartbeats, "is_stale", lambda node: True)
+
+    asyncio.run(w._unresponsive("rfdetr_detector", last_heartbeat=1.0))
+    emitted = w.queue.get_nowait()
+    assert (emitted.kind, emitted.node) == ("PIPELINE_DEGRADED", "video_source")
+    provisional = next(a[0] for a, k in monitor_events if a[1] == "detected" and k.get("node") == "rfdetr_detector")
+    assert (provisional, "dismissed") in [(a[0], a[1]) for a, _ in monitor_events]
+
+
+def _run_rate_loop(w, monkeypatch, samples):
+    """Drive _rate_loop through scripted {topic: rate} samples, one per 30s tick."""
+    script = iter(samples)
+    monkeypatch.setattr(w, "_camera_sources", lambda: {
+        "camera/c": {"source": "video_source", "detectors": {"rfdetr_detector": ["detection/c"]}}})
+    monkeypatch.setattr(w, "_count_messages", lambda topics, window: next(script))
+    w._redis = object()
+    ticks = iter(range(len(samples)))
+
+    async def tick(_seconds):
+        if next(ticks, None) is None:
+            raise asyncio.CancelledError
+    monkeypatch.setattr(watcher_mod.asyncio, "sleep", tick)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(w._rate_loop())
+
+
+def _stages(monitor_events):
+    kinds = {a[0]: k.get("kind") for a, k in monitor_events if k.get("kind")}
+    return [(kinds.get(a[0]), a[1]) for a, _ in monitor_events if a[1] in ("classified", "resolved")]
+
+
+NORMAL = {"camera/c": 5.0, "detection/c": 5.0}
+
+
+def test_no_slow_detector_alert_when_the_camera_itself_stopped(quiet_watcher, monitor_events, monkeypatch):
+    stalled = {"camera/c": 0.0, "detection/c": 0.0}
+    _run_rate_loop(quiet_watcher, monkeypatch, [NORMAL] * 4 + [stalled] * 3)
+    kinds = [k for k, _ in _stages(monitor_events)]
+    assert "CAMERA_SLOW_DETECTOR" not in kinds and "CAMERA_LOW_FPS" in kinds
+
+
+def test_a_slow_detector_alert_clears_when_it_recovers(quiet_watcher, monitor_events, monkeypatch):
+    slow = {"camera/c": 5.0, "detection/c": 0.0}
+    _run_rate_loop(quiet_watcher, monkeypatch, [NORMAL] * 4 + [slow] * 2 + [NORMAL])
+    assert _stages(monitor_events) == [("CAMERA_SLOW_DETECTOR", "classified"), ("CAMERA_SLOW_DETECTOR", "resolved")]
+
+
+def test_a_paused_node_is_never_dismissed_as_recovered(quiet_watcher, monitor_events, monkeypatch):
+    w = quiet_watcher
+
+    async def paused(name):
+        return {"Running": True, "Paused": True}
+    monkeypatch.setattr(watcher_mod, "inspect_container", paused)
+    monkeypatch.setattr(w, "_get_json", lambda path, timeout: {"status": "ok", "verdict": "healthy"})
+    monkeypatch.setattr(w.heartbeats, "is_stale", lambda node: False)   # one read looked fine
+    asyncio.run(w._unresponsive("rfdetr_detector", last_heartbeat=1.0))
+    assert w.queue.get_nowait().node == "rfdetr_detector"
+    assert "dismissed" not in [a[1] for a, _ in monitor_events]
+
+
+def test_a_slow_but_working_node_is_not_reported_frozen(quiet_watcher, monitor_events, monkeypatch):
+    # A slowed camera stream: the detector still works at 0.24 msg/s, so its heartbeat
+    # (every 10 messages) goes quiet. That is a frame-rate drop, not a frozen node.
+    w = quiet_watcher
+
+    async def running(name):
+        return {"Running": True, "Paused": False}
+    monkeypatch.setattr(watcher_mod, "inspect_container", running)
+    monkeypatch.setattr(w, "_get_json", lambda path, timeout: {"status": "ok", "verdict": "healthy", "nodes": [
+        {"name": "rfdetr_detector", "health": "OK", "in_rate_hz": 0.24, "out_rate_hz": 0.24}]})
+    monkeypatch.setattr(w.heartbeats, "is_stale", lambda node: True)
+    asyncio.run(w._unresponsive("rfdetr_detector", last_heartbeat=1.0))
+    assert w.queue.empty()
+    assert [a[1] for a, _ in monitor_events] == ["detected", "dismissed"]
+    # Not re-checked every ~40s, and not hidden from the frame-rate check either.
+    assert w._slow_until["rfdetr_detector"] > 1.0 and not w._recently_reported("rfdetr_detector")
+
+
+def test_a_new_camera_source_relearns_the_picture_and_closes_old_alerts(quiet_watcher, monitor_events, monkeypatch):
+    from msight_agent.sentinel.camera_watch import CameraHealth
+    w = quiet_watcher
+    moved = Incident(kind="CAMERA_MOVED", node="video_source", summary="s", first_event_at=1)
+    w.open[moved.id] = moved
+    w._camera_health["camera/c"] = CameraHealth(source="rtsp://old/cam")
+    w._camera_alerts[("camera/c", "MOVED")] = moved
+    monkeypatch.setattr(watcher_mod.started_source, "source", lambda: "/videos/new.mp4")
+    monkeypatch.setattr(watcher_mod, "CAMERA_REFERENCE_DIR", watcher_mod.LOG_DIR / "no_such_reference_dir")
+
+    health = w._picture_health("camera/c")
+    assert health.source == "/videos/new.mp4" and not health.learned
+    assert (moved.id, "dismissed") in [(a[0], a[1]) for a, _ in monitor_events]
+    assert w._camera_alerts == {}
+
+
+def test_frame_rate_baselines_survive_a_restart_of_the_check(quiet_watcher, monitor_events, monkeypatch):
+    _run_rate_loop(quiet_watcher, monkeypatch, [NORMAL] * 4)
+    learned = quiet_watcher._rate_baselines["camera/c"].normal
+    _run_rate_loop(quiet_watcher, monkeypatch, [NORMAL])     # the loop restarted after a failure
+    assert learned == 5.0 and quiet_watcher._rate_baselines["camera/c"].normal == learned
+
+
+def test_monitor_notice_opens_once_and_resolves_when_the_sentinel_is_back():
+    from msight_agent.msight.routes import track_monitor
+    notice, sent = track_monitor(100.0, None)
+    assert notice["id"] == "FEED-sentinel-100" and '"status": "open"' in sent
+    assert track_monitor(100.0, notice) == (notice, "")          # still down: nothing new to send
+    notice, sent = track_monitor(None, notice)
+    assert notice is None and '"status": "resolved"' in sent
+
+
+def test_new_stream_entries_fold_into_state_and_advance_the_cursor():
+    from msight_agent.msight.routes import new_events_sse
+    states = {}
+    entries = [(b"5-0", incidents.encode("INC-1", "detected", {"node": "x", "kind": "CONTAINER_KILLED"})),
+               (b"6-0", {"data": "not json"}),
+               (b"7-0", incidents.encode("INC-1", "resolved", {"text": "back"}))]
+    chunk, cursor = new_events_sse(entries, states, "4-0")
+    assert cursor == "7-0" and states["INC-1"]["status"] == "resolved"
+    assert chunk.count("event: incident") == 2 and "id: 7-0" in chunk
+
+
+def test_redis_notice_appears_only_after_a_few_seconds_down(monkeypatch):
+    from msight_agent.msight import routes
+    monkeypatch.setattr(routes.time, "time", lambda: 1000.0)
+    since, notice, sent = routes.track_redis_outage(None, None)
+    assert (since, notice, sent) == (1000.0, None, "")                     # a blip shows nothing
+    monkeypatch.setattr(routes.time, "time", lambda: 1004.0)
+    since, notice, sent = routes.track_redis_outage(since, None)
+    assert notice["id"] == "FEED-redis-1000" and sent
+    assert routes.track_redis_outage(since, notice)[2] == ""                # shown once
