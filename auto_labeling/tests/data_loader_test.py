@@ -28,7 +28,7 @@ def dataset_v51():
         # Ensure that all splits are represented (normally Data Engine takes care of that)
         for sample in dataset.iter_samples(progress=True, autosave=True):
             sample.tags = [random.choice(ACCEPTED_SPLITS)]
-    except:
+    except Exception:
         dataset = fo.load_dataset(dataset_name)
     return dataset
 
@@ -48,7 +48,7 @@ def dataset_v51_no_splits_no_detections():
 
         # Remove detection field
         dataset.delete_sample_field(fisheye8k_gt_field)
-    except:
+    except Exception:
         dataset = fo.load_dataset(dataset_name)
     return dataset
 
@@ -277,7 +277,7 @@ def empty_dataset():
     """Fixture to create an empty FiftyOne dataset."""
     try:
         dataset = fo.Dataset(name="empty_dataset")
-    except:
+    except Exception:
         dataset = fo.load_dataset("empty_dataset")
     return dataset
 
@@ -289,7 +289,7 @@ def no_annotations_dataset():
         dataset = fo.Dataset(name="no_annotations_dataset")
         dataset.add_sample(fo.Sample(filepath="image1.jpg"))
         dataset.add_sample(fo.Sample(filepath="image2.jpg"))
-    except:
+    except Exception:
         dataset = fo.load_dataset("no_annotations_dataset")
 
     return dataset

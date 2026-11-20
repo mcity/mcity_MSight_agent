@@ -11,7 +11,7 @@ import tempfile
 import uuid
 import zipfile
 from pathlib import Path
-from typing import Awaitable, Callable, List, Optional, Tuple
+from typing import Awaitable, Callable, List, Optional
 
 from msight_agent.agent.state import WorkflowState
 from msight_agent.agent.workflow_tools import SELECTED_WORKFLOW_RE, with_selected_workflow, write_selected_dataset
@@ -35,8 +35,10 @@ def _extract_zip(zip_path: str) -> tuple[Path, Path]:
 def _read(p: Path) -> str:
     return p.read_text(encoding="utf-8")
 
+
 def _write(p: Path, s: str) -> None:
     p.write_text(s, encoding="utf-8")
+
 
 def _patch_data_ingest_block(
     src: str,
@@ -46,6 +48,7 @@ def _patch_data_ingest_block(
     dataset_name: Optional[str],
     annotation_format: Optional[str],
 ) -> str:
+    """config.py source with WORKFLOWS["data_ingest"] set to these values (added if missing)."""
     def upsert_key(block: str, key: str, value_src: str) -> str:
         patt = rf'(["\']{re.escape(key)}["\']\s*:\s*)(.*?)(,?\s*\n)'
         if re.search(patt, block, flags=re.DOTALL):
@@ -57,18 +60,19 @@ def _patch_data_ingest_block(
     fps_val = int(fps)
     splits_val = json.dumps([float(x) for x in split_percentages])
 
-    if _data_ingest_block_span(src) is None:
+    span = _data_ingest_block_span(src)
+    if span is None:
         m = re.search(r'WORKFLOWS\s*=\s*\{', src)
         block_lines = [
             '    "data_ingest": {',
-            f'        "dataset_dir": {repr(dataset_dir)},',
+            f'        "dataset_dir": {dataset_dir!r},',
             f'        "fps": {fps_val},',
             f'        "split_percentages": {splits_val},',
         ]
         if dataset_name:
-            block_lines.append(f'        "dataset_name": {repr(dataset_name)},')
+            block_lines.append(f'        "dataset_name": {dataset_name!r},')
         if annotation_format:
-            block_lines.append(f'        "annotation_format": {repr(annotation_format)},')
+            block_lines.append(f'        "annotation_format": {annotation_format!r},')
         block_lines.append('    },\n')
         block = "\n".join(block_lines)
         if not m:
@@ -79,13 +83,8 @@ def _patch_data_ingest_block(
             insert_at = m.end()
         return src[:insert_at + 1] + "\n" + block + src[insert_at + 1:]
 
-    span = _data_ingest_block_span(src)
-    if span is None:
-        return src
     start, end = span
-    block_src = src[start:end]
-    block_new = block_src
-    block_new = upsert_key(block_new, "dataset_dir", repr(dataset_dir))
+    block_new = upsert_key(src[start:end], "dataset_dir", repr(dataset_dir))
     block_new = upsert_key(block_new, "fps", str(fps_val))
     block_new = upsert_key(block_new, "split_percentages", splits_val)
     if dataset_name:
@@ -94,20 +93,13 @@ def _patch_data_ingest_block(
         block_new = upsert_key(block_new, "annotation_format", repr(annotation_format))
     return src[:start] + block_new + src[end:]
 
-def _parse_name_samples(text: str) -> Tuple[Optional[str], Optional[int]]:
-    name, samples = None, None
-    m = re.search(r'(Created dataset|Dataset(?:\s+name)?):?\s*([A-Za-z0-9_\-\.]+)', text, flags=re.IGNORECASE)
-    if m: name = m.group(2)
-    m2 = re.search(r'(?:samples\s*=\s*|)(\d+)\s+samples', text, flags=re.IGNORECASE)
-    if m2:
-        try: samples = int(m2.group(1))
-        except ValueError: pass
-    if samples is None:
-        m3 = re.search(r'samples\s*=\s*(\d+)', text, flags=re.IGNORECASE)
-        if m3:
-            try: samples = int(m3.group(1))
-            except ValueError: pass
-    return name, samples
+
+def _parse_samples(text: str) -> Optional[int]:
+    """The sample count in an engine log line ("123 samples" or "samples=123"), if any."""
+    m = (re.search(r"(\d+)\s+samples", text, flags=re.IGNORECASE)
+         or re.search(r"samples\s*=\s*(\d+)", text, flags=re.IGNORECASE))
+    return int(m.group(1)) if m else None
+
 
 async def _stream_subprocess(proc: asyncio.subprocess.Process, on_line):
     async def _reader(stream, source):
@@ -117,6 +109,7 @@ async def _stream_subprocess(proc: asyncio.subprocess.Process, on_line):
                 break
             await on_line(source, line.decode("utf-8", errors="ignore"))
     await asyncio.gather(_reader(proc.stdout, "stdout"), _reader(proc.stderr, "stderr"))
+
 
 def _data_ingest_block_span(src: str) -> Optional[tuple[int, int]]:
     """(start, end) of the WORKFLOWS["data_ingest"] dict literal, braces matched."""
@@ -210,13 +203,9 @@ async def run_data_ingest(
             nonlocal ds_name, samples
             combined_lines.append(f"[{source}] {line}")
             text = line.strip()
-            # Target the specific ingestion line directly
-            ingest_match = re.search(r"Ingesting dataset:\s*([A-Za-z0-9_\-\.]+)", text)
-            if ingest_match:
+            if ingest_match := re.search(r"Ingesting dataset:\s*([A-Za-z0-9_\-\.]+)", text):
                 ds_name = ingest_match.group(1)
-
-            _, s = _parse_name_samples(text)
-            if s: samples = s
+            samples = _parse_samples(text) or samples
             await emit({"type": "log", "data": {"msg": text}})
 
         await _stream_subprocess(proc, on_line)
@@ -242,9 +231,7 @@ async def run_data_ingest(
             await emit({
                 "type": "agent",
                 "data": {
-                    "msg": (
-                        f"✅ Ingestion complete. Dataset **{ds_name}**"
-                    ),
+                    "msg": f"✅ Ingestion complete. Dataset **{ds_name}**",
                     "dataset": ds_name,
                     "samples": samples,
                 },

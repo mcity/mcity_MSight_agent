@@ -30,17 +30,13 @@ def _read_config_state() -> dict:
 
 @mcp.tool()
 async def launch_voxel51_session(dataset_name: str = "") -> str:
+    """Open the FiftyOne App on a dataset (default: the session's labeled dataset, else its
+    selected one), replacing any session already running."""
     target_dataset = dataset_name.strip()
-
     if not target_dataset:
-        try:
-            state = _read_config_state()
-            labeled = state.get("labeled_dataset_name", "")
-            base = state.get("dataset_name", "")
-            target_dataset = labeled if labeled else base
-            logging.warning(f"[V51] Resolved from config state: labeled='{labeled}' base='{base}' -> using '{target_dataset}'")
-        except Exception as e:
-            logging.warning(f"[V51] Error reading config state: {e}")
+        state = _read_config_state()
+        target_dataset = state.get("labeled_dataset_name") or state.get("dataset_name", "")
+        logging.warning(f"[V51] No dataset given; using '{target_dataset}' from the session state")
 
     if not target_dataset:
         return "Could not determine which dataset to visualize. Please provide a dataset name."

@@ -4,6 +4,7 @@ from cloudFormationManager import CloudFormationManager
 from config import Config
 from datetime import datetime
 
+
 class App:
     def __init__(self):
         self.config = Config()
@@ -26,8 +27,6 @@ class App:
             last_name = request.form['last_name'].strip()
             email = request.form['email'].strip().lower()
             organization = request.form['organization'].strip()
-
-            today = self.redis_manager.get_today()
 
             # Whitelisting
             if email not in self.config.WHITELIST:
@@ -67,6 +66,7 @@ class App:
 
     def run(self):
         self.flask_app.run(host='0.0.0.0', port=5000, debug=True)
+
 
 if __name__ == '__main__':
     # Make sure templates directory exists and has form.html

@@ -93,7 +93,7 @@ async def ingest_stream(job_id: str):
                 JOB_LOGS.pop(job_id, None)  # job finished; a reconnect gets the default "done"
                 break
 
-            # Forward each event under its own type (hardcoding "log" hid ingestion errors).
+            # Forward each event under its own type, so errors reach the page as errors.
             try:
                 parsed = json.loads(msg)
             except ValueError:

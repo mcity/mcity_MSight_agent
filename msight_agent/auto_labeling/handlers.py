@@ -9,7 +9,7 @@ from typing import Optional
 
 from msight_agent.agent.routing import (
     Sentinels, HardStop, Injection, FallThrough, ToolRouting,
-    unwrap_tool_output, ANSI_RE,
+    error_text, unwrap_tool_output, ANSI_RE,
 )
 from msight_agent.agent.state import (
     AutoLabelingState, AutoLabelingPhase, LabelingBackend, LabelingPath, config_selected_dataset,
@@ -136,6 +136,13 @@ def _strip_sentinel(message: str) -> str:
     return rest.strip() if sep and head.isupper() and " " not in head else message.strip()
 
 
+def _backend_info(backend: str, message: str, **extra) -> dict:
+    """Backend info for a backend that is already chosen (see _routing_for_backend)."""
+    return {"cvat_available": backend == LabelingBackend.CVAT,
+            "ls_available": backend == LabelingBackend.LABEL_STUDIO,
+            "active_backend": backend, "message": message, **extra}
+
+
 def _backend_label(backend: str) -> str:
     return "Label Studio" if backend == LabelingBackend.LABEL_STUDIO else "CVAT"
 
@@ -173,11 +180,15 @@ def _ls_task_ids_from_registry(dataset_name: str) -> list[int]:
 class AutoLabelingHandlers:
     """Mixin: all auto_labeling-workflow tool handlers. See agent/dispatch.py's ChatPipeline."""
 
+    def _ensure_auto_labeling(self) -> AutoLabelingState:
+        if self.state.auto_labeling is None:
+            self.state.auto_labeling = AutoLabelingState()
+        return self.state.auto_labeling
+
     def _store_backend(self, backend: str) -> None:
         """Persist a detected/chosen backend (BOTH is a sentinel the state hint routes on)."""
         if backend in (LabelingBackend.CVAT, LabelingBackend.LABEL_STUDIO, LabelingBackend.BOTH):
-            if self.state.auto_labeling is None:
-                self.state.auto_labeling = AutoLabelingState()
+            self._ensure_auto_labeling()
             self.state.auto_labeling.labeling_backend = backend
             self.state.save()
 
@@ -275,7 +286,6 @@ class AutoLabelingHandlers:
         initial_backend: str,
         was_dataset_switch: bool,
         path_was_preserved: bool,
-        mcp_client,
     ) -> tuple[str, list[ToolRouting]]:
         """Decide routing after set_selected_dataset returns a non-error result."""
         self.state.dataset_name = dataset_name
@@ -310,13 +320,8 @@ class AutoLabelingHandlers:
                 if was_dataset_switch
                 else f"**{dataset_name}** confirmed."
             )
-            backend_info = {
-                "cvat_available": effective_backend == LabelingBackend.CVAT,
-                "ls_available":   effective_backend == LabelingBackend.LABEL_STUDIO,
-                "active_backend": effective_backend,
-                "message":        f"Using previously confirmed backend: {effective_backend}.",
-                "dataset_note":   dataset_note,
-            }
+            backend_info = _backend_info(effective_backend, f"Using previously confirmed backend: {effective_backend}.",
+                                         dataset_note=dataset_note)
             logging.warning(
                 f"[PIPELINE] Backend preserved for '{dataset_name}': {effective_backend!r}"
             )
@@ -349,12 +354,7 @@ class AutoLabelingHandlers:
             )
             routings: list[ToolRouting] = []
             if self.state.workflow_name == "auto_labeling" and initial_backend:
-                backend_info = {
-                    "cvat_available": initial_backend == LabelingBackend.CVAT,
-                    "ls_available":   initial_backend == LabelingBackend.LABEL_STUDIO,
-                    "active_backend": initial_backend,
-                    "message":        f"Dataset unchanged; backend confirmed: {initial_backend}.",
-                }
+                backend_info = _backend_info(initial_backend, f"Dataset unchanged; backend confirmed: {initial_backend}.")
                 routings = self._routing_for_backend(backend_info)
             return f"Dataset '{dataset_name}' is already confirmed. No change needed.", routings
 
@@ -364,7 +364,7 @@ class AutoLabelingHandlers:
         if Sentinels.DATASET_NOT_FOUND not in tool_output:
             return await self._route_after_dataset_confirmed(
                 tool_output, dataset_name, initial_backend,
-                was_dataset_switch, path_was_preserved, mcp_client,
+                was_dataset_switch, path_was_preserved,
             )
         self.state.dataset_confirmed = False
         return tool_output, [FallThrough()]
@@ -396,8 +396,7 @@ class AutoLabelingHandlers:
             )
             return msg, [FallThrough()]
 
-        if self.state.auto_labeling is None:
-            self.state.auto_labeling = AutoLabelingState()
+        self._ensure_auto_labeling()
         if not self.state.auto_labeling.labeling_path:
             self.state.auto_labeling.labeling_path = LabelingPath.AUTO
             self.state.save()
@@ -481,51 +480,49 @@ class AutoLabelingHandlers:
                     f"{fn_export}(dataset_name={dataset!r}, classes=[...]) immediately. "
                     f"Otherwise ask the user for class names."
                 )]
-            else:  # auto
-                if al.auto_labeling_complete and not (al.cvat_task_ids or al.ls_task_ids):
-                    return [HardStop(
-                        f"The annotation backend is now **{backend_label}**. The predictions from your "
-                        f"last run are ready — say \"export\" and I'll send them to {backend_label} "
-                        f"(no need to re-run the model)."
-                    )]
-                if al.model_configured:
-                    model_name     = al.model_name or "?"
-                    model_source   = al.model_source or "?"
-                    hyperparam_block = f"\nCurrent hyperparameters:\n{self._format_hyperparam_block()}"
-                    return [Injection(
-                        f"BACKEND_SWITCHED: annotation backend is now {backend_label}. "
-                        f"Model {model_name!r} ({model_source}) is still configured.{hyperparam_block}\n"
-                        f"Tell the user the backend was switched and the model is still configured. "
-                        f"If the user's current message also requests a different model, "
-                        f"call configure_auto_labeling immediately (it was already batched if so). "
-                        f"Otherwise ask if they want to modify hyperparameters or proceed."
-                    )]
-                elif al.models_listed:
-                    step_ctx = (
-                        "The model list was already shown. "
-                        "Please select a model to continue."
-                    )
-                else:
-                    step_ctx = "I'll fetch the available models for you to choose from."
-                return [HardStop(f"{ack}{step_ctx}")]
-        else:
-            preamble = f"{dataset_note}\n\n" if dataset_note else ""
-            return [HardStop(
-                f"{preamble}The annotation backend is set to **{backend_label}**.\n\n"
-                f"How would you like to annotate your dataset?\n\n"
-                f"- **Manual Labeling**: I will export your dataset to {backend_label} "
-                f"where you can annotate the images yourself. Once you are done, "
-                f"I will import your labels back.\n"
-                f"- **Auto Generated Labeling**: I will run a detection model of your "
-                f"choice on your dataset to generate predictions automatically, then "
-                f"export to {backend_label} so you can review and correct them."
-            )]
+            # auto
+            if al.auto_labeling_complete and not (al.cvat_task_ids or al.ls_task_ids):
+                return [HardStop(
+                    f"The annotation backend is now **{backend_label}**. The predictions from your "
+                    f"last run are ready — say \"export\" and I'll send them to {backend_label} "
+                    f"(no need to re-run the model)."
+                )]
+            if al.model_configured:
+                model_name     = al.model_name or "?"
+                model_source   = al.model_source or "?"
+                hyperparam_block = f"\nCurrent hyperparameters:\n{self._format_hyperparam_block()}"
+                return [Injection(
+                    f"BACKEND_SWITCHED: annotation backend is now {backend_label}. "
+                    f"Model {model_name!r} ({model_source}) is still configured.{hyperparam_block}\n"
+                    f"Tell the user the backend was switched and the model is still configured. "
+                    f"If the user's current message also requests a different model, "
+                    f"call configure_auto_labeling immediately (it was already batched if so). "
+                    f"Otherwise ask if they want to modify hyperparameters or proceed."
+                )]
+            if al.models_listed:
+                step_ctx = (
+                    "The model list was already shown. "
+                    "Please select a model to continue."
+                )
+            else:
+                step_ctx = "I'll fetch the available models for you to choose from."
+            return [HardStop(f"{ack}{step_ctx}")]
+        preamble = f"{dataset_note}\n\n" if dataset_note else ""
+        return [HardStop(
+            f"{preamble}The annotation backend is set to **{backend_label}**.\n\n"
+            f"How would you like to annotate your dataset?\n\n"
+            f"- **Manual Labeling**: I will export your dataset to {backend_label} "
+            f"where you can annotate the images yourself. Once you are done, "
+            f"I will import your labels back.\n"
+            f"- **Auto Generated Labeling**: I will run a detection model of your "
+            f"choice on your dataset to generate predictions automatically, then "
+            f"export to {backend_label} so you can review and correct them."
+        )]
 
     async def _handle_configure_auto_labeling(
         self, fn_args: dict, mcp_client
     ) -> tuple[str, list[ToolRouting]]:
-        if self.state.auto_labeling is None:
-            self.state.auto_labeling = AutoLabelingState()
+        self._ensure_auto_labeling()
 
         if self.state.auto_labeling.model_configured:
             self.state.auto_labeling.reset_from_step("model_configured")
@@ -565,8 +562,7 @@ class AutoLabelingHandlers:
     async def _handle_set_auto_labeling_hyperparams(
         self, fn_args: dict, mcp_client
     ) -> tuple[str, list[ToolRouting]]:
-        if self.state.auto_labeling is None:
-            self.state.auto_labeling = AutoLabelingState()
+        self._ensure_auto_labeling()
 
         ok, msg = self.state.auto_labeling.can_set_auto_labeling_hyperparams()
         if not ok:
@@ -597,16 +593,14 @@ class AutoLabelingHandlers:
         self, fn_args: dict, mcp_client
     ) -> tuple[str, list[ToolRouting]]:
         """Set localization_enabled on success (chat tracking only)."""
-        if self.state.auto_labeling is None:
-            self.state.auto_labeling = AutoLabelingState()
+        self._ensure_auto_labeling()
 
         result = unwrap_tool_output(
             await mcp_client.call_tool("set_msight_localization_config", fn_args)
         )
 
         if Sentinels.MSIGHT_LOCALIZATION_ERROR in result:
-            err = result.split(":", 1)[1].strip() if ":" in result else result
-            return result, [HardStop(err)]
+            return result, [HardStop(error_text(result))]
 
         self.state.auto_labeling.localization_enabled = fn_args.get("enabled", True)
         self.state.save()
@@ -615,8 +609,7 @@ class AutoLabelingHandlers:
         )]
 
     async def _handle_confirm_export(self) -> tuple[str, list[ToolRouting]]:
-        if self.state.auto_labeling is None:
-            self.state.auto_labeling = AutoLabelingState()
+        self._ensure_auto_labeling()
 
         # Only record consent for a summary the user actually saw; don't trust the tool filter.
         if not self.state.auto_labeling.export_awaiting_confirmation:
@@ -709,8 +702,7 @@ class AutoLabelingHandlers:
         with_predictions = fn_args.get("with_predictions", False)
 
         if self.state.workflow_name == "auto_labeling":
-            if self.state.auto_labeling is None:
-                self.state.auto_labeling = AutoLabelingState()
+            self._ensure_auto_labeling()
 
             if self.state.auto_labeling.labeling_path == LabelingPath.AUTO and not with_predictions:
                 if not self.state.auto_labeling.auto_labeling_complete:
@@ -759,8 +751,7 @@ class AutoLabelingHandlers:
             )]
 
         if not with_predictions and fn_args.get("classes"):
-            if self.state.auto_labeling is None:
-                self.state.auto_labeling = AutoLabelingState()
+            self._ensure_auto_labeling()
             self.state.auto_labeling.manual_classes = fn_args["classes"]
             self.state.save()
 
@@ -768,7 +759,7 @@ class AutoLabelingHandlers:
 
         # 0 images exported: no task ids recorded and the phase doesn't advance (stays Zone A).
         if export_empty(result):
-            detail = result.split(":", 1)[1].strip() if ":" in result else result
+            detail = error_text(result)
             logging.warning(f"[PIPELINE] {tool_name}: empty export — {detail}")
             return result, [HardStop(
                 f"{detail}\n\n"
@@ -790,14 +781,14 @@ class AutoLabelingHandlers:
             Sentinels.CVAT_NOT_FOUND, Sentinels.CVAT_CONNECTION_ERROR, Sentinels.CVAT_TIMEOUT_ERROR,
             "CVAT upload failed:",
         ]):
-            err = result.split(":", 1)[1].strip() if ":" in result else result
+            err = error_text(result)
             return [HardStop(err)]
 
         if any(s in result for s in [
             Sentinels.LS_AUTH_ERROR, Sentinels.LS_CONNECTION_ERROR,
             Sentinels.LS_BACKEND_ERROR, Sentinels.BACKEND_NOT_SET,
         ]):
-            err = result.split(":", 1)[1].strip() if ":" in result else result
+            err = error_text(result)
             return [HardStop(err)]
 
         return None
@@ -854,8 +845,7 @@ class AutoLabelingHandlers:
 
     def _run_gate(self) -> Optional[tuple[str, list[ToolRouting]]]:
         """Preconditions + consent for a run: None when it may start, else the response."""
-        if self.state.auto_labeling is None:
-            self.state.auto_labeling = AutoLabelingState()
+        self._ensure_auto_labeling()
 
         ok, msg = self.state.auto_labeling.can_run_auto_labeling(
             self.state.dataset_confirmed, self.state.dataset_name,
@@ -955,12 +945,7 @@ class AutoLabelingHandlers:
             logging.warning(
                 f"[PIPELINE] set_labeling_backend: '{requested}' already confirmed — no-op"
             )
-            backend_info = {
-                "cvat_available": requested == LabelingBackend.CVAT,
-                "ls_available":   requested == LabelingBackend.LABEL_STUDIO,
-                "active_backend": requested,
-                "message":        f"Backend already confirmed: {requested}.",
-            }
+            backend_info = _backend_info(requested, f"Backend already confirmed: {requested}.")
             return (
                 f"Backend is already set to {requested}. No change needed.",
                 self._routing_for_backend(backend_info),
@@ -968,21 +953,13 @@ class AutoLabelingHandlers:
 
         result = unwrap_tool_output(await mcp_client.call_tool("set_labeling_backend", fn_args))
         # LS_BACKEND_ERROR covers missing credentials for either backend.
-        _backend_error_sentinels = [Sentinels.LS_BACKEND_ERROR, "Invalid backend"]
-        if any(s in result for s in _backend_error_sentinels):
-            err = result.split(":", 1)[1].strip() if ":" in result else result
-            return result, [HardStop(err)]
-        if self.state.auto_labeling is None:
-            self.state.auto_labeling = AutoLabelingState()
+        if any(s in result for s in (Sentinels.LS_BACKEND_ERROR, "Invalid backend")):
+            return result, [HardStop(error_text(result))]
+        self._ensure_auto_labeling()
         self.state.auto_labeling.labeling_backend = requested
         logging.warning(f"[PIPELINE] set_labeling_backend: {current!r} → {requested!r}")
         self.state.save()
-        backend_info = {
-            "cvat_available": requested == LabelingBackend.CVAT,
-            "ls_available":   requested == LabelingBackend.LABEL_STUDIO,
-            "active_backend": requested,
-            "message":        f"Backend confirmed: {requested}.",
-        }
+        backend_info = _backend_info(requested, f"Backend confirmed: {requested}.")
         return result, self._routing_for_backend(backend_info)
 
     async def _handle_set_labeling_path(
@@ -1009,9 +986,7 @@ class AutoLabelingHandlers:
                 "Please name one and I will set it up."
             )]
 
-        if self.state.auto_labeling is None:
-            self.state.auto_labeling = AutoLabelingState()
-        al = self.state.auto_labeling
+        al = self._ensure_auto_labeling()
         # Mid-Zone-A path switch: reset downstream state but keep dataset and backend.
         if al.labeling_path and al.labeling_path != path:
             preserved_backend = al.labeling_backend
@@ -1026,7 +1001,6 @@ class AutoLabelingHandlers:
         self.state.save()
         logging.warning(f"[PIPELINE] set_labeling_path: path={path!r}")
         result = f"Labeling path set to '{path}'."
-        al = self.state.auto_labeling
         if path == LabelingPath.MANUAL:
             if al.manual_classes:
                 classes_s = ", ".join(al.manual_classes)
@@ -1047,13 +1021,13 @@ class AutoLabelingHandlers:
                 f"{fn_export}(dataset_name={dataset!r}, classes=[...]) immediately. "
                 f"Otherwise ask for annotation class names (e.g., car, pedestrian, cyclist)."
             )]
-        else:  # auto
-            return result, [Injection(
-                "LABELING_PATH_SET: auto. "
-                "Tell the user Auto Generated Labeling has been selected. "
-                "Then proceed to STEP R1: call list_model_sources_and_models() immediately. "
-                "Do NOT re-present the labeling path options."
-            )]
+        # auto
+        return result, [Injection(
+            "LABELING_PATH_SET: auto. "
+            "Tell the user Auto Generated Labeling has been selected. "
+            "Then proceed to STEP R1: call list_model_sources_and_models() immediately. "
+            "Do NOT re-present the labeling path options."
+        )]
 
     async def _handle_export_to_label_studio(
         self, fn_args: dict, mcp_client
@@ -1069,8 +1043,7 @@ class AutoLabelingHandlers:
                 return msg, [FallThrough()]
         result = unwrap_tool_output(await self._call_tool_with_progress(mcp_client, "import_from_label_studio", fn_args))
         if Sentinels.LS_NO_ANNOTATIONS in result:
-            err = result.split(":", 1)[1].strip() if ":" in result else result
-            return result, [HardStop(err)]
+            return result, [HardStop(error_text(result))]
         return result, [HardStop(self._finalize_import(fn_args, result))]
 
     async def _handle_launch_voxel51(
@@ -1265,8 +1238,7 @@ class AutoLabelingHandlers:
 
     async def _handle_confirm_auto_labeling_run(self) -> tuple[str, list[ToolRouting]]:
         """auto_labeling branch of confirm_run."""
-        if self.state.auto_labeling is None:
-            self.state.auto_labeling = AutoLabelingState()
+        self._ensure_auto_labeling()
 
         # Last checkpoint before a run that locks the workflow: only record consent for
         # a summary the user actually saw; don't trust the tool filter.

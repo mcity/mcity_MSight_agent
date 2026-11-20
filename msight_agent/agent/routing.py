@@ -82,6 +82,11 @@ def tool_status(result: str) -> str | None:
     return parsed.get("status") if isinstance(parsed, dict) else None
 
 
+def error_text(result: str) -> str:
+    """A tool's error message without its leading "SENTINEL:" prefix."""
+    return result.split(":", 1)[1].strip() if ":" in result else result
+
+
 def format_reply(message: str, source: str | None) -> str:
     """send_reply's text, with a [source: ...] tag when the model supplied one."""
     if source and source.strip():

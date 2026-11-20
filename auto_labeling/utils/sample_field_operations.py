@@ -10,9 +10,9 @@ def add_sample_field(
     type_dataset = fo.core.dataset.Dataset
     type_dataset_view = fo.core.view.DatasetView
     try:
-        if type(v51_dataset_or_view) == type_dataset:
+        if type(v51_dataset_or_view) is type_dataset:
             dataset_operation = v51_dataset_or_view
-        elif type(v51_dataset_or_view) == type_dataset_view:
+        elif type(v51_dataset_or_view) is type_dataset_view:
             dataset_operation = fo.load_dataset(v51_dataset_or_view.dataset_name)
         else:
             logging.error(
@@ -29,9 +29,9 @@ def rename_sample_field(v51_dataset_or_view, v51_field_old, v51_field_new):
     type_dataset = fo.core.dataset.Dataset
     type_dataset_view = fo.core.view.DatasetView
     try:
-        if type(v51_dataset_or_view) == type_dataset:
+        if type(v51_dataset_or_view) is type_dataset:
             dataset_operation = v51_dataset_or_view
-        elif type(v51_dataset_or_view) == type_dataset_view:
+        elif type(v51_dataset_or_view) is type_dataset_view:
             dataset_operation = fo.load_dataset(v51_dataset_or_view.dataset_name)
         else:
             logging.error(

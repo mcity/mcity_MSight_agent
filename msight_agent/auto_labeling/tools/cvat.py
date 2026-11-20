@@ -1,55 +1,48 @@
-import os
-import json
-import time
-import uuid
 import asyncio
-import zipfile
-import tempfile
+import json
 import logging
-import requests
+import math
+import os
+import tempfile
+import time
 import traceback
+import uuid
+import zipfile
 from pathlib import Path
-from dotenv import load_dotenv
 
 import fiftyone as fo
 import fiftyone.types as fot
-from fastmcp import Context
+import requests
 from cvat_sdk import make_client
+from cvat_sdk.core.progress import ProgressReporter
+from cvat_sdk.core.proxies.tasks import ResourceType
+from dotenv import load_dotenv
+from fastmcp import Context
+
 from msight_agent.shared.mcp import mcp
+from msight_agent.shared.paths import ANNOTATION_TASKS_DIR
 
 load_dotenv()
 
-from msight_agent.shared.paths import ANNOTATION_TASKS_DIR
 CVAT_URL        = os.getenv("CVAT_URL", "https://app.cvat.ai")
 CVAT_TASKS_FILE = ANNOTATION_TASKS_DIR / "cvat_tasks.json"
 
-# Uploads go through CVAT's chunked uploader (create_from_data), which handles
-# large payloads fine -- this cap just keeps datasets that fit in fewer tasks
-# from using more of the account's limited task budget than they need to.
+# Preferred images per task: fewer, fuller tasks save the account's small task budget.
 CVAT_MAX_FILES_PER_TASK = 11000
-
-# Account-wide total, not reserved per export -- export_to_cvat checks current
-# usage and batches into whatever's actually free. HARD_LIMIT is the fallback
-# ceiling when slots are scarce and batches must grow past the preferred size.
+# The account's task limit. Exports batch into the slots free right now; when those are
+# scarce, batches grow up to the hard limit.
 CVAT_MAX_CONCURRENT_TASKS = 3
 CVAT_UPLOAD_HARD_LIMIT = 35000
+# Errors worth retrying: gateway timeouts and the server dropping a long request.
+_TRANSIENT_ERRORS = ("504", "502", "503", "Gateway Timeout", "Service Unavailable",
+                     "Status Code: 499", "Client Closed Request")
 
 
 def _compute_cvat_batches(image_paths: list, max_tasks: int) -> list:
-    """Split image_paths into <= max_tasks batches, each within
-    CVAT_UPLOAD_HARD_LIMIT files. Returns [] if the dataset can't fit.
-
-    max_tasks is the number of task slots actually free on the account right
-    now (CVAT_MAX_CONCURRENT_TASKS minus whatever's already there), not the
-    raw account ceiling -- a dataset needing exactly 3 tasks has zero margin
-    if even one unrelated task already exists.
-    """
-    import math
-
+    """Split image_paths into at most max_tasks batches (the task slots free right now),
+    each within CVAT_UPLOAD_HARD_LIMIT files. Returns [] if the dataset can't fit."""
     total = len(image_paths)
     if total == 0 or max_tasks <= 0:
-        # total == 0 would make batch_size 0 and raise on range(0, 0, 0);
-        # callers reject an empty dataset before this point anyway.
         return []
     if total <= CVAT_MAX_FILES_PER_TASK:
         batch_size = total
@@ -64,15 +57,16 @@ def _compute_cvat_batches(image_paths: list, max_tasks: int) -> list:
 
     return [image_paths[i:i + batch_size] for i in range(0, total, batch_size)]
 
+
 def _get_cvat_token() -> str | None:
-    """Read token fresh each call so credential changes take effect without restart."""
+    """Read fresh each call, so a changed token works without a restart."""
     load_dotenv(override=True)
     return os.getenv("CVAT_ACCESS_TOKEN")
 
 
 def _load_task_registry() -> dict:
     if CVAT_TASKS_FILE.exists():
-        with open(CVAT_TASKS_FILE, "r") as f:
+        with open(CVAT_TASKS_FILE) as f:
             return json.load(f)
     return {}
 
@@ -84,11 +78,8 @@ def _save_task_registry(registry: dict):
 
 
 def _make_cvat_progress_reporter(ctx, loop, task_name: str):
-    """Bridges CVAT SDK's (synchronous) ProgressReporter callbacks to ctx.log()
-    (async), the same run_coroutine_threadsafe pattern used for HF downloads
-    in workflow_selector.py's _load_dataset_with_progress."""
-    from cvat_sdk.core.progress import ProgressReporter
-
+    """A CVAT SDK progress reporter (called from a worker thread) that logs to ctx at most
+    every 15s."""
     class _Reporter(ProgressReporter):
         def __init__(self):
             self._total = 0
@@ -127,22 +118,11 @@ def _make_cvat_progress_reporter(ctx, loop, task_name: str):
 def _create_and_upload_batch(
     client, task_name: str, batch_paths: list, classes: list, ctx=None, loop=None,
 ) -> int:
-    """Create one CVAT task and upload its images via CVAT's own chunked
-    uploader (create_from_data -> DataUploader), which auto-splits into
-    <=100MB requests and falls back to TUS for any single file larger than
-    that. This replaces a raw single-multipart create_data() call that sent
-    every image in the batch as one unbounded request -- that was hitting
-    server-side connection drops (499) on large batches; this is the upload
-    path CVAT's own SDK recommends for local files (see cvat-ai/cvat #1616,
-    PR #3692 "Large files uploads"). Runs synchronously -- callers should
-    offload via asyncio.to_thread.
-    """
-    from cvat_sdk.core.proxies.tasks import ResourceType
-
+    """Create one CVAT task and upload its images with the SDK's chunked uploader, which
+    splits large uploads into requests the server accepts. Blocking: run it in a thread."""
     pbar = _make_cvat_progress_reporter(ctx, loop, task_name) if ctx and loop else None
-
-    _RETRIES = 3
-    for attempt in range(_RETRIES):
+    retries = 3
+    for attempt in range(retries):
         try:
             task = client.tasks.create_from_data(
                 spec={"name": task_name, "labels": [{"name": c} for c in classes]},
@@ -156,15 +136,8 @@ def _create_and_upload_batch(
             )
             return task.id
         except Exception as upload_err:
-            err_str_u = str(upload_err)
-            is_transient = any(
-                code in err_str_u for code in (
-                    "504", "502", "503", "Gateway Timeout",
-                    "Status Code: 499", "Client Closed Request",
-                )
-            )
-            # create_from_data creates + uploads in one call, so a failed upload
-            # may leave the task behind -- remove it by name before retrying.
+            is_transient = any(code in str(upload_err) for code in _TRANSIENT_ERRORS)
+            # A failed upload can leave its task behind: remove it by name before retrying.
             for t in client.tasks.list():
                 if t.name == task_name:
                     try:
@@ -172,22 +145,19 @@ def _create_and_upload_batch(
                         logging.warning(f"[CVAT] Cleaned up partial task {t.id} before retry")
                     except Exception:
                         pass
-            if is_transient and attempt < _RETRIES - 1:
+            if is_transient and attempt < retries - 1:
                 logging.warning(
-                    f"[CVAT] Upload failed (attempt {attempt+1}/{_RETRIES}), "
+                    f"[CVAT] Upload failed (attempt {attempt+1}/{retries}), "
                     f"retrying in {5*(attempt+1)}s..."
                 )
                 time.sleep(5 * (attempt + 1))
                 continue
             raise
-
-    # Unreachable (the loop always returns or raises), but keeps type checkers happy.
     raise RuntimeError("Image upload failed after all retries.")
 
 
 def _attach_predictions(client, task_id: int, batch_view, label_field: str) -> None:
-    """Export a batch's predictions as CVAT XML and attach them to its task.
-    Runs synchronously -- callers should offload via asyncio.to_thread."""
+    """Export a batch's predictions as CVAT XML and attach them to its task. Blocking."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         batch_view.export(
             export_dir=tmp_dir,
@@ -214,15 +184,15 @@ async def export_to_cvat(
     classes: list = None,
     ctx: Context = None,
 ) -> str:
-    CVAT_TOKEN = _get_cvat_token()
-    if not CVAT_TOKEN:
+    """Export a FiftyOne dataset to CVAT: images only (manual labelling) or with the model's
+    predictions (auto). Large datasets are split across the account's free task slots."""
+    token = _get_cvat_token()
+    if not token:
         return "CVAT_ACCESS_TOKEN not set in .env"
 
     try:
-        # fo.load_dataset() returns a process-wide singleton keyed by name — if this
-        # process already loaded this dataset earlier (e.g. during selection/listing),
-        # its in-memory schema can be stale relative to fields another process (the
-        # auto-labeling subprocess) just wrote. reload() forces a resync from Mongo.
+        # load_dataset returns a per-process singleton whose schema can be stale after the
+        # auto-labeling subprocess wrote new fields; reload() resyncs it.
         dataset = fo.load_dataset(dataset_name)
         dataset.reload()
     except Exception as e:
@@ -231,9 +201,7 @@ async def export_to_cvat(
     try:
         image_paths = [sample.filepath for sample in dataset]
 
-        # Checked before anything else: an empty export gives the user nothing to
-        # annotate, and an empty CVAT task cannot be imported back. Stopping here
-        # also skips the 20-second prediction-field poll below.
+        # An empty CVAT task can't be imported back, so stop before creating one.
         if not image_paths:
             logging.warning(f"[CVAT] export_to_cvat: dataset '{dataset_name}' has no images")
             return (
@@ -275,17 +243,16 @@ async def export_to_cvat(
 
         loop = asyncio.get_running_loop()
         created_task_ids = []
-        with make_client(CVAT_URL, access_token=CVAT_TOKEN) as client:
-            # Check slots actually free right now, not just the account ceiling.
+        with make_client(CVAT_URL, access_token=token) as client:
             existing_task_count = len(client.tasks.list())
             available_slots = CVAT_MAX_CONCURRENT_TASKS - existing_task_count
-            batches = _compute_cvat_batches(image_paths, available_slots)
             if available_slots <= 0:
                 return (
                     f"CVAT_TASK_LIMIT_REACHED: This CVAT account allows {CVAT_MAX_CONCURRENT_TASKS} tasks "
                     f"and already has {existing_task_count}, so there is no room for '{dataset_name}'. "
                     f"Delete some existing tasks at {CVAT_URL}, or use Label Studio instead."
                 )
+            batches = _compute_cvat_batches(image_paths, available_slots)
             if not batches:
                 return (
                     f"CVAT_TASK_LIMIT_REACHED: '{dataset_name}' has {len(image_paths)} images, more than "
@@ -333,7 +300,7 @@ async def export_to_cvat(
             registry = _load_task_registry()
             registry[dataset_name] = {
                 "task_ids": created_task_ids,
-                "uploaded_at": str(Path(__file__).stat().st_mtime),
+                "uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "with_predictions": with_predictions,
                 "manual_classes": classes if not with_predictions else [],
             }
@@ -361,17 +328,14 @@ async def export_to_cvat(
         err_str = str(e)
         tb = traceback.format_exc()
 
-        if any(code in err_str for code in (
-            "504", "502", "503", "Gateway Timeout", "Service Unavailable",
-            "Status Code: 499", "Client Closed Request",
-        )):
+        if any(code in err_str for code in _TRANSIENT_ERRORS):
             return (
                 "CVAT_TIMEOUT_ERROR: CVAT timed out while uploading images. "
                 "This usually happens with large datasets or when the CVAT server is under load. "
                 "Please try again."
             )
         if "403" in err_str or "Forbidden" in err_str:
-            # Same 403 as an expired token -- check storage quota first so we don't misreport it.
+            # Quota errors are also 403s: check for them before blaming the token.
             if "maximum usage of internal storage" in err_str or "maximum usage of internal storage" in tb:
                 return (
                     "CVAT_STORAGE_LIMIT_REACHED: Your CVAT account has reached its storage quota — "
@@ -408,15 +372,11 @@ async def export_to_cvat(
 
 
 def _download_and_import_task(task_id: int, data_path: str, dataset_name: str) -> tuple:
-    """Download one CVAT task's annotations and import them into a throwaway
-    temp dataset. Returns (temp_dataset_name, error_message); exactly one is
-    None. Runs synchronously -- callers should offload via asyncio.to_thread.
-    """
-    CVAT_TOKEN = _get_cvat_token()
-    headers = {"Authorization": f"Bearer {CVAT_TOKEN}"}
+    """Download one task's annotations into a temporary dataset. Returns
+    (temp_dataset_name, error); exactly one is None. Blocking."""
+    headers = {"Authorization": f"Bearer {_get_cvat_token()}"}
 
-    # Guard against a stale registry merging another dataset's annotations in
-    # (real risk if two datasets share generic filenames like "0001.jpg").
+    # A stale registry could merge another dataset's annotations (generic names like 0001.jpg).
     task_resp = requests.get(f"{CVAT_URL}/api/tasks/{task_id}", headers=headers)
     if task_resp.status_code != 200:
         return None, f"Could not verify task {task_id} ownership: {task_resp.status_code} {task_resp.text}"
@@ -449,7 +409,7 @@ def _download_and_import_task(task_id: int, data_path: str, dataset_name: str) -
         if status == "finished":
             result_url = status_data.get("result_url")
             break
-        elif status == "failed":
+        if status == "failed":
             logging.warning(f"[CVAT] annotation export job failed: {status_data}")
             return None, (
                 "CVAT reported that the annotation export job failed. "
@@ -503,16 +463,16 @@ def _download_and_import_task(task_id: int, data_path: str, dataset_name: str) -
 
 @mcp.tool()
 async def import_from_cvat(dataset_name: str, ctx: Context = None) -> str:
-    CVAT_TOKEN = _get_cvat_token()
-    if not CVAT_TOKEN:
+    """Import the finished CVAT annotations for a dataset as a new dataset
+    <dataset_name>_labeled, with the labels in 'ground_truth'."""
+    if not _get_cvat_token():
         return "CVAT_ACCESS_TOKEN not set in .env"
 
     registry = _load_task_registry()
     if dataset_name not in registry:
         return f"No CVAT task found for dataset '{dataset_name}'. Please upload it first."
 
-    # "task_ids" (plural, list) is the current format; fall back to the older
-    # single "task_id" entries from before multi-task chunking existed.
+    # Older registry entries have a single "task_id".
     task_ids = registry[dataset_name].get("task_ids")
     if not task_ids:
         legacy_id = registry[dataset_name].get("task_id")

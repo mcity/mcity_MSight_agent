@@ -29,7 +29,7 @@ Quick start
 """
 
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -342,4 +342,3 @@ def _apply_augmentation(aug, img_np, raw_boxes, raw_keypoints):
 def fo_kp_collate_fn(batch):
     imgs, targets = zip(*batch)
     return list(imgs), list(targets)
-

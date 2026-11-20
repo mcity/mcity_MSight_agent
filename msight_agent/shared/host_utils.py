@@ -1,3 +1,4 @@
+"""Where this host is reachable from: its EC2 public IP (via IMDSv2) or localhost."""
 import logging
 
 import requests

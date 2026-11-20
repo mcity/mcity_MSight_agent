@@ -12,8 +12,8 @@ GPU works.
 Needs mcp_server.py, msight_api.py, chat_server.py and an LLM provider running
 (~1.5 min per scenario per run).
 
-    ../.venv/bin/python3 evals/fault_injection_eval.py
-    ../.venv/bin/python3 evals/fault_injection_eval.py --runs 3 --scenarios kill_detector topic_typo
+    .venv/bin/python3 -m msight_agent.evals.fault_injection_eval
+    .venv/bin/python3 -m msight_agent.evals.fault_injection_eval --runs 3 --scenarios kill_detector topic_typo
 """
 import argparse
 import glob

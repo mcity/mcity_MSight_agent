@@ -24,7 +24,7 @@ _DEFAULT_DATASETS_YAML = Path(__file__).resolve().parents[1] / "config" / "datas
 def get_supported_datasets(config_path=_DEFAULT_DATASETS_YAML):
     """Returns a list of supported dataset names from the config file."""
     try:
-        with open(config_path, "r") as file:
+        with open(config_path) as file:
             config = yaml.safe_load(file)
 
         return [dataset["name"] for dataset in config["datasets"]]
@@ -253,7 +253,7 @@ def _hf_token():
     if token := os.environ.get("HF_TOKEN", "").strip():
         return token
     try:
-        with open(".secret", "r") as f:
+        with open(".secret") as f:
             for line in f:
                 if line.startswith("HF_TOKEN="):
                     return line.split("=", 1)[1].strip()
@@ -465,6 +465,7 @@ def load_fisheye_8k(dataset_info):
 
     return dataset
 
+
 def load_fisheye_8k_mini(dataset_info):
     """Loads a fisheye 8k mini dataset from FiftyOne, creating it from HuggingFace if it doesn't exist locally."""
 
@@ -480,7 +481,10 @@ def load_fisheye_8k_mini(dataset_info):
 
     return dataset
 
+
 from config.config import SELECTED_DATASET
+
+
 def load_custom_dataset(dataset_info=None):
     """
     Loads a dataset from FiftyOne's persistent store using the name from SELECTED_DATASET.
@@ -520,6 +524,7 @@ def load_mars_multiagent(dataset_info):
 def load_mars_multitraversal(dataset_info):
     """MARS multi-traversal (./datasets/MARS/...): loading is not implemented yet."""
     raise NotImplementedError("Loading the MARS multi-traversal dataset is not implemented yet.")
+
 
 def load_sunrgbd(dataset_info):
     dataset_name = dataset_info["name"]
@@ -571,7 +576,7 @@ def load_mcity_31k(dataset_info):
         dataset = fo.load_dataset(dataset_name)
         logging.info("Existing dataset " + dataset_name + " was loaded.")
     else:
-       dataset = load_from_hub(hf_dataset_name, name=dataset_name)
-       _post_process_dataset(dataset)
+        dataset = load_from_hub(hf_dataset_name, name=dataset_name)
+        _post_process_dataset(dataset)
 
     return dataset

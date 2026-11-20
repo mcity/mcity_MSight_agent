@@ -31,7 +31,7 @@ import fiftyone as fo
 
 from msight_base.detection import DetectionResultBase
 
-from localization.utils.fiftyone_to_msight_det import fo_detections_to_msight, DetectedObject2D
+from localization.utils.fiftyone_to_msight_det import fo_detections_to_msight
 
 
 def _is_valid(x) -> bool:

@@ -1,4 +1,3 @@
-import os
 import psutil
 
 #: Select workflow list from 'WORKFLOWS = {...}' dictionary
@@ -76,10 +75,10 @@ WORKFLOWS = {
             "configs": [
                 # "rfdetr_nano",
                 # "rfdetr_small",
-                 #"rfdetr_medium",
-                #"rfdetr_large",
-		#"rfdetr_xlarge",
-  "rfdetr_2xlarge",
+                # "rfdetr_medium",
+                # "rfdetr_large",
+                # "rfdetr_xlarge",
+                "rfdetr_2xlarge",
             ],
             # Fallback HuggingFace repo to download best.pt from when no local model is found.
             # Maps config name → HF repo ID. Set to None to skip HF fallback for that config.
@@ -120,7 +119,7 @@ WORKFLOWS = {
             # ── FiftyOne-native mode (no COCO export needed) ──────────
             "fo_native": True,                      # read directly from FiftyOne
             "detection_field": "ground_truth",      # fo.Detections field name
-            "keypoint_field":  "pedestrian_points", # fo.Keypoints field name
+            "keypoint_field":  "pedestrian_points",  # fo.Keypoints field name
             "target_label":    "pedestrian",        # only this label is used
             "class_names":     ["pedestrian"],
             "num_classes":     1,
@@ -138,10 +137,8 @@ WORKFLOWS = {
             "lr_encoder": None,
             "resolution": 880,  # rfdetr_2xlarge=880, xlarge=700, base/large=560
             # ── Pre-trained weights ───────────────────────────────────
-            # Start from the COCO-pretrained checkpoint to benefit from
-            # the bbox head warm-start; keypoint head is re-initialised.
-            # Path was previously /home/dataengine/... (wrong machine path → silently
-            # skipped, model started randomly → TPs=0 all training). Fixed to NFS path.
+            # COCO-pretrained checkpoint: warm-starts the bbox head; the keypoint head is re-initialised.
+            # If this path doesn't exist, training silently starts from random weights.
             "pretrain_weights": "/nfs/turbo/coe-mcity/rpatnaik/Mcity/rf-detr-data-engine/mcity_data_engine/output/models/rfdetr_kp/coco-2017-keypoints/rfdetr_2xlarge/best.pt",
         },
         "vitpose": {  # Standalone ViTPose-B fine-tuning on GT RoI crops
@@ -152,10 +149,10 @@ WORKFLOWS = {
             "resume_weights": None,        # set to vitpose_best.pt path to continue training from a checkpoint
             "vitpose_save_dir": "output/models/vitpose/",
             # ── Dataset / annotation ───────────────────────────────────────────────
-            "detection_field": "ground_truth", #"pred_od_rfdetr_2xlarge-ashley-huron-jan-2026",  # RF-DETR predicted boxes
+            "detection_field": "ground_truth",  # "pred_od_rfdetr_2xlarge-ashley-huron-jan-2026",  # RF-DETR predicted boxes
             "detection_conf_thresh": 0.2,           # min confidence for RF-DETR pedestrian boxes
-            "keypoint_field":  "pedestrian_points", # fo.Keypoints with ankle keypoints (GT)
-            "target_label":    "pedestrian",             #"class_3",           # label used in detection_field for pedestrians
+            "keypoint_field":  "pedestrian_points",  # fo.Keypoints with ankle keypoints (GT)
+            "target_label":    "pedestrian",             # "class_3",           # label used in detection_field for pedestrians
             "keypoint_names":  ["ankle_center"],
             "kp_sigma": 0.089,
             # ── Training parameters ────────────────────────────────────────────────
@@ -184,13 +181,13 @@ WORKFLOWS = {
             "multi_scale": False,
             "cos_lr": True,
             "models": {  # Pick from https://docs.ultralytics.com/models/
-                #"yolo11n": {"batch_size": 8, "img_size": 1280},
-                #"yolo11x": {"batch_size": 1, "img_size": 960},
-                #"yolo12n": {"batch_size": 8, "img_size": 1280},
-                #"yolo12x": {"batch_size": 1, "img_size": 960},
-		#"yolo26x": {"batch_size": 1, "img_size": 960},
-		#"yolo26l": {"batch_size": 1, "img_size": 960},
-#		"yolo26m": {"batch_size": 1, "img_size": 960},
+                # "yolo11n": {"batch_size": 8, "img_size": 1280},
+                # "yolo11x": {"batch_size": 1, "img_size": 960},
+                # "yolo12n": {"batch_size": 8, "img_size": 1280},
+                # "yolo12x": {"batch_size": 1, "img_size": 960},
+                # "yolo26x": {"batch_size": 1, "img_size": 960},
+                # "yolo26l": {"batch_size": 1, "img_size": 960},
+                # "yolo26m": {"batch_size": 1, "img_size": 960},
             },
         },
     },

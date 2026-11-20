@@ -261,8 +261,6 @@ def test_auto_labeling_tools_auto_path_complete_not_imported_ls():
     assert result == ALWAYS | {"import_from_label_studio"}
 
 
-
-
 def test_auto_labeling_tools_run_done_export_failed_offers_retry_not_import():
     state = _al_state(
         labeling_path="auto", labeling_backend=LabelingBackend.CVAT,

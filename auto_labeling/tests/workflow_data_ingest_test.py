@@ -5,7 +5,6 @@ from config import config
 from workflows.data_ingest import run_data_ingest
 from utils.logging import configure_logging
 import logging
-import os
 
 
 @pytest.fixture(autouse=True)

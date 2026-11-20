@@ -3,7 +3,6 @@
 from msight_agent.agent import workflow_tools  # noqa: F401
 from msight_agent.auto_labeling.tools import (  # noqa: F401
     cvat,
-    data_ingest,
     label_studio,
     labeling,
     voxel51,

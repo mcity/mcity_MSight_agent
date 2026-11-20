@@ -139,10 +139,10 @@ class Scenario:
     kinds: tuple[str, ...]            # acceptable kinds for the primary incident
     node: Optional[str]               # expected node (substring of the incident's node field)
     human: Optional[bool]             # expected requires_human (None: either is fine)
+    truth: str                        # what was injected, in plain words (the ground truth for labelling)
     fixable: bool = False             # a scoped restart fixes it (autonomy fix should fix, not escalate)
     detect_timeout: float = 90
     camera_only: bool = False
-    note: str = ""
     restore: Optional[Callable[[], None]] = None   # extra cleanup beyond the baseline
 
 
@@ -168,54 +168,63 @@ def _add_broken_detector() -> None:
 
 SCENARIOS = [
     Scenario("kill_detector", "node", lambda: inject.kill("rfdetr_detector"),
-             ("CONTAINER_KILLED",), "rfdetr_detector", False, fixable=True),
-    Scenario("oom_detector", "node",
-             lambda: inject.oom("rfdetr_detector", inject.OOM_LIMIT),
-             ("CONTAINER_OOM",), "rfdetr_detector", None, fixable=True, detect_timeout=120),
+             ("CONTAINER_KILLED",), "rfdetr_detector", False, fixable=True,
+             truth="docker kill on the detector (SIGKILL through the Docker API)"),
+    Scenario("oom_detector", "node", lambda: inject.oom("rfdetr_detector", inject.OOM_LIMIT),
+             ("CONTAINER_OOM",), "rfdetr_detector", None, fixable=True, detect_timeout=120,
+             truth="a 700 MB memory cap applied with docker update; the detector is OOM-killed"),
     Scenario("exit_detector", "node", lambda: inject.exit_cleanly("rfdetr_detector"),
-             ("CONTAINER_EXITED",), "rfdetr_detector", False, fixable=True),
+             ("CONTAINER_EXITED",), "rfdetr_detector", False, fixable=True,
+             truth="SIGINT inside the detector container; it exits 0 and Docker doesn't restart it"),
     Scenario("freeze_detector", "node", lambda: inject.freeze("rfdetr_detector"),
-             ("NODE_UNRESPONSIVE", "PIPELINE_DEGRADED"), "rfdetr_detector", False, fixable=True),
+             ("NODE_UNRESPONSIVE", "PIPELINE_DEGRADED"), "rfdetr_detector", False, fixable=True,
+             truth="docker pause on the detector"),
     Scenario("broken_config_node", "node", _add_broken_detector, ("CONTAINER_CRASHED",), "detector_2", True,
-             detect_timeout=180, note="crash loop from a bad config on an added node",
-             restore=lambda: api("POST", "/nodes/remove", {"name": "detector_2"})),
+             detect_timeout=180, restore=lambda: api("POST", "/nodes/remove", {"name": "detector_2"}),
+             truth="an extra detector (detector_2) added with a config file that doesn't exist"),
     Scenario("kill_recording_process", "node", _kill_recording_process, ("PROCESS_DIED",), "local_dumper", None,
-             fixable=True, note="host-process node", restore=lambda: api("POST", "/recording/stop", {})),
+             fixable=True, restore=lambda: api("POST", "/recording/stop", {}),
+             truth="SIGKILL to the local_dumper host process during a recording"),
     Scenario("chat_server_crash", "service", lambda: _kill_service_then_restart("chat_server"),
-             ("SERVICE_DOWN",), "chat_server", None, detect_timeout=60),
+             ("SERVICE_DOWN",), "chat_server", None, detect_timeout=60,
+             truth="chat_server process killed (the harness restarts it 40 s later)"),
     Scenario("msight_api_crash", "service", lambda: _kill_service_then_restart("msight_api"),
-             ("SERVICE_DOWN",), "msight_api", None, detect_timeout=60),
+             ("SERVICE_DOWN",), "msight_api", None, detect_timeout=60,
+             truth="msight_api process killed (the harness restarts it 40 s later)"),
     Scenario("camera_offline", "stream", lambda: camera("network", "offline"),
              ("CONTAINER_CRASHED", "CONTAINER_EXITED", "NODE_UNRESPONSIVE"), "video_source", True,
-             detect_timeout=120, camera_only=True),
+             detect_timeout=120, camera_only=True, truth="the RTSP camera is unreachable"),
+    # Brief outage: the camera may be back before the diagnosis, so a fix or a recovery both pass.
     Scenario("camera_reboot", "stream", lambda: camera("camera", "reboot"),
              ("CONTAINER_CRASHED", "CONTAINER_EXITED", "NODE_UNRESPONSIVE"), "video_source", None,
-             fixable=True, detect_timeout=120, camera_only=True, note="brief outage; may recover on its own"),
+             fixable=True, detect_timeout=120, camera_only=True, truth="the RTSP camera server restarted"),
     Scenario("network_stall", "stream", lambda: camera("network", "stall"),
              ("NODE_UNRESPONSIVE", "PIPELINE_DEGRADED", "CONTAINER_CRASHED", "CAMERA_FROZEN", "CAMERA_LOW_FPS"),
-             "video_source", True,
-             detect_timeout=120, camera_only=True),
+             "video_source", True, detect_timeout=120, camera_only=True,
+             truth="the network between camera and pipeline stalls (connection open, no data)"),
     Scenario("network_reset", "stream", lambda: camera("network", "reset"),
              ("CONTAINER_CRASHED", "CONTAINER_EXITED", "NODE_UNRESPONSIVE"), "video_source", True,
-             detect_timeout=120, camera_only=True),
+             detect_timeout=120, camera_only=True, truth="connections from the camera are reset shortly after opening"),
     Scenario("network_slow", "stream", lambda: camera("network", "slow"),
              ("CAMERA_LOW_FPS", "NODE_UNRESPONSIVE", "PIPELINE_DEGRADED", "CONTAINER_CRASHED"), "video_source", True,
-             detect_timeout=180, camera_only=True),
+             detect_timeout=180, camera_only=True, truth="camera bandwidth throttled to 40 KB/s (frame rate collapses)"),
     Scenario("camera_credentials", "stream", lambda: camera("auth", "on"),
              ("CONTAINER_CRASHED", "CONTAINER_EXITED", "NODE_UNRESPONSIVE"), "video_source", True,
-             detect_timeout=120, camera_only=True),
+             detect_timeout=120, camera_only=True, truth="the camera now requires credentials the pipeline doesn't have"),
     Scenario("camera_frozen", "picture", lambda: camera("picture", "frozen"),
-             ("CAMERA_FROZEN",), "video_source", True, camera_only=True),
+             ("CAMERA_FROZEN",), "video_source", True, camera_only=True, truth="the camera keeps sending one still frame"),
     Scenario("camera_black", "picture", lambda: camera("picture", "black"),
-             ("CAMERA_BLACK",), "video_source", True, camera_only=True),
+             ("CAMERA_BLACK",), "video_source", True, camera_only=True, truth="the camera image is black"),
     Scenario("camera_covered", "picture", lambda: camera("picture", "covered"),
-             ("CAMERA_COVERED",), "video_source", True, camera_only=True),
+             ("CAMERA_COVERED",), "video_source", True, camera_only=True,
+             truth="most of the lens is covered (dark overlay)"),
+    # Heavy blur can also crash the detector (MSight_Vision localizer bounds bug).
     Scenario("camera_blurred", "picture", lambda: camera("picture", "blur"),
-             ("CAMERA_DEFOCUSED",), "video_source", True, camera_only=True,
-             note="can also crash the detector (MSight_Vision localizer bounds bug)"),
+             ("CAMERA_DEFOCUSED",), "video_source", True, camera_only=True, truth="the camera image is heavily blurred"),
     Scenario("camera_moved", "picture", lambda: camera("picture", "moved"),
-             ("CAMERA_MOVED",), "video_source", True, camera_only=True),
-    Scenario("no_fault", "control", lambda: None, (), None, None, detect_timeout=120),
+             ("CAMERA_MOVED",), "video_source", True, camera_only=True,
+             truth="the camera view is shifted (camera knocked)"),
+    Scenario("no_fault", "control", lambda: None, (), None, None, detect_timeout=120, truth="nothing injected"),
 ]
 
 
@@ -278,7 +287,7 @@ def run(scenario: Scenario, source: dict, feed: Feed, camera_mode: bool, settle:
         return result
 
     pid = primary["id"]
-    result.update(kind=primary["kind"], node=primary.get("node"), detect_s=round(primary["detected_at"] - t0, 1),
+    result.update(incident=pid, kind=primary["kind"], node=primary.get("node"), detect_s=round(primary["detected_at"] - t0, 1),
                   node_ok=scenario.node is None or scenario.node in (primary.get("node") or ""))
 
     def diagnosed() -> bool:

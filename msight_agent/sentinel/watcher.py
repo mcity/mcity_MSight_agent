@@ -468,7 +468,7 @@ class Watcher:
         self._classified: set[str] = set()             # incident ids whose facts are settled
         self._reported_at: dict[str, float] = {}       # node -> when last reported
         self._dead_pids: set[tuple[str, int]] = set()
-        self._down_counts = {s: 0 for s in SERVICES}
+        self._down_counts = dict.fromkeys(SERVICES, 0)
         self._down_reported: set[str] = set()
         self._empty_sweeps = 0
         self._redis_failures = 0

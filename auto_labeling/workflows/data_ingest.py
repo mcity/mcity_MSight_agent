@@ -2,7 +2,6 @@ import os
 import fiftyone as fo
 import fiftyone.types as fot
 import random
-import shutil
 import fiftyone.utils.yolo as fouy
 import fiftyone.utils.video as fouv
 import logging
@@ -10,9 +9,9 @@ from config.config import WORKFLOWS
 from pathlib import Path
 from ruamel.yaml import YAML
 from ruamel.yaml.scalarstring import DoubleQuotedScalarString as dqs
-import yaml
 
 DATASETS_YAML = Path(__file__).resolve().parent.parent / "config" / "datasets.yaml"
+
 
 def append_dataset_entry(dataset_name: str, loader_fct: str = "load_custom_dataset"):
     yaml_path = Path(__file__).resolve().parent.parent / "config" / "datasets.yaml"
@@ -20,7 +19,7 @@ def append_dataset_entry(dataset_name: str, loader_fct: str = "load_custom_datas
     yaml.preserve_quotes = True
     yaml.indent(sequence=4, offset=2)
 
-    with open(yaml_path, "r") as f:
+    with open(yaml_path) as f:
         data = yaml.load(f)
 
     # Check for duplicate names
@@ -41,13 +40,11 @@ def append_dataset_entry(dataset_name: str, loader_fct: str = "load_custom_datas
 
     logging.info(f"Appended new dataset entry to datasets.yaml: {dataset_name}")
 
-def detect_format(dataset_dir):
-    files = os.listdir(dataset_dir)
-    files_lower = [f.lower() for f in files]
 
-    # Flatten all files (including nested) up to 2 levels
+def detect_format(dataset_dir):
+    # Every file path in the tree, lowercased
     all_files = []
-    for root, dirs, fs in os.walk(dataset_dir):
+    for root, _, fs in os.walk(dataset_dir):
         for f in fs:
             all_files.append(os.path.join(root, f).lower())
 
@@ -84,7 +81,6 @@ def get_dataset_type(fmt):
         return fot.CVATImageDataset
     else:
         raise ValueError(f"Unsupported annotation_format: {fmt}")
-
 
 
 def run_data_ingest():
@@ -144,7 +140,7 @@ def run_data_ingest():
             logging.info(f"Deleted temporary dataset: {temp_name}")
 
     elif dataset_type == "image_only":
-        dataset = fo.Dataset.from_images_dir(dataset_dir, name = dataset_name)
+        dataset = fo.Dataset.from_images_dir(dataset_dir, name=dataset_name)
     elif fmt == "coco":
         # Fast path: Single JSON + single image folder (any name)
         flat_jsons = [f for f in os.listdir(dataset_dir) if f.endswith(".json")]
@@ -265,8 +261,6 @@ def run_data_ingest():
                     except Exception as e:
                         logging.info(f"Warning: Failed to load split '{split_name}': {e}")
 
-
-
                 # Fallback logic if val or test is missing
                 if "val" not in loaded_splits and "test" in loaded_splits:
                     test_samples = loaded_splits["test"]
@@ -290,7 +284,7 @@ def run_data_ingest():
 
                 elif "val" not in loaded_splits and "test" not in loaded_splits and "train" in loaded_splits:
                     all_train_samples = loaded_splits["train"]
-                    dataset.select(all_train_samples).untag_samples("train")# clear tag first
+                    dataset.select(all_train_samples).untag_samples("train")  # clear tag first
                     random.seed(51)
                     random.shuffle(all_train_samples)
 
@@ -301,8 +295,8 @@ def run_data_ingest():
 
                     # Get sample IDs
                     dataset.select(all_train_samples[:n_train]).tag_samples("train")
-                    dataset.select(all_train_samples[ n_train : n_train + n_val]).tag_samples("val")
-                    dataset.select(all_train_samples[ n_train + n_val:]).tag_samples("test")
+                    dataset.select(all_train_samples[n_train : n_train + n_val]).tag_samples("val")
+                    dataset.select(all_train_samples[n_train + n_val:]).tag_samples("test")
 
                     logging.info(f"Split train → train/val/test with {split} proportion")
 
@@ -314,7 +308,6 @@ def run_data_ingest():
                 dataset_type=dataset_type,
                 name=dataset_name,
             )
-
 
     dataset.persistent = True
 
@@ -345,7 +338,6 @@ def run_data_ingest():
         remaining = n - n_train
         n_val = int(remaining * (s_val / (s_val + s_test)))
         n_test = remaining - n_val
-
 
         # Apply tag-based split
         dataset[:n_train].tag_samples("train")

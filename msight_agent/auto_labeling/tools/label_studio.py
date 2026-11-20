@@ -1,32 +1,32 @@
-import os
-import json
-import time
 import asyncio
+import json
 import logging
+import mimetypes
+import os
+import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from dotenv import load_dotenv
 
 import fiftyone as fo
+from dotenv import load_dotenv
 from fastmcp import Context
 from label_studio_sdk import LabelStudio
+
 from msight_agent.shared.mcp import mcp
+from msight_agent.shared.paths import ANNOTATION_TASKS_DIR
 
 load_dotenv()
 
-from msight_agent.shared.paths import ANNOTATION_TASKS_DIR
-
 LS_URL = os.getenv("LS_URL", "https://app.humansignal.com")
-
-def _get_ls_token() -> str | None:
-    """Read token fresh each call so credential changes take effect without restart."""
-    load_dotenv(override=True)
-    return os.getenv("LS_TOKEN")
-
 LS_TASKS_FILE = ANNOTATION_TASKS_DIR / "ls_tasks.json"
 
 
-# Internal helpers
+def _get_ls_token() -> str | None:
+    """Read fresh each call, so a changed token works without a restart."""
+    load_dotenv(override=True)
+    return os.getenv("LS_TOKEN")
+
 
 def _get_client():
     """Return an authenticated LabelStudio SDK client."""
@@ -72,11 +72,7 @@ def _build_label_config(classes: list[str]) -> str:
 
 
 def _upload_image(http, project_id: int, path: Path) -> list[int]:
-    """
-    Upload a single image to a Label Studio project.
-    Returns a list of task IDs, resolving the async import job if needed.
-    """
-    import mimetypes
+    """Upload one image; returns its task IDs, waiting for the import job if there is one."""
     mime = mimetypes.guess_type(path)[0] or "image/jpeg"
 
     with open(path, "rb") as f:
@@ -118,21 +114,13 @@ def _upload_image(http, project_id: int, path: Path) -> list[int]:
 async def _upload_images_concurrent(
     ctx, http, project_id: int, paths: list[Path], max_workers: int = 3
 ) -> tuple[dict[str, int], list[str]]:
+    """Upload images one per POST, a few at a time; returns ({filename: task_id}, errors).
+
+    Label Studio creates one task per POST however many files it carries, so each image
+    is its own request. max_workers=3 stays under the cloud rate limit (429 above ~5).
+    Each upload is awaited separately so progress keeps flowing to the client; a long
+    silent export would trip its 300s timeout.
     """
-    Upload images one-per-POST using a thread pool, return {filename: task_id}.
-
-    LS creates exactly one task per POST regardless of how many files are packed
-    into a single multipart body, so per-file uploads are required for N tasks.
-    Concurrency removes the per-image latency; max_workers=3 stays under LS
-    cloud rate limits (429 appears above ~5 simultaneous uploads).
-
-    Awaits each upload individually instead of blocking on a synchronous
-    as_completed loop, so control returns to the event loop between images and
-    progress can go out over the SSE connection -- a long export previously
-    held the loop with no traffic on it, tripping the client's 300s timeout.
-    """
-    from concurrent.futures import ThreadPoolExecutor
-
     total = len(paths)
     t0 = time.time()
     logging.warning(f"[LS] Uploading {total} image(s) ({max_workers} concurrent)…")
@@ -209,14 +197,9 @@ def _detections_to_ls_results(detections) -> list:
     return results
 
 
-def _attach_as_annotations(http, task_id: int, detections, label_field: str):
-    """
-    Import model detections as annotations (not predictions) so they appear
-    as editable boxes in the Label Studio labeling interface.
-
-    Predictions are read-only and cause a blank image when clicking Label.
-    Annotations are editable and become ground truth after the annotator submits.
-    """
+def _attach_as_annotations(http, task_id: int, detections):
+    """Attach model detections as editable annotations. Predictions would be read-only, and
+    Label Studio shows a blank image when one is opened for labelling."""
     results = _detections_to_ls_results(detections)
     if not results:
         return
@@ -316,8 +299,8 @@ def get_labeling_backend() -> dict:
       - active_backend: "cvat" | "label_studio" | "none"
       - message: human-readable summary
     """
-    cvat_token = os.getenv("CVAT_ACCESS_TOKEN", "").strip()
     load_dotenv(override=True)
+    cvat_token = os.getenv("CVAT_ACCESS_TOKEN", "").strip()
     ls_token   = os.getenv("LS_TOKEN", "").strip()
 
     cvat_ok = bool(cvat_token)
@@ -423,22 +406,15 @@ async def export_to_label_studio(
         pred_fields = [f for f in schema if f.startswith("pred_od_")]
         label_field = None
 
-        # Normalize classes: LLM may pass "car, bus" (str), ["car","bus"] (list), or None.
+        # The LLM may pass "car, bus", ["car", "bus"] or nothing.
         if isinstance(classes, str):
-            manual_classes = [c.strip() for c in classes.split(",") if c.strip()]
+            classes = [c.strip() for c in classes.split(",") if c.strip()]
         elif isinstance(classes, list):
-            manual_classes = [str(c).strip() for c in classes if str(c).strip()]
+            classes = [str(c).strip() for c in classes if str(c).strip()]
         else:
-            manual_classes = []
-
-        logging.warning(f"[LS] export_to_label_studio called: dataset={dataset_name}, "
-                       f"with_predictions={with_predictions}, raw_classes={classes}, "
-                       f"resolved_manual_classes={manual_classes}")
-        classes = []
-
-        if manual_classes and not with_predictions:
-            classes = manual_classes
-            logging.warning(f"[LS] Manual path — using provided classes: {classes}")
+            classes = []
+        logging.warning(f"[LS] export_to_label_studio: dataset={dataset_name}, "
+                        f"with_predictions={with_predictions}, classes={classes}")
 
         if with_predictions:
             if not pred_fields:
@@ -464,8 +440,6 @@ async def export_to_label_studio(
             )
             classes = dataset.distinct(f"{label_field}.detections.label")
             logging.info(f"[LS] Using label field: {label_field}, classes: {classes}")
-        elif not classes:
-            classes = []
 
         label_config = _build_label_config(classes)
         logging.warning(f"[LS] Creating project with label_config:\n{label_config}")
@@ -489,7 +463,6 @@ async def export_to_label_studio(
         samples = list(dataset)
         image_paths = [Path(s.filepath) for s in samples]
 
-        # --- Upload (concurrent, one POST per image) ----------------------
         fname_to_task_id, upload_errors = await _upload_images_concurrent(ctx, http, project_id, image_paths)
         all_task_ids = list(fname_to_task_id.values())
 
@@ -508,16 +481,11 @@ async def export_to_label_studio(
                 f"{len(image_paths)} images: {detail}"
             )
 
-        # --- Attach predictions (auto path only) --------------------------
-        if with_predictions and label_field and fname_to_task_id:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-
+        if with_predictions and label_field:
             samples_with_dets = [
                 (Path(s.filepath).name, s[label_field])
                 for s in samples
-                if s.get_field(label_field) is not None
-                and s[label_field] is not None
-                and s[label_field].detections
+                if s.get_field(label_field) is not None and s[label_field].detections
             ]
 
             t_ann = time.time()
@@ -527,7 +495,7 @@ async def export_to_label_studio(
                 task_id = fname_to_task_id.get(fname)
                 if not task_id:
                     return False
-                _attach_as_annotations(http, task_id, dets.detections, label_field)
+                _attach_as_annotations(http, task_id, dets.detections)
                 return True
 
             with ThreadPoolExecutor(max_workers=5) as pool:

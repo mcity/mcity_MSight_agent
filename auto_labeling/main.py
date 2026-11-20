@@ -1,4 +1,3 @@
-import datetime
 import logging
 import os
 import signal
@@ -20,7 +19,6 @@ if IGNORE_FUTURE_WARNINGS:
 import gc
 
 import fiftyone as fo
-import torch.multiprocessing as mp
 from tqdm import tqdm
 
 from config.config import (
@@ -45,15 +43,13 @@ from workflows.auto_labeling import (
 from workflows.rfdetr_keypoint import RFDETRKeypointDetection
 from workflows.data_ingest import run_data_ingest
 
-wandb_run = None  # Init globally to make sure it is available
 
 def signal_handler(sig, frame):
     """Handle Ctrl+C signal by cleaning up resources and exiting."""
     logging.error("You pressed Ctrl+C!")
     try:
         wandb_close(exit_code=1)
-        #cleanup_memory()
-    except:
+    except Exception:
         pass
     sys.exit(0)
 
@@ -62,7 +58,7 @@ def workflow_auto_labeling_ultralytics(dataset, run_config, wandb_activate=True)
     """Auto-labeling workflow using Ultralytics models with optional training and inference."""
     try:
         wandb_exit_code = 0
-        wandb_run = wandb_init(
+        wandb_init(
             run_name=run_config["model_name"],
             project_name="Auto Labeling Ultralytics",
             dataset_name=run_config["v51_dataset_name"],
@@ -99,7 +95,7 @@ def workflow_auto_labeling_hf(dataset, hf_dataset, run_config, wandb_activate=Tr
     """Auto-labeling using Hugging Face models on a dataset, including training and/or inference based on the provided configuration."""
     try:
         wandb_exit_code = 0
-        wandb_run = wandb_init(
+        wandb_init(
             run_name=run_config["model_name"],
             project_name="Auto Labeling Hugging Face",
             dataset_name=run_config["v51_dataset_name"],
@@ -141,7 +137,7 @@ def workflow_auto_labeling_custom_codetr(
 
     try:
         wandb_exit_code = 0
-        wandb_run = wandb_init(
+        wandb_init(
             run_name=run_config["config"],
             project_name="Co-DETR Auto Labeling",
             dataset_name=dataset_info["name"],
@@ -200,7 +196,7 @@ def cleanup_memory(do_extensive_cleanup=False):
                 if torch.is_tensor(obj):
                     del obj
                     n_deleted_torch_objects += 1
-            except:
+            except Exception:
                 pass
 
         logging.info(f"Deleted {n_deleted_torch_objects} torch objects")
@@ -432,7 +428,7 @@ class WorkflowExecutor:
 
                             try:
                                 wandb_exit_code = 0
-                                wandb_run = wandb_init(
+                                wandb_init(
                                     run_name=config,
                                     project_name="RF-DETR Auto Labeling",
                                     dataset_name=self.dataset_info["name"],
@@ -528,7 +524,7 @@ class WorkflowExecutor:
 
                             try:
                                 wandb_exit_code = 0
-                                wandb_run = wandb_init(
+                                wandb_init(
                                     run_name=config,
                                     project_name="RF-DETR Keypoint Auto Labeling",
                                     dataset_name=self.dataset_info["name"],
@@ -571,8 +567,7 @@ class WorkflowExecutor:
                     self.dataset_info = dataset_info
                     self.selected_dataset = "custom_dataset"
 
-                    logging.info(f"Data ingestion completed successfully.")
-
+                    logging.info("Data ingestion completed successfully.")
 
                 else:
                     logging.error(
@@ -580,7 +575,7 @@ class WorkflowExecutor:
                     )
                     return False
 
-                #cleanup_memory()  # Clean after each workflow
+                # cleanup_memory()  # Clean after each workflow
                 logging.info(f"Completed workflow {workflow} and cleaned up memory")
 
             except Exception as e:
@@ -588,7 +583,7 @@ class WorkflowExecutor:
                 logging.exception(f"Workflow {workflow}: An error occurred: {e}")
                 failed_workflows.append(workflow)
                 wandb_close(exit_code=1)
-                #cleanup_memory()  # Clean up even after failure
+                # cleanup_memory()  # Clean up even after failure
 
         # Later workflows still run after one fails, but the failure is reported.
         if failed_workflows:
@@ -714,7 +709,6 @@ def main():
         )
         workflows_ok = executor.execute()
 
-
     if dataset is not None:
         dataset.reload()
         dataset.save()
@@ -730,13 +724,11 @@ def main():
         logging.debug(dataset.stats(include_media=True))
 
         # V51 UI launch
-        session = fo.launch_app(
+        fo.launch_app(
             dataset, address=V51_ADDRESS, port=V51_PORT, remote=V51_REMOTE
         )
     else:
         logging.info("Skipping Voxel51 session.")
-
-
 
     time_stop = time.time()
     logging.info(f"Elapsed time: {time_stop - time_start:.2f} seconds")

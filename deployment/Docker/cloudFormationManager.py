@@ -3,6 +3,7 @@ from config import Config
 import time
 import threading
 
+
 class CloudFormationManager:
     def __init__(self, config: Config):
         self.config = config
@@ -14,11 +15,11 @@ class CloudFormationManager:
         )
 
     def create_stack(self, email):
-        with open('deploy-agent-AWS-AMI.yml', 'r') as f:
+        with open('deploy-agent-AWS-AMI.yml') as f:
             template_body = f.read()
         stack_name = f"{self.config.STACK_NAME}-{email.replace('@', '-').replace('.', '-')}-{int(time.time())}"
-        keypair_name=f"{self.config.KEY_PAIR_NAME}-{email.replace('@', '-').replace('.', '-')}-{int(time.time())}"
-        response = self.cf_client.create_stack(
+        keypair_name = f"{self.config.KEY_PAIR_NAME}-{email.replace('@', '-').replace('.', '-')}-{int(time.time())}"
+        self.cf_client.create_stack(
             StackName=stack_name,
             TemplateBody=template_body,
             RoleARN=self.config.ROLE_ARN,
@@ -37,6 +38,7 @@ class CloudFormationManager:
             Capabilities=['CAPABILITY_NAMED_IAM']
         )
         return stack_name
+
     def wait_for_stack(self, stack_name):
         waiter = self.cf_client.get_waiter('stack_create_complete')
         waiter.wait(StackName=stack_name)
@@ -53,4 +55,4 @@ class CloudFormationManager:
                 print(f"Stack {stack_name} deleted after {delay} seconds.")
             except Exception as e:
                 print(f"Error deleting stack {stack_name}: {e}")
-        threading.Thread(target=delete_stack, daemon=True).start()    
+        threading.Thread(target=delete_stack, daemon=True).start()

@@ -1,4 +1,3 @@
-import logging
 import os
 from pathlib import Path
 import shutil
@@ -47,7 +46,7 @@ def dataset_v51():
         for sample in dataset.iter_samples(progress=True, autosave=True):
             split = random.choice(ACCEPTED_SPLITS)
             sample.tags = [split]
-    except:
+    except Exception:
         dataset = fo.load_dataset(dataset_name)
 
     assert dataset is not None, "Failed to load or create the FiftyOne dataset"
@@ -79,7 +78,7 @@ def test_hf_object_detection(dataset_v51, dataset_hf, mode):
         if mode == "inference_hf":
             selected_mode = ["inference"]
             # Delete the whole folder to force download from HF
-            folder = f"./output/models/object_detection_hf/fisheye8k_v51_hf_od_test/{MODEL_NAME.replace("-","_")}"
+            folder = f"./output/models/object_detection_hf/fisheye8k_v51_hf_od_test/{MODEL_NAME.replace("-", "_")}"
             if os.path.exists(folder):
                 shutil.rmtree(folder)
                 print(f"Deleted folder: {folder}")
