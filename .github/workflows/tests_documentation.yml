@@ -60,6 +60,14 @@ jobs:
 
   engine-tests:
     runs-on: ubuntu-latest
+    # FiftyOne's bundled MongoDB doesn't install on every runner image, so run our own.
+    services:
+      mongodb:
+        image: mongo:8.0
+        ports:
+          - 27017:27017
+    env:
+      FIFTYONE_DATABASE_URI: mongodb://localhost:27017
     steps:
     - name: Remove unnecessary files
       run: |

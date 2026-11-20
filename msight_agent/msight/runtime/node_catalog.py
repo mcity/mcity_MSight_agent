@@ -340,9 +340,7 @@ def resolve_cmd(spec: NodeSpec, name: str, config: dict) -> list[str]:
         args += ["--publish-topic", config["publish_topic"]]
     if spec.category in (NodeCategory.PROCESSING, NodeCategory.SINK):
         args += ["--subscribe-topic", config["subscribe_topic"]]
-    if spec.category == NodeCategory.SOURCE:
-        args += ["--sensor-name", config["sensor_name"]]
-    elif spec.category == NodeCategory.PROCESSING and "sensor_name" in config:
+    if spec.category == NodeCategory.SOURCE or spec.category == NodeCategory.PROCESSING and "sensor_name" in config:
         args += ["--sensor-name", config["sensor_name"]]
 
     for key, flag in spec.arg_map.items():

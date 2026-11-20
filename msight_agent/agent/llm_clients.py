@@ -112,14 +112,12 @@ class OpenAIClient(_OpenAICompatibleClient):
 class GroqClient(_OpenAICompatibleClient):
     def __init__(self):
         self.client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
-        # llama3-70b-8192 (former default) was decommissioned by Groq on 2025-05-31.
         self.model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 
 class GeminiClient(BaseLLMClient):
     def __init__(self):
         genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        # gemini-1.5-flash has been retired.
         self.model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
     async def chat(self, messages, tools=None, tool_choice=None):

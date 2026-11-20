@@ -1,0 +1,27 @@
+# The MSight sentinel as a supervised service (EC2 deployment).
+#
+#   sudo cp deployment/systemd/msight-sentinel.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now msight-sentinel
+#   journalctl -u msight-sentinel -f
+#
+# Type=notify + WatchdogSec: the sentinel pings systemd from its event loop every 5 s; if it
+# hangs or dies, systemd restarts it. Adjust the paths and the --autonomy level to the deployment.
+[Unit]
+Description=MSight sentinel (monitors the MSight pipeline and agent services)
+After=network-online.target docker.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=30
+Restart=always
+RestartSec=5
+User=ubuntu
+WorkingDirectory=/home/ubuntu/myapp
+Environment=PYTHONPATH=/home/ubuntu/myapp
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/myapp/.venv-sentinel/bin/python -m msight_agent.sentinel --autonomy suggest
+
+[Install]
+WantedBy=multi-user.target

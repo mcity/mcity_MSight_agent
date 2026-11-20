@@ -46,7 +46,7 @@ if __name__ == "__main__":
     # Transform the AST
     transformer = ConfigVisitor()
 
-    with open(config_file_path, "r") as file:
+    with open(config_file_path) as file:
         content = file.read()
 
     parsed_ast = ast.parse(content)

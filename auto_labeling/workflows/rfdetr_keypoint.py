@@ -24,15 +24,12 @@ Output dict (forward pass):
   aux_outputs   : list of dicts (same keys, one per decoder layer)
 """
 
-import copy
 import json
 import logging
 import math
 import os
 import random
-import shutil
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -49,9 +46,8 @@ from tqdm import tqdm
 from rfdetr.models.lwdetr import LWDETR, MLP
 from rfdetr.util.misc import nested_tensor_from_tensor_list, NestedTensor
 from rfdetr.models.matcher import build_matcher
-from rfdetr.util import box_ops
 
-from config.config import GLOBAL_SEED, HF_DO_UPLOAD, HF_ROOT, WANDB_ACTIVE
+from config.config import GLOBAL_SEED, HF_DO_UPLOAD, HF_ROOT
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -527,7 +523,7 @@ class CocoKeypointDataset(Dataset):
         self.augment = augment
         self.num_keypoints = num_keypoints
 
-        with open(annotation_path, "r") as f:
+        with open(annotation_path) as f:
             data = json.load(f)
 
         # Build image-id → file map
@@ -652,14 +648,12 @@ def build_rfdetr_keypoint_model(
     The backbone + transformer + bbox/class heads are loaded from pretrain_weights.
     keypoint_embed is always randomly initialised.
     """
-    from rfdetr.main import Model, download_pretrain_weights
+    from rfdetr.main import download_pretrain_weights
     from rfdetr.config import (
         RFDETRBaseConfig, RFDETRLargeConfig, RFDETRSmallConfig,
         RFDETRMediumConfig, RFDETRNanoConfig,
     )
     from rfdetr.platform.models import RFDETRXLargeConfig, RFDETR2XLargeConfig
-    from rfdetr.models import build_model as rfdetr_build_model
-    import argparse
 
     # Map config name → config class
     CONFIG_MAP = {
@@ -687,7 +681,6 @@ def build_rfdetr_keypoint_model(
     args = populate_args(**kwargs)
 
     # Build backbone + transformer (same as rf-detr)
-    from rfdetr.models.backbone import build_backbone
     from rfdetr.models.lwdetr import build_model as _build_lwdetr
     base_lwdetr = _build_lwdetr(args)
 
@@ -1054,7 +1047,7 @@ def _ddp_train_worker(
                             outputs["pred_keypoints"].detach(),
                             targets,
                         )
-                        for key in ("tp","fp","fn","n_gt","oks_sum","n_oks","pck_correct","pck_total"):
+                        for key in ("tp", "fp", "fn", "n_gt", "oks_sum", "n_oks", "pck_correct", "pck_total"):
                             agg[key] += batch_m[key]
                         agg["ap_entries"].extend(batch_m["ap_entries"])
                         for k in range(K):
@@ -1068,16 +1061,16 @@ def _ddp_train_worker(
             # since they all processed the full val set without a DistributedSampler)
             if is_main:
                 tp, fp, fn = agg["tp"], agg["fp"], agg["fn"]
-                prec = tp/(tp+fp) if (tp+fp)>0 else 0.0
-                rec  = tp/(tp+fn) if (tp+fn)>0 else 0.0
-                f1   = 2*prec*rec/(prec+rec) if (prec+rec)>0 else 0.0
+                prec = tp/(tp+fp) if (tp+fp) > 0 else 0.0
+                rec  = tp/(tp+fn) if (tp+fn) > 0 else 0.0
+                f1   = 2*prec*rec/(prec+rec) if (prec+rec) > 0 else 0.0
                 mAP  = _compute_ap(agg["ap_entries"], agg["n_gt"])
-                oks  = agg["oks_sum"]/agg["n_oks"] if agg["n_oks"]>0 else float("nan")
-                pck  = agg["pck_correct"]/agg["pck_total"] if agg["pck_total"]>0 else float("nan")
+                oks  = agg["oks_sum"]/agg["n_oks"] if agg["n_oks"] > 0 else float("nan")
+                pck  = agg["pck_correct"]/agg["pck_total"] if agg["pck_total"] > 0 else float("nan")
                 per_kp_oks = [agg["oks_per_kp"][k]/agg["n_oks_per_kp"][k]
-                              if agg["n_oks_per_kp"][k]>0 else float("nan") for k in range(K)]
+                              if agg["n_oks_per_kp"][k] > 0 else float("nan") for k in range(K)]
                 per_kp_pck = [agg["pck_per_kp"][k]/agg["pck_total_per_kp"][k]
-                              if agg["pck_total_per_kp"][k]>0 else float("nan") for k in range(K)]
+                              if agg["pck_total_per_kp"][k] > 0 else float("nan") for k in range(K)]
                 val_metrics = dict(prec=prec, rec=rec, f1=f1, mAP=mAP, oks=oks, pck=pck,
                                    per_kp_oks=per_kp_oks, per_kp_pck=per_kp_pck)
 
@@ -1382,7 +1375,7 @@ class RFDETRKeypointDetection:
           2. FiftyOne sample field (run_config["keypoint_field"])          — if available
           3. Zeros                                                          — fallback
         """
-        with open(ann_path, "r") as f:
+        with open(ann_path) as f:
             data = json.load(f)
 
         if not data.get("annotations"):
@@ -1536,7 +1529,7 @@ class RFDETRKeypointDetection:
 
     def _fix_annotation_indices(self, ann_path: str):
         """Convert 1-indexed COCO category IDs to 0-indexed (RF-DETR expectation)."""
-        with open(ann_path, "r") as f:
+        with open(ann_path) as f:
             data = json.load(f)
 
         for cat in data["categories"]:
@@ -1573,7 +1566,6 @@ class RFDETRKeypointDetection:
 
         if run_config.get("fo_native", False):
             # ── FiftyOne-native path ───────────────────────────────────
-            import fiftyone as fo
             from workflows.keypoint.fo_keypoint_dataset import prefetch_fo_split
 
             detection_field = run_config.get("detection_field", "ground_truth")
@@ -1905,4 +1897,3 @@ class RFDETRKeypointDetection:
                     logging.error(f"Evaluation failed: {e}")
 
         return True
-

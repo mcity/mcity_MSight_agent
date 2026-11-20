@@ -79,168 +79,72 @@ def _update_auto_labeling_keys(updated_keys: dict[str, str]) -> bool:
     return found
 
 
+# Per model source: the list inside its config block that holds the models (None: the block
+# itself), the pattern that finds a model's name on a line, and whether the selected name
+# must equal it (False: be contained in it, e.g. a Co-DETR config path).
+_MODEL_LISTS = {
+    "ultralytics": ('"models": {', r'^\s*#?\s*"([^"]+)"\s*:', True),
+    "hf_models_objectdetection": (None, r'^\s*#?\s*"([^"]+)"\s*:', True),
+    "custom_codetr": ('"configs": [', r'^\s*#?\s*"([^"]+\.py)"', False),
+    "roboflow": ('"configs": [', r'^\s*#?\s*"([^"]+)"', True),
+}
+
+
+def _toggle(line: str, enable: bool) -> str:
+    """The line with its leading '#' removed (enable) or added (disable), keeping its indent."""
+    indent = line[:len(line) - len(line.lstrip())]
+    bare = line.strip().lstrip("#").strip()
+    return indent + (bare if enable else "# " + bare)
+
 
 @mcp.tool()
 def configure_auto_labeling(selected_source: str, selected_model: str) -> str:
-    """
-    Enable the selected model source and model inside config.py for the auto_labeling workflow.
-    """
+    """Enable the selected model source and model inside config.py for the auto_labeling workflow."""
     selected_source = selected_source.lower().strip()
     selected_model = selected_model.strip()
-    lines = CONFIG_PATH.read_text().split('\n')
-    modified = []
-
-    in_model_source = False
-    in_selected_source = False
-    in_model_dict = False
-    in_config_list = False
-    in_rf_config_list = False
-
-    source_key_pattern = re.compile(rf'^\s*"{selected_source}"\s*:\s*{{')
-    model_line_pattern = re.compile(r'^\s*#?\s*"([^"]+)"\s*:')
-    config_line_pattern = re.compile(r'^\s*"([^"]+\.py)"')
-
-    # A line may be commented as '    #"yolo12x"' or '#\t\t"yolo26m"': strip any mix of
-    # leading whitespace and '#', then rebuild the indent.
-    def _bare(line):
-        return re.sub(r'^[\s#]+', '', line).rstrip()
-
-    def _enable(line, indent="                "):
-        return indent + _bare(line)
-
-    def _disable(line, indent="                "):
-        return indent + "# " + _bare(line)
-
-    enabled_count = 0
-
-    for line in lines:
-        stripped = line.strip()
-
-        if '"model_source": [' in line:
-            in_model_source = True
-            modified.append(line)
-            continue
-        if in_model_source:
-            if ']' in stripped:
-                in_model_source = False
-                modified.append(line)
-                continue
-            match = re.search(r'"([^"]+)"', stripped)
-            if match:
-                source = match.group(1)
-                if source == selected_source:
-                    modified.append(f'        "{source}",')
-                else:
-                    modified.append(f'        # "{source}",')
-                continue
-
-        if source_key_pattern.match(line):
-            in_selected_source = True
-            modified.append(line)
-            continue
-
-        if in_selected_source:
-            if stripped.startswith("}"):
-                in_selected_source = False
-                modified.append(line)
-                continue
-
-            if '"models": {' in line and selected_source == "ultralytics":
-                in_model_dict = True
-                modified.append(line)
-                continue
-
-            if in_model_dict:
-                if stripped.startswith("}"):
-                    in_model_dict = False
-                    modified.append(line)
-                    continue
-                match = model_line_pattern.match(line)
-                if match:
-                    model_name = match.group(1)
-                    if model_name == selected_model:
-                        modified.append(_enable(line))
-                        enabled_count += 1
-                    else:
-                        modified.append(_disable(line))
-                    continue
-
-            if selected_source == "hf_models_objectdetection":
-                match = model_line_pattern.match(line)
-                if match:
-                    model_name = match.group(1)
-                    if model_name == selected_model:
-                        modified.append(_enable(line))
-                        enabled_count += 1
-                    else:
-                        modified.append(_disable(line))
-                    continue
-
-            if '"configs": [' in line and selected_source == "custom_codetr":
-                in_config_list = True
-                modified.append(line)
-                continue
-
-            if in_config_list:
-                if ']' in stripped:
-                    in_config_list = False
-                    modified.append(line)
-                    continue
-                match = config_line_pattern.match(line)
-                if match:
-                    config_path = match.group(1)
-                    if selected_model in config_path:
-                        modified.append(_enable(line))
-                        enabled_count += 1
-                    else:
-                        modified.append(_disable(line))
-                    continue
-
-            if '"configs": [' in line and selected_source == "roboflow":
-                in_rf_config_list = True
-                modified.append(line)
-                continue
-
-            if in_rf_config_list:
-                if ']' in stripped:
-                    in_rf_config_list = False
-                    modified.append(line)
-                    continue
-
-                match = re.search(r'^\s*#?\s*"([^"]+)"', stripped)
-                if match:
-                    config_name = match.group(1)
-                    if config_name == selected_model:
-                        indent = len(line) - len(line.lstrip())
-                        uncommented = line.lstrip().lstrip('#').lstrip()
-                        modified.append(' ' * indent + uncommented)
-                        enabled_count += 1
-                    else:
-                        if not stripped.startswith("#"):
-                            indent = len(line) - len(line.lstrip())
-                            modified.append(' ' * indent + '# ' + stripped)
-                        else:
-                            modified.append(line)
-                    continue
-
-        modified.append(line)
-
-    # Validate against list_model_sources_and_models()
     valid = list_model_sources_and_models()
     if selected_model not in valid.get(selected_source, []):
         return (
             f"Invalid model '{selected_model}' for source '{selected_source}'. "
             f"Available: {valid.get(selected_source, [])}"
         )
-    # Guard against a silent no-op: the model line must really be enabled.
+
+    list_start, name_pattern, exact = _MODEL_LISTS[selected_source]
+    name_re = re.compile(name_pattern)
+    source_re = re.compile(rf'^\s*"{re.escape(selected_source)}"\s*:\s*{{')
+    modified, enabled_count = [], 0
+    in_sources = in_block = in_list = False
+    for line in CONFIG_PATH.read_text().split("\n"):
+        stripped = line.strip()
+        if '"model_source": [' in line:
+            in_sources = True
+        elif in_sources:
+            if "]" in stripped:
+                in_sources = False
+            elif match := re.search(r'"([^"]+)"', stripped):
+                line = _toggle(line, match.group(1) == selected_source)
+        elif source_re.match(line):
+            in_block, in_list = True, list_start is None
+        elif in_block:
+            if stripped.startswith("}") or (in_list and list_start and "]" in stripped):
+                in_block = in_list = False
+            elif list_start and list_start in line:
+                in_list = True
+            elif in_list and (match := name_re.match(line)):
+                name = match.group(1)
+                selected = name == selected_model if exact else selected_model in name
+                enabled_count += selected
+                line = _toggle(line, selected)
+        modified.append(line)
+
+    # Guard against a silent no-op: exactly one model line must end up enabled.
     if enabled_count != 1:
         return (
             f"Config not written: '{selected_model}' matched {enabled_count} lines "
             f"in source '{selected_source}', but exactly 1 is needed. "
             f"Please check the model list in config.py."
         )
-
-    CONFIG_PATH.write_text('\n'.join(modified).rstrip('\n') + '\n')
+    CONFIG_PATH.write_text("\n".join(modified).rstrip("\n") + "\n")
     return f"Config updated to use `{selected_model}` from `{selected_source}`."
 
 

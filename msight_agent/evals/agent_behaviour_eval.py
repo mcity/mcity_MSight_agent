@@ -6,9 +6,9 @@ running healthy, with any extra nodes it sets up. The scenarios are the ones fou
 hand while testing the node catalog and the stop guard, so a fixed bug stays fixed and
 models can be compared:
 
-    ../.venv/bin/python3 evals/agent_behaviour_eval.py
-    ../.venv/bin/python3 evals/agent_behaviour_eval.py --provider claude --runs 3
-    ../.venv/bin/python3 evals/agent_behaviour_eval.py --scenarios dup_detector thanks_no_stop
+    .venv/bin/python3 -m msight_agent.evals.agent_behaviour_eval
+    .venv/bin/python3 -m msight_agent.evals.agent_behaviour_eval --provider claude --runs 3
+    .venv/bin/python3 -m msight_agent.evals.agent_behaviour_eval --scenarios dup_detector thanks_no_stop
 
 Needs mcp_server.py, msight_api.py and chat_server.py running, plus an LLM provider
 (~1-2 min per scenario: every scenario restarts the demo pipeline).

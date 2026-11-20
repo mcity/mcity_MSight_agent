@@ -6,7 +6,7 @@ from fastmcp import Client
 from msight_agent.agent.guards import confirmation_question, destructive_allowed
 from msight_agent.agent.routing import (
     Sentinels, HardStop, Injection, FallThrough, ToolRouting, WRITE_TOOLS,
-    format_reply, tool_status, unwrap_tool_output, TOOL_STATUS_MESSAGES,
+    error_text, format_reply, tool_status, unwrap_tool_output, TOOL_STATUS_MESSAGES,
 )
 from msight_agent.auto_labeling.handlers import AutoLabelingHandlers, user_texts
 from msight_agent.msight.handlers import MsightPipelineHandlers
@@ -58,7 +58,7 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
     ) -> "HardStop | None":
         """Run `state_setter` and save state unless `result` contains an error sentinel (then HardStop)."""
         if error_sentinels and any(s in result for s in error_sentinels):
-            err = result.split(":", 1)[1].strip() if ":" in result else result
+            err = error_text(result)
             return HardStop(err)
         state_setter()
         self.state.save()
@@ -108,7 +108,7 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
         except Exception:
             pass
 
-        tool_results  = []
+        tool_results = []
         all_routings: list[list[ToolRouting]] = []
         logging.warning(
             f"[PIPELINE] Processing {len(tool_calls)} tool call(s): "
@@ -245,16 +245,16 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
             err_str = str(e) or type(e).__name__
             if "WORKFLOW_STATE" in err_str or "WorkflowState" in err_str or "config.py" in err_str:
                 logging.warning(f"[PIPELINE] State save failed in {fn_name}: {e}")
-                result   = f"STATE_SAVE_ERROR: {err_str}"
+                result = f"STATE_SAVE_ERROR: {err_str}"
                 routings = [HardStop(
                     "Failed to save session state. Please try your last action again. "
                     "If the problem persists, try restarting the server."
                 )]
             else:
                 logging.warning(f"[PIPELINE] Exception in {fn_name}: {e}")
-                result   = err_str
+                result = err_str
                 routings = [FallThrough()]
-                failed   = True
+                failed = True
 
         messages.append({
             "role": "tool",
@@ -358,7 +358,8 @@ class ChatPipeline(AutoLabelingHandlers, MsightPipelineHandlers):
                     f"tools instead."
                 )]
 
-            if al and al.phase in (AutoLabelingPhase.ANNOTATING, AutoLabelingPhase.TRAINING) and not fn_args.get("confirm_restart"):
+            locked = al and al.phase in (AutoLabelingPhase.ANNOTATING, AutoLabelingPhase.TRAINING)
+            if locked and not fn_args.get("confirm_restart"):
                 action = "annotation export" if al.phase == AutoLabelingPhase.ANNOTATING else "auto-labeling run"
                 logging.warning(
                     f"[PIPELINE] switch_workflow blocked: phase={al.phase!r}"

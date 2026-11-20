@@ -14,6 +14,7 @@ A natural-language agent for running and debugging [MSight Vision](https://githu
 - **Build custom pipelines.** Add or remove any of 25 MSight node types (extra sources, detectors, viewers, LiDAR, trackers, sinks) by asking. Nodes are validated before they start, and viewers come back with their URL.
 - **Record & archive.** Save the annotated video locally or push it to S3.
 - **Debug it.** Describe a symptom ("the viewer is frozen") and the agent measures live data flow to find the root cause. It can also report GPU/CPU usage and check the host (drivers, ports, disk, Docker), without changing anything unless you ask.
+- **Watches itself.** A background monitor (the sentinel) spots faults within seconds: crashed, killed or frozen nodes, a black, frozen, covered or moved camera, services or Redis going down. Claude diagnoses each one and the incident appears in the chat with a **Fix it** button, or is fixed automatically in `fix` mode. See [msight_agent/sentinel/README.md](msight_agent/sentinel/README.md).
 - **Asks before destructive actions.** Stopping the pipeline, removing nodes or resetting the session only happen at your request.
 - **Dashboard.** A web dashboard for status, nodes, logs and recording, alongside the chat.
 - **Auto-labeling.** Run a detection model on a dataset, review the labels in CVAT or Label Studio, and import them back. See [auto_labeling/README.md](auto_labeling/README.md).
@@ -105,6 +106,12 @@ Start each in its own terminal from the repo root, MCP server first:
 .venv/bin/python3 -m msight_agent.msight_api                                            # 8003
 ```
 
+Optionally, the sentinel (its own venv; setup in [msight_agent/sentinel/README.md](msight_agent/sentinel/README.md)):
+
+```bash
+.venv-sentinel/bin/python -m msight_agent.sentinel          # --autonomy observe | suggest (default) | fix
+```
+
 Open the chat at http://localhost:5225 and the dashboard at http://localhost:8003. To check everything works, say "hi" then "run a demo": a viewer link appears, with detections within a minute.
 
 **Common problems**
@@ -148,11 +155,11 @@ Agent: rfdetr_detector runs on the GPU (RTX 4090); the source and viewer are CPU
 ```bash
 .venv/bin/python3 -m pytest msight_agent/tests                                 # agent unit tests
 cd auto_labeling && ../.venv/bin/python3 -m pytest tests                         # engine tests
-.venv/bin/python3 msight_agent/evals/fault_injection_eval.py                     # live eval: diagnosis
+.venv/bin/python3 -m msight_agent.evals.fault_injection_eval                     # live eval: diagnosis
 .venv/bin/python3 -m msight_agent.evals.agent_behaviour_eval --provider openai   # live eval: behaviour
 ```
 
-The live evals need the MCP server, chat server and dashboard API running, and take over the pipeline while they run. The fault-injection eval breaks a running pipeline and scores the agent's diagnosis; the behaviour eval plays multi-turn conversations and scores what actually happened (nodes, topics, files), so it can also compare LLMs.
+The live evals need the MCP server, chat server and dashboard API running, and take over the pipeline while they run. The fault-injection eval breaks a running pipeline and scores the agent's diagnosis; the behaviour eval plays multi-turn conversations and scores what actually happened (nodes, topics, files), so it can also compare LLMs. The sentinel has its own end-to-end suite, soak test and labelling sheet; see [msight_agent/sentinel/README.md](msight_agent/sentinel/README.md#evaluation).
 
 Every LLM call is logged with its full prompt and response to `data/logs/agent/prompts.jsonl`.
 
@@ -167,6 +174,7 @@ Every LLM call is logged with its full prompt and response to `data/logs/agent/p
 ├── msight_agent/          # The agent
 │  ├── agent/              # Agent loop, tool dispatch, guards, session state, prompts, LLM clients
 │  ├── msight/             # MSight pipeline: control plane, node catalog, diagnosis, tools
+│  ├── sentinel/           # Background monitor: fault detection, Claude diagnosis and fixes
 │  ├── auto_labeling/      # Agent side of auto-labeling
 │  ├── shared/             # MCP connection, paths, shared helpers
 │  ├── frontend/           # Chat page and dashboard

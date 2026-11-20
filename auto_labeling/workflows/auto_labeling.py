@@ -15,7 +15,6 @@ from functools import partial
 from pathlib import Path
 from typing import Union
 
-import albumentations as A
 import fiftyone as fo
 import numpy as np
 import psutil
@@ -23,7 +22,6 @@ import torch
 import torch.multiprocessing as mp
 from accelerate.test_utils.testing import get_backend
 from datasets import Split
-from fiftyone import ViewField as F
 from huggingface_hub import HfApi, hf_hub_download
 from PIL import Image
 from torch.utils.data import DataLoader, Subset
@@ -40,7 +38,7 @@ from transformers import (
     TrainingArguments,
 )
 from ultralytics import YOLO
-import rfdetr_plus  # must import before rfdetr to avoid circular import that blocks XLarge/2XLarge
+import rfdetr_plus  # noqa: F401 -- must import before rfdetr to avoid circular import that blocks XLarge/2XLarge
 from rfdetr import RFDETRNano, RFDETRSmall, RFDETRMedium, RFDETRLarge, RFDETRXLarge, RFDETR2XLarge
 import supervision as sv
 import wandb
@@ -248,8 +246,8 @@ class ZeroShotObjectDetection:
         step = 0
 
         while True:
-            for i, queue in enumerate(queues):
-                queue_sizes[i] = queue.qsize()
+            for i, q in enumerate(queues):
+                queue_sizes[i] = q.qsize()
                 writer.add_scalar(f"queue_size/items/{i}", queue_sizes[i], step)
 
             step += 1
@@ -316,7 +314,7 @@ class ZeroShotObjectDetection:
         while True:
             results_queue = result_queues[largest_queue_index.value]
             writer.add_scalar(
-                f"post_processing/selected_queue",
+                "post_processing/selected_queue",
                 largest_queue_index.value,
                 n_processed_images,
             )
@@ -356,14 +354,14 @@ class ZeroShotObjectDetection:
                     frames_per_second = batches_per_second * n_images
                     n_processed_images += n_images
                     writer.add_scalar(
-                        f"post_processing/frames_per_second",
+                        "post_processing/frames_per_second",
                         frames_per_second,
                         n_processed_images,
                     )
 
                     del result  # Explicit removal from device
 
-                except Exception as e:
+                except Exception:
                     continue
 
             else:
@@ -415,7 +413,7 @@ class ZeroShotObjectDetection:
                         task_metadata = task_queue.get(
                             timeout=5
                         )  # Timeout to prevent indefinite blocking
-                    except Exception as e:
+                    except Exception:
                         break  # Exit if no more tasks
                     run_successful = self.model_inference(
                         task_metadata,
@@ -612,14 +610,14 @@ class ZeroShotObjectDetection:
                         f"{os.getpid()}: Number of processes images: {n_processed_images}"
                     )
                     writer.add_scalar(
-                        f"inference/frames_per_second",
+                        "inference/frames_per_second",
                         frames_per_second,
                         n_processed_images,
                     )
 
                 except TimeoutException:
                     logging.warning(
-                        f"Dataloader loop got stuck. Continuing with next batch."
+                        "Dataloader loop got stuck. Continuing with next batch."
                     )
                     continue
 
@@ -636,7 +634,7 @@ class ZeroShotObjectDetection:
         finally:
             try:
                 wandb.finish(exit_code=wandb_exit_code)
-            except:
+            except Exception:
                 pass
 
             # Explicit removal from device
@@ -873,7 +871,7 @@ class UltralyticsObjectDetection:
         if torch.cuda.device_count() > 1:
             device = ",".join(map(str, range(torch.cuda.device_count())))
 
-        results = model.train(
+        model.train(
             data=f"{self.ultralytics_data_path}/dataset.yaml",
             epochs=self.config["epochs"],
             project=self.export_folder,
@@ -928,8 +926,6 @@ class UltralyticsObjectDetection:
             os.makedirs(os.path.join(download_dir), exist_ok=True)
 
             self.model_path = os.path.join(download_dir, "best.pt")
-
-            # Create directories if they don't exist
 
             file_path = hf_hub_download(
                 repo_id=model_hf,
@@ -1020,7 +1016,7 @@ def transform_batch_standalone(
             # DETR expects COCO (top_left_x, top_left_y, width, height) in absolute coordinates if 'do_convert_annotations == True'
             # DETR expects YOLO (center_x, center_y, width, height) in relative coordinates between [0,1] if 'do_convert_annotations == False'
 
-            if do_convert_annotations == False:
+            if not do_convert_annotations:
                 x, y, w, h = bbox
                 img_height, img_width = image_np.shape[:2]
                 center_x = (x + w / 2) / img_width
@@ -1154,7 +1150,6 @@ class HuggingFaceObjectDetection:
         )
 
         hf_model_config = AutoConfig.from_pretrained(self.model_name)
-        hf_model_config_name = type(hf_model_config).__name__
 
         if type(hf_model_config) in AutoModelForObjectDetection._model_mapping:
             model = AutoModelForObjectDetection.from_pretrained(
@@ -1170,7 +1165,7 @@ class HuggingFaceObjectDetection:
             )
 
         if (
-            overwrite_output == True
+            overwrite_output
             and os.path.exists(self.model_root)
             and os.listdir(self.model_root)
         ):
@@ -1250,12 +1245,12 @@ class HuggingFaceObjectDetection:
                     self.hf_hub_model_id
                 )
                 load_from_hf_successful = True
-            except Exception as e:
+            except Exception:
                 load_from_hf_successful = False
                 logging.warning(
                     f"Model {self.model_name} could not be loaded from Hugging Face {self.hf_hub_model_id}. Attempting loading from disk."
                 )
-        if load_from_hf == False or load_from_hf_successful == False:
+        if not load_from_hf or not load_from_hf_successful:
             try:
                 # Select folder in self.model_root that include 'checkpoint-'
                 checkpoint_dirs = [
@@ -1426,7 +1421,7 @@ class CustomCoDETRObjectDetection:
             "coco/annotations/instances_train2017.json",
         )
         # Read the JSON file
-        with open(annotations_json, "r") as file:
+        with open(annotations_json) as file:
             data = json.load(file)
 
         # Extract the value associated with the key "categories"
@@ -1436,7 +1431,7 @@ class CustomCoDETRObjectDetection:
 
         # Update configuration file
         # This assumes that 'classes = '('a','b',...)' are already defined and will be overwritten.
-        with open(config_path, "r") as file:
+        with open(config_path) as file:
             content = file.read()
 
         # Update the classes tuple
@@ -1492,7 +1487,7 @@ class CustomCoDETRObjectDetection:
             volume_data = os.path.join(self.export_dir_root, self.dataset_name)
 
             # Train model, store checkpoints in 'output_folder_codetr'
-            train_result = self._run_container(
+            self._run_container(
                 volume_data=volume_data,
                 param_function=param_function,
                 param_config=param_config,
@@ -1520,7 +1515,7 @@ class CustomCoDETRObjectDetection:
                 logging.info("Co-DETR was trained successfully.")
 
                 # Upload best model to Hugging Face
-                if HF_DO_UPLOAD == True:
+                if HF_DO_UPLOAD:
                     logging.info("Uploading Co-DETR model to Hugging Face.")
                     api = HfApi()
                     api.create_repo(
@@ -1625,7 +1620,7 @@ class CustomCoDETRObjectDetection:
             )
             os.makedirs(download_folder, exist_ok=True)
 
-            file_path = hf_hub_download(
+            hf_hub_download(
                 repo_id=hf_path,
                 filename="model.pth",
                 local_dir=download_folder,
@@ -1637,7 +1632,7 @@ class CustomCoDETRObjectDetection:
         model_path = os.path.join(dataset_name, config_key, "model.pth")
         logging.info(f"Starting inference for model {model_path}")
 
-        inference_result = self._run_container(
+        self._run_container(
             volume_data=volume_data,
             param_function=param_function,
             param_config=param_config,
@@ -1678,7 +1673,7 @@ class CustomCoDETRObjectDetection:
         # Use the most recent file based on timestamp
         latest_file = file_paths_sorted[0]
         logging.info(f"Using inference results from: {latest_file}")
-        with open(latest_file, "r") as file:
+        with open(latest_file) as file:
             data = json.load(file)
 
         # Get conversion for annotated classes
@@ -1686,7 +1681,7 @@ class CustomCoDETRObjectDetection:
             volume_data, "coco", "annotations", "instances_train2017.json"
         )
 
-        with open(annotations_path, "r") as file:
+        with open(annotations_path) as file:
             data_annotations = json.load(file)
 
         class_ids_and_names = [
@@ -2028,7 +2023,7 @@ class CustomRFDETRObjectDetection:
                 logging.debug(f"Created backup: {backup_path}")
 
             # Read annotation file
-            with open(annotation_path, 'r') as f:
+            with open(annotation_path) as f:
                 data = json.load(f)
 
             # Fix categories: 1-indexed → 0-indexed
@@ -2057,13 +2052,10 @@ class CustomRFDETRObjectDetection:
             backup_path = f"{annotation_path}.backup"
             if os.path.exists(backup_path):
                 shutil.copy2(backup_path, annotation_path)
-                logging.info(f"Restored from backup due to error")
+                logging.info("Restored from backup due to error")
 
     def train(self, run_config, shared_config):
         """Train RF-DETR model using shared and model-specific configuration"""
-
-
-
 
         # Model selection mapping
         MODEL_REGISTRY = {
@@ -2071,7 +2063,7 @@ class CustomRFDETRObjectDetection:
             "rfdetr_small": RFDETRSmall,
             "rfdetr_medium": RFDETRMedium,
             "rfdetr_large": RFDETRLarge,
-	    "rfdetr_xlarge": RFDETRXLarge,
+            "rfdetr_xlarge": RFDETRXLarge,
             "rfdetr_2xlarge": RFDETR2XLarge
         }
 
@@ -2122,7 +2114,7 @@ class CustomRFDETRObjectDetection:
             # === Logging (use global settings) ===
             "tensorboard": True,
             "wandb": WANDB_ACTIVE,
-            "project": f"MCityDataEngine-RFDETR",
+            "project": "MCityDataEngine-RFDETR",
             "run": f"{self.dataset_name}_{model_name}",
 
             # === Early stopping ===
@@ -2201,7 +2193,6 @@ class CustomRFDETRObjectDetection:
             traceback.print_exc()
             return False
 
-
     def _upload_to_hf(self):
         """Upload trained RF-DETR model to Hugging Face"""
 
@@ -2236,11 +2227,8 @@ class CustomRFDETRObjectDetection:
             import traceback
             traceback.print_exc()
 
-
     def inference(self, inference_settings, gt_field="ground_truth"):
         """Performs inference using RF-DETR model on a dataset with optional evaluation"""
-
-
 
         logging.info(f"Running RF-DETR inference on dataset {self.dataset_name}")
 
@@ -2250,7 +2238,7 @@ class CustomRFDETRObjectDetection:
             "rfdetr_small": RFDETRSmall,
             "rfdetr_medium": RFDETRMedium,
             "rfdetr_large": RFDETRLarge,
-	       "rfdetr_xlarge": RFDETRXLarge,
+            "rfdetr_xlarge": RFDETRXLarge,
             "rfdetr_2xlarge": RFDETR2XLarge
         }
 
@@ -2449,8 +2437,6 @@ class CustomRFDETRObjectDetection:
                     else:
                         ped_sv = sv.Detections.empty()
                         other_sv = detections if len(detections) > 0 else sv.Detections.empty()
-
-                    rfdetr_detected_peds = len(ped_sv) > 0
 
                     # Update tracker with pedestrian detections from this frame
                     tracked_peds = tracker.update_with_detections(ped_sv)

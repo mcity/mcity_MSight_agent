@@ -28,6 +28,8 @@ TOOL_STATUS_MESSAGES: dict[str, str] = {
     "launch_voxel51_session":                "Launching Voxel51 visualization...",
     "diagnose_msight_pipeline":              "Diagnosing pipeline — sampling live data flow (~5-10s)...",
     "inspect_host":                          "Inspecting the host...",
+    "get_recent_incidents":                  "Reading the monitor's incident report...",
+    "restart_msight_node":                   "Restarting the node with its normal settings...",
 }
 
 # Strip ANSI escape codes and bare CR from subprocess output.
@@ -37,7 +39,7 @@ ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]|\r')
 # and counts as real progress when the iteration budget runs out.
 WRITE_TOOLS: frozenset[str] = frozenset({
     "start_msight_pipeline", "stop_msight_pipeline",
-    "add_msight_node", "remove_msight_node",
+    "add_msight_node", "remove_msight_node", "restart_msight_node",
     "start_msight_recording", "stop_msight_recording",
     "start_msight_archiving", "stop_msight_archiving",
 })
@@ -78,6 +80,11 @@ def tool_status(result: str) -> str | None:
     except (TypeError, ValueError):
         return None
     return parsed.get("status") if isinstance(parsed, dict) else None
+
+
+def error_text(result: str) -> str:
+    """A tool's error message without its leading "SENTINEL:" prefix."""
+    return result.split(":", 1)[1].strip() if ":" in result else result
 
 
 def format_reply(message: str, source: str | None) -> str:

@@ -1,3 +1,4 @@
+"""MCP tools for the chat's workflow and dataset selection, written into the engine's config.py."""
 import asyncio
 import logging
 import re
@@ -49,7 +50,7 @@ def _prune_stale_custom_entries() -> None:
     yaml.preserve_quotes = True
     yaml.indent(sequence=4, offset=2)
     try:
-        with open(DEFAULT_DATASETS_YAML, "r") as f:
+        with open(DEFAULT_DATASETS_YAML) as f:
             data = yaml.load(f)
         entries = data.get("datasets", []) or []
         stale = [
@@ -68,32 +69,18 @@ def _prune_stale_custom_entries() -> None:
 
 def write_selected_dataset(dataset_name: str) -> None:
     """Point SELECTED_DATASET in config.py (what main.py runs on) at `dataset_name`."""
-    lines = CONFIG_PATH.read_text().split("\n")
+    values = {"name": f'"{dataset_name}"', "n_samples": "None", "custom_view": "None"}
     modified = []
     in_dataset_block = False
-
-    for line in lines:
+    for line in CONFIG_PATH.read_text().split("\n"):
         if "SELECTED_DATASET = {" in line:
             in_dataset_block = True
-            modified.append(line)
-            continue
-        if in_dataset_block:
-            if '"name":' in line:
-                indent = " " * (len(line) - len(line.lstrip()))
-                modified.append(f'{indent}"name": "{dataset_name}",')
-                continue
-            elif '"n_samples":' in line:
-                indent = " " * (len(line) - len(line.lstrip()))
-                modified.append(f'{indent}"n_samples": None,')
-                continue
-            elif '"custom_view":' in line:
-                indent = " " * (len(line) - len(line.lstrip()))
-                modified.append(f'{indent}"custom_view": None,')
-                continue
+        elif in_dataset_block:
+            key = next((k for k in values if f'"{k}":' in line), None)
+            if key:
+                line = f'{line[:len(line) - len(line.lstrip())]}"{key}": {values[key]},'
             elif "}" in line:
-                modified.append(line)
                 in_dataset_block = False
-                continue
         modified.append(line)
 
     CONFIG_PATH.write_text("\n".join(modified).rstrip("\n") + "\n")
@@ -238,11 +225,4 @@ def list_datasets() -> List[str]:
     """
     _prune_stale_custom_entries()
     dynamic_names = _extract_names_after_line(DEFAULT_DATASETS_YAML, _FIRST_LISTED_YAML_LINE)
-    out: List[str] = []
-    for n in FIXED_DATASETS:
-        if n not in out:
-            out.append(n)
-    for n in dynamic_names:
-        if n not in out:
-            out.append(n)
-    return out
+    return list(dict.fromkeys(FIXED_DATASETS + dynamic_names))

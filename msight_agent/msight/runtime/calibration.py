@@ -8,9 +8,8 @@ import yaml
 
 from msight_agent.msight.runtime.paths import get_msight_path
 
-# RF-DETR's config names the calibration files (paths relative to the config).
-# Read them from there rather than hard-coding a layout: MSight_Vision has moved
-# them before (examples/rfdetr/locmaps/ -> examples/rfdetr/calibration/).
+# RF-DETR's config names the calibration files (paths relative to the config). Read them
+# from there: MSight_Vision has moved them between versions.
 RFDETR_CONFIG_REL = Path("examples/rfdetr/rfdetr_config.yaml")
 
 # SHA256 of the shipped demo calibration, to tell default from user-uploaded.

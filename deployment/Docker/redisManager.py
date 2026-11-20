@@ -1,7 +1,8 @@
 import redis
 from datetime import datetime
 from config import Config
-import json 
+import json
+
 
 class RedisManager:
     def __init__(self, config: Config):

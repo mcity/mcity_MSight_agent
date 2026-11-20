@@ -149,6 +149,9 @@ async def started_node_names() -> set[str]:
     return names - _NOT_NODES
 
 
+_NAME_CONFLICT_RETRIES = 3
+
+
 class DockerExecutor:
     """One `docker run` per node on the prebuilt msight-vision image.
 
@@ -181,7 +184,14 @@ class DockerExecutor:
             if progress and not _CONTAINER_ID_RE.fullmatch(line):
                 await progress(line)
 
-        code, out = await run_cmd(*args, cwd=str(cwd), on_line=pull_progress if progress else None)
+        for attempt in range(_NAME_CONFLICT_RETRIES + 1):
+            code, out = await run_cmd(*args, cwd=str(cwd), on_line=pull_progress if progress else None)
+            # The old container can still be on its way out (removing a just-stopped or
+            # unpaused container isn't instant): the name frees up within a few seconds.
+            if code == 0 or "is already in use" not in out or attempt == _NAME_CONFLICT_RETRIES:
+                break
+            await asyncio.sleep(2)
+            await run_cmd("docker", "rm", "-f", cname)
         if code != 0:
             raise RuntimeError(f"docker run failed for '{name}': {out.strip()}")
         return DockerHandle(cname)
@@ -239,6 +249,16 @@ def recover_supervisor_handle(name: str) -> Optional[SupervisorHandle]:
     return SupervisorHandle(name=name, pid=pid)
 
 
+# The agent's own Python setup must not reach MSight_Vision's processes: they run in its venv
+# with cwd=MSight_Vision, where a relative PYTHONPATH (e.g. "PYTHONPATH=. python -m ...")
+# makes its cli/ folder shadow msight_core's cli package, and the node fails to import.
+_AGENT_PYTHON_VARS = ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV")
+
+
+def node_environment() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if k not in _AGENT_PYTHON_VARS}
+
+
 class SupervisorExecutor:
     """Runs each node as a detached local subprocess."""
 
@@ -258,7 +278,7 @@ class SupervisorExecutor:
         with open(log_path, "wb") as log_file:
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdout=log_file, stderr=asyncio.subprocess.STDOUT,
-                env={**os.environ, **env}, cwd=str(cwd), start_new_session=True,
+                env={**node_environment(), **env}, cwd=str(cwd), start_new_session=True,
             )
 
         await asyncio.sleep(_STARTUP_GRACE_SECONDS)

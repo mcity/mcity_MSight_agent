@@ -6,6 +6,8 @@ from msight_agent.shared.mcp import error_json, mcp, ok_json
 
 @mcp.tool()
 def check_msight_calibration_status() -> str:
+    """Whether the live pipeline runs on the user's own camera calibration or still on the
+    shipped demo calibration (default, user-uploaded, missing or partial)."""
     msight_path, err = get_msight_path()
     if err:
         return error_json(err)

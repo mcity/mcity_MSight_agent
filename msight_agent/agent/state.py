@@ -65,8 +65,8 @@ ALWAYS_TOOLS: frozenset[str] = frozenset({
     "start_msight_recording", "start_msight_archiving",
     "stop_msight_recording", "stop_msight_archiving",
     "get_msight_record_archive_status",
-    "list_msight_node_types", "add_msight_node", "remove_msight_node",
-    "get_msight_reference",
+    "list_msight_node_types", "add_msight_node", "remove_msight_node", "restart_msight_node",
+    "get_msight_reference", "get_recent_incidents",
 })
 
 
@@ -346,8 +346,7 @@ class WorkflowState(BaseModel):
 
     def valid_tool_names(self) -> set[str]:
         """The tools valid at the current workflow step."""
-        ALWAYS = ALWAYS_TOOLS
-
+        ALWAYS = ALWAYS_TOOLS  # noqa: N806 -- reads as the constant it is
         if not self.workflow_name:
             return ALWAYS | {"select_workflow"}
 
@@ -387,18 +386,14 @@ class WorkflowState(BaseModel):
         if al.labeling_path == LabelingPath.MANUAL:
             if al.labels_imported:
                 return ALWAYS | {"launch_voxel51_session"}
-            if ls:
-                if al.ls_task_ids:
-                    return ALWAYS | {"import_from_label_studio"}
-                if al.manual_classes and not al.export_confirmed:
-                    return ALWAYS | {"confirm_export", "set_selected_dataset", "set_labeling_backend", "set_labeling_path"}
-                return ALWAYS | {"set_selected_dataset", "export_to_label_studio", "set_labeling_backend", "set_labeling_path"}
-            else:
-                if al.cvat_task_ids:
-                    return ALWAYS | {"import_from_cvat"}
-                if al.manual_classes and not al.export_confirmed:
-                    return ALWAYS | {"confirm_export", "set_selected_dataset", "set_labeling_backend", "set_labeling_path"}
-                return ALWAYS | {"set_selected_dataset", "export_to_cvat", "set_labeling_backend", "set_labeling_path"}
+            if ls and al.ls_task_ids:
+                return ALWAYS | {"import_from_label_studio"}
+            if al.cvat_task_ids:
+                return ALWAYS | {"import_from_cvat"}
+            reconfigure = {"set_selected_dataset", "set_labeling_backend", "set_labeling_path"}
+            if al.manual_classes and not al.export_confirmed:
+                return ALWAYS | reconfigure | {"confirm_export"}
+            return ALWAYS | reconfigure | {"export_to_label_studio" if ls else "export_to_cvat"}
 
         if al.labeling_path == LabelingPath.AUTO:
             if not al.auto_labeling_complete:
@@ -420,7 +415,8 @@ class WorkflowState(BaseModel):
             if not (al.cvat_task_ids or al.ls_task_ids):
                 # The run finished but its export failed: retry the export, switch backend, or re-run.
                 export_tool = "export_to_label_studio" if ls else "export_to_cvat"
-                run_tool = "confirm_run" if al.run_awaiting_confirmation and not al.run_confirmed else "run_auto_labeling"
+                awaiting = al.run_awaiting_confirmation and not al.run_confirmed
+                run_tool = "confirm_run" if awaiting else "run_auto_labeling"
                 return ALWAYS | {export_tool, "set_labeling_backend", run_tool}
             import_tool = "import_from_label_studio" if ls else "import_from_cvat"
             return ALWAYS | {import_tool}
@@ -430,52 +426,42 @@ class WorkflowState(BaseModel):
     def load(cls) -> "WorkflowState":
         try:
             importlib.reload(_cc)
-            raw = dict(_cc.WORKFLOW_STATE)
-            raw = cls._migrate(raw)
-            state = cls.model_validate(raw)
-
-            # TTL: after an hour without writes, clear stale confirmation gates.
-            try:
-                age = time.time() - CONFIG_PATH.stat().st_mtime
-                if age > 3600 and state.auto_labeling:
-                    if state.auto_labeling.run_awaiting_confirmation:
-                        state.auto_labeling.run_awaiting_confirmation = False
-                        logging.warning("[STATE] TTL: cleared stale run_awaiting_confirmation")
-                    if state.auto_labeling.export_awaiting_confirmation:
-                        state.auto_labeling.export_awaiting_confirmation = False
-                        logging.warning("[STATE] TTL: cleared stale export_awaiting_confirmation")
-                    if state.auto_labeling.export_confirmed:
-                        state.auto_labeling.export_confirmed = False
-                        logging.warning("[STATE] TTL: cleared stale export_confirmed")
-                # msight_pipeline's shorter TTL below always fires first.
-                mp = state.msight_pipeline
-                if mp and mp.run_awaiting_confirmation and mp.run_confirmation_requested_at:
-                    pending_age = time.time() - mp.run_confirmation_requested_at
-                    if pending_age > 300:
-                        mp.run_awaiting_confirmation = False
-                        mp.run_confirmation_requested_at = 0.0
-                        logging.warning(
-                            f"[STATE] TTL: cleared stale msight_pipeline pending "
-                            f"confirmation after {pending_age:.0f}s unanswered"
-                        )
-                # Expire deferred requests so they don't fire on an unrelated later start.
-                if mp and mp.recording_pending and mp.recording_pending_since and time.time() - mp.recording_pending_since > 3600:
-                    mp.recording_pending = False
-                    mp.recording_pending_since = 0.0
-                    logging.warning("[STATE] TTL: cleared stale recording_pending")
-                if mp and mp.archiving_pending and mp.archiving_pending_since and time.time() - mp.archiving_pending_since > 3600:
-                    mp.archiving_pending = False
-                    mp.archiving_pending_since = 0.0
-                    mp.archiving_pending_bucket = ""
-                    mp.archiving_pending_prefix = ""
-                    logging.warning("[STATE] TTL: cleared stale archiving_pending")
-            except Exception:
-                pass
-
-            return state
+            state = cls.model_validate(cls._migrate(dict(_cc.WORKFLOW_STATE)))
         except Exception as e:
             logging.warning(f"[STATE] Failed to load WorkflowState: {e} — using defaults")
             return cls()
+        try:
+            state._expire_stale()
+        except OSError as e:
+            logging.warning(f"[STATE] Could not check for stale confirmations: {e}")
+        return state
+
+    def _expire_stale(self) -> None:
+        """Clear confirmations and deferred requests nobody acted on, so a later turn
+        can't act on consent given long ago."""
+        now = time.time()
+        al, mp = self.auto_labeling, self.msight_pipeline
+        if al and now - CONFIG_PATH.stat().st_mtime > 3600:   # an hour without any write
+            for flag in ("run_awaiting_confirmation", "export_awaiting_confirmation", "export_confirmed"):
+                if getattr(al, flag):
+                    setattr(al, flag, False)
+                    logging.warning(f"[STATE] TTL: cleared stale {flag}")
+        if not mp:
+            return
+        # Own short TTL: config.py's mtime is refreshed by unrelated writes.
+        if mp.run_awaiting_confirmation and mp.run_confirmation_requested_at \
+                and now - mp.run_confirmation_requested_at > 300:
+            logging.warning(f"[STATE] TTL: cleared msight_pipeline confirmation unanswered for "
+                            f"{now - mp.run_confirmation_requested_at:.0f}s")
+            mp.run_awaiting_confirmation, mp.run_confirmation_requested_at = False, 0.0
+        # Deferred requests expire so they don't fire on an unrelated later start.
+        if mp.recording_pending and mp.recording_pending_since and now - mp.recording_pending_since > 3600:
+            mp.recording_pending, mp.recording_pending_since = False, 0.0
+            logging.warning("[STATE] TTL: cleared stale recording_pending")
+        if mp.archiving_pending and mp.archiving_pending_since and now - mp.archiving_pending_since > 3600:
+            mp.archiving_pending, mp.archiving_pending_since = False, 0.0
+            mp.archiving_pending_bucket = mp.archiving_pending_prefix = ""
+            logging.warning("[STATE] TTL: cleared stale archiving_pending")
 
     @classmethod
     def _migrate(cls, raw: dict) -> dict:
@@ -508,18 +494,6 @@ class WorkflowState(BaseModel):
             if "cvat_task_id" in al:
                 old_val = al.pop("cvat_task_id")
                 al.setdefault("cvat_task_ids", [old_val] if old_val else [])
-            al.setdefault("labeling_backend", "")
-            al.setdefault("cvat_task_ids", [])
-            al.setdefault("ls_task_ids", [])
-            al.setdefault("manual_classes", [])
-            al.setdefault("models_listed", False)
-            al.setdefault("export_confirmed", False)
-            al.setdefault("run_confirmed", False)
-            al.setdefault("run_awaiting_confirmation", False)
-            al.setdefault("export_awaiting_confirmation", False)
-            al.setdefault("model_source", "")
-            al.setdefault("model_name", "")
-            al.setdefault("phase", "")
             al.pop("pending_dataset_change", None)
 
         lr = raw.get("last_run")
@@ -551,7 +525,7 @@ class WorkflowState(BaseModel):
                     if isinstance(target, ast.Name) and target.id == "WORKFLOW_STATE":
                         start = node.lineno - 1
                         end = node.end_lineno
-                        lines[start:end] = [f"WORKFLOW_STATE = {repr(state_dict)}"]
+                        lines[start:end] = [f"WORKFLOW_STATE = {state_dict!r}"]
                         new_src = "\n".join(lines).rstrip("\n") + "\n"
                         # Skip identical writes: the mtime bump restarts uvicorn --reload,
                         # which saves again, looping forever.
@@ -575,7 +549,7 @@ class WorkflowState(BaseModel):
         substate_cls = _resolve_substate_cls(spec.substate_cls_name) if spec else None
         if substate_cls:
             # Relies on the WORKFLOW_SPECS key matching a WorkflowState field name 1:1.
-            assert workflow_name in fresh.model_fields, (
+            assert workflow_name in WorkflowState.model_fields, (
                 f"WorkflowSpec {workflow_name!r} has substate_cls_name="
                 f"{spec.substate_cls_name!r} but WorkflowState has no field "
                 f"named {workflow_name!r} to hold it."

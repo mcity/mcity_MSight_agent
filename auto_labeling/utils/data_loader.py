@@ -28,7 +28,7 @@ class FiftyOneTorchDatasetCOCO(torch.utils.data.Dataset):
 
     def __init__(self, fiftyone_dataset, transforms=None, gt_field="ground_truth"):
         """Initialize dataset from Voxel51 (fiftyone) dataset with optional transforms and ground truth field name."""
-        logging.info(f"Collecting data for torch dataset conversion.")
+        logging.info("Collecting data for torch dataset conversion.")
         self.transforms = transforms
         try:
             self.classes = fiftyone_dataset.distinct(f"{gt_field}.detections.label")
@@ -56,7 +56,7 @@ class FiftyOneTorchDatasetCOCO(torch.utils.data.Dataset):
 
         try:
             ground_truths = fiftyone_dataset.values(gt_field)
-        except:
+        except Exception:
             logging.info(f"Voxel51 dataset has no field named '{gt_field}'")
             ground_truths = None
         tags = fiftyone_dataset.values("tags")

@@ -5,14 +5,14 @@ from fiftyone import ViewField as F
 
 from config.config import GLOBAL_SEED
 
-#### FUNCTION MUST EXPECT A DATASET AND RETURN A VIEW ####
+# FUNCTION MUST EXPECT A DATASET AND RETURN A VIEW ####
 
 
 def keep_val_no_crowd_no_added(dataset, include_added=False):
     view_pot_train = dataset.match_tags(["val", "crowd"], bool=False)
     view_pot_train.untag_samples(["train"])
 
-    if include_added == False:
+    if not include_added:
         view_train = view_pot_train.match_tags(["added"], bool=False)
     else:
         view_train = view_pot_train

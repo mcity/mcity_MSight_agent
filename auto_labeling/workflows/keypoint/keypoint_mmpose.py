@@ -44,7 +44,7 @@ import os
 import sys
 import yaml
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict
 from collections import defaultdict
 
 import numpy as np
@@ -57,7 +57,6 @@ from mmengine.config import Config
 from mmengine.runner import Runner
 from mmpose.utils import register_all_modules
 from mmpose.apis import init_model, inference_topdown
-from mmpose.structures import PoseDataSample
 
 # ── logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -76,7 +75,7 @@ def load_config(config_path: str) -> Dict:
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
-    with open(config_path, 'r') as f:
+    with open(config_path) as f:
         config = yaml.safe_load(f)
 
     log.info("━━━ Configuration loaded ━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -244,6 +243,7 @@ def resolve_checkpoint_path(config: Dict) -> Optional[str]:
 
     # Training from scratch
     return None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Lower body keypoint constants (6 joints: hips, knees, ankles)
@@ -751,9 +751,9 @@ def build_config(
         ),
 
         # ── Data loaders ─────────────────────────────────────────────
-        train_dataloader = _dataloader(train_ann, train_pipeline, shuffle=True,  bs=batch_size),
-        val_dataloader   = _dataloader(val_ann,   val_pipeline,   shuffle=False, bs=batch_size),
-        test_dataloader  = _dataloader(val_ann,   val_pipeline,   shuffle=False, bs=batch_size),
+        train_dataloader=_dataloader(train_ann, train_pipeline, shuffle=True,  bs=batch_size),
+        val_dataloader=_dataloader(val_ann,   val_pipeline,   shuffle=False, bs=batch_size),
+        test_dataloader=_dataloader(val_ann,   val_pipeline,   shuffle=False, bs=batch_size),
 
         # ── OKS evaluator ─────────────────────────────────────────────
         val_evaluator=dict(
@@ -968,18 +968,12 @@ class OKSValidator:
                 if len(pred_instances.keypoints) == 0:
                     continue
 
-                # Model predicts 6 keypoints (lower body only)
-                # Handle both torch tensors and numpy arrays
+                # 6 lower-body keypoints, as a torch tensor or a numpy array
                 pred_kps_raw = pred_instances.keypoints[0]
-                pred_scores_raw = pred_instances.keypoint_scores[0]
-
-                # Convert to numpy if needed
                 if hasattr(pred_kps_raw, 'cpu'):
                     pred_kps = pred_kps_raw.cpu().numpy()  # (6, 2)
-                    pred_scores = pred_scores_raw.cpu().numpy()  # (6,)
                 else:
-                    pred_kps = np.array(pred_kps_raw)  # Already numpy
-                    pred_scores = np.array(pred_scores_raw)
+                    pred_kps = np.array(pred_kps_raw)
 
                 # Verify prediction shape
                 if len(pred_kps) != NUM_KP:

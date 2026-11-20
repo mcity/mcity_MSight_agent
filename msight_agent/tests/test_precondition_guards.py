@@ -156,5 +156,3 @@ def test_can_import_from_label_studio_passes_when_task_ids_present():
     ok, msg = al.can_import_from_label_studio()
     assert ok
     assert msg == ""
-
-

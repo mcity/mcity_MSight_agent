@@ -169,6 +169,12 @@ async def run_inspection(command: str) -> dict:
 
 @mcp.tool()
 async def inspect_host(command: str) -> str:
+    """Run ONE read-only diagnostic command on the host, for what the pipeline tools can't
+    see: GPU and drivers, disk, ports, the Docker daemon, system services, Redis. Allowed:
+    uname, uptime, nproc, lsmod, lspci, modinfo, mokutil --sb-state, dpkg -l, nvidia-smi
+    queries, df, free, ss, read-only docker commands (ps/inspect/logs/images/info/version/
+    stats --no-stream), systemctl status|is-active|is-enabled, journalctl -u|-k. No pipes,
+    redirects, sudo or file reads."""
     result = await run_inspection(command)
     if not result["allowed"]:
         return error_json(f"Command not allowed: {result['reason']}")

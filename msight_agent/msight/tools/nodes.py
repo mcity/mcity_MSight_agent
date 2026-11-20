@@ -47,6 +47,8 @@ _NODE_TYPE_DESCRIPTIONS: dict[str, str] = {
 
 @mcp.tool()
 def list_msight_node_types() -> str:
+    """Every node_type add_msight_node accepts: its category (source/processing/sink),
+    required config keys, whether it needs a GPU, and a one-line description."""
     catalog = [
         {
             "node_type": node_type,

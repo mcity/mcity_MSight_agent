@@ -71,7 +71,7 @@ def test_migrate_top_level_auto_labeling_fields_dropped_for_non_auto_labeling_wo
 # auto_labeling subdict — missing optional fields get defaults
 
 def test_migrate_auto_labeling_subdict_gets_missing_defaults():
-    """An existing auto_labeling subdict that's missing new fields gets defaults added."""
+    """An old auto_labeling subdict loads, with every newer field at its default."""
     raw = {
         "workflow_name": "auto_labeling",
         "auto_labeling": {
@@ -80,19 +80,19 @@ def test_migrate_auto_labeling_subdict_gets_missing_defaults():
         },
     }
     result = migrate(raw)
-    al = result["auto_labeling"]
-    assert "cvat_task_id" not in al
-    assert al.get("cvat_task_ids") == []
-    assert al.get("labeling_backend") == ""
-    assert al.get("ls_task_ids") == []
-    assert al.get("manual_classes") == []
-    assert al.get("models_listed") is False
-    assert al.get("export_confirmed") is False
-    assert al.get("run_confirmed") is False
-    assert al.get("run_awaiting_confirmation") is False
-    assert al.get("model_source") == ""
-    assert al.get("model_name") == ""
-    assert al.get("phase") == ""
+    assert "cvat_task_id" not in result["auto_labeling"]
+    al = WorkflowState.model_validate(result).auto_labeling
+    assert al.cvat_task_ids == []
+    assert al.labeling_backend == ""
+    assert al.ls_task_ids == []
+    assert al.manual_classes == []
+    assert al.models_listed is False
+    assert al.export_confirmed is False
+    assert al.run_confirmed is False
+    assert al.run_awaiting_confirmation is False
+    assert al.model_source == ""
+    assert al.model_name == ""
+    assert al.phase == ""
 
 
 def test_migrate_auto_labeling_subdict_preserves_existing_values():
